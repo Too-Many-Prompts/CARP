@@ -1,0 +1,92 @@
+# extraction_config.yaml
+# Example config for a regex + context extractor.
+# Replace the patterns and keywords with your own; keep the structure.
+
+settings:
+  context_window_words: 8        # words to look at on each side of a match
+  distance_decay: true           # closer keywords count more (weight / distance)
+  min_score: 0                   # drop candidates scoring below this
+  case_sensitive: false
+  overlap_tiebreak:              # applied in order when overlapping spans conflict
+    - score                      # higher context score wins
+    - length                     # then longer match
+    - priority                   # then lower priority number wins
+
+normalize:
+  collapse_whitespace: true
+  unicode_dashes_to_hyphen: true # – — → -
+  smart_quotes_to_ascii: true
+
+patterns:
+  - label: invoice_number
+    priority: 1
+    regex: '\b(?:INV|INVOICE)[-\s#]?\d{5,8}\b'
+    context:
+      positive: {invoice: 3, bill: 2, "amount due": 2, ref: 1}
+      negative: {phone: -3, tel: -3}
+
+  - label: phone_number
+    priority: 2
+    regex: |
+      (?x)                       # verbose mode: comments allowed
+      (?:\+?1[-.\s]?)?           # optional country code
+      \(?\d{3}\)?[-.\s]?         # area code
+      \d{3}[-.\s]?\d{4}\b
+    context:
+      positive: {phone: 3, tel: 3, call: 2, mobile: 2, fax: 1}
+      negative: {invoice: -2, account: -2, order: -1}
+
+  - label: account_number
+    priority: 3
+    regex: '\b\d{10}\b'          # overlaps with phone_number on purpose
+    context:
+      positive: {account: 3, "acct": 3, routing: 1}
+      negative: {phone: -3, call: -2}
+
+  - label: timestamp
+    priority: 1
+    regex: '\b\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}(?::\d{2})?\b'
+    context:
+      positive: {at: 1, logged: 2, created: 2}
+      negative: {}
+
+  - label: date
+    priority: 2
+    regex: '\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})\b'
+    context:
+      positive: {date: 2, due: 2, dated: 2, on: 1}
+      negative: {}
+
+  - label: amount
+    priority: 2
+    regex: '(?:\$|USD\s?)\d{1,3}(?:,\d{3})*(?:\.\d{2})?'
+    context:
+      positive: {total: 3, due: 2, amount: 2, balance: 2}
+      negative: {}
+
+# Label pairs that may BOTH be kept when they overlap.
+# Any overlapping pair not listed here goes through overlap_tiebreak.
+coexist:
+  - [timestamp, date]            # keep the date inside a timestamp
+  - [invoice_number, amount]
+
+# Test cases the program must pass (run with: pytest)
+tests:
+  - text: "Please call 555-123-4567 about the order."
+    expect:
+      - {label: phone_number, text: "555-123-4567"}
+
+  - text: "Acct 5551234567 is overdue."
+    expect:
+      - {label: account_number, text: "5551234567"}
+
+  - text: "Invoice INV-004521 dated 03/14/2026, amount due $1,250.00"
+    expect:
+      - {label: invoice_number, text: "INV-004521"}
+      - {label: date, text: "03/14/2026"}
+      - {label: amount, text: "$1,250.00"}
+
+  - text: "Record created 2026-03-14 09:30:00 by admin."
+    expect:
+      - {label: timestamp, text: "2026-03-14 09:30:00"}
+      - {label: date, text: "2026-03-14"}
