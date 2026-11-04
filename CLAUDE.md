@@ -16,7 +16,8 @@ each match using nearby context words, and resolves overlapping matches.
 3. `find_candidates(text, patterns)`: run EACH pattern separately with
    `finditer`. Never combine patterns into one alternation (it hides overlaps).
    Candidate = dataclass(label, start, end, text, priority, score=0).
-4. `score_candidate(...)`: take words before/after the match, add each matching
+4. `score_candidate(...)`: take words before/after the match (per
+   `settings.context_direction`: `before`, `after` or `both`, default `both`), add each matching
    keyword's weight (phrases allowed), divided by word distance if
    `distance_decay` is true.
 5. `resolve_overlaps(...)`: drop below `min_score`; for overlapping spans keep

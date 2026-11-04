@@ -26,6 +26,7 @@ import yaml
 from words import next_words, prev_words
 
 TIEBREAK_NAMES = ("score", "length", "priority")
+CONTEXT_DIRECTIONS = ("before", "after", "both")
 REQUIRED_SETTINGS = (
     "context_window_words",
     "distance_decay",
@@ -123,6 +124,14 @@ def load_config(path: str | Path) -> Config:
                 f"settings.overlap_tiebreak: unknown criterion '{name}' "
                 f"(expected one of {', '.join(TIEBREAK_NAMES)})"
             )
+
+    direction = settings.get("context_direction", "both")
+    if direction not in CONTEXT_DIRECTIONS:
+        raise ValueError(
+            f"settings.context_direction: unknown value '{direction}' "
+            f"(expected one of {', '.join(CONTEXT_DIRECTIONS)})"
+        )
+    settings["context_direction"] = direction
 
     flags = 0 if settings["case_sensitive"] else re.IGNORECASE
     patterns: list[Pattern] = []
@@ -261,11 +270,15 @@ def score_candidate(
     """Sum the weight of each keyword found near the match (nearest occurrence
     only), divided by word distance when distance_decay is true.
 
+    settings["context_direction"] ("before", "after" or "both", default
+    "both") chooses which side(s) of the match are searched.
+
     Keyword matching is always lowercase; case_sensitive only affects regex.
     """
     n = int(settings["context_window_words"])
-    before = prev_words(text, cand.start, n)
-    after = next_words(text, cand.end, n)
+    direction = settings.get("context_direction", "both")
+    before = prev_words(text, cand.start, n) if direction in ("before", "both") else []
+    after = next_words(text, cand.end, n) if direction in ("after", "both") else []
     decay = bool(settings["distance_decay"])
 
     total = 0.0

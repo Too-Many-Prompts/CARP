@@ -141,6 +141,35 @@ def test_distance_decay_and_nearest_occurrence(tmp_path: Path) -> None:
     assert extract("tel a b 5", no_decay)[0].score == pytest.approx(6.0)
 
 
+DIRECTION_PATTERNS = [
+    {"label": "n", "priority": 1, "regex": "\\d+",
+     "context": {"positive": {"pre": 2, "post": 3}}},
+]
+
+
+@pytest.mark.parametrize(
+    "direction, expected_before, expected_after",
+    [("both", 2.0, 3.0), ("before", 2.0, 0.0), ("after", 0.0, 3.0)],
+)
+def test_context_direction(
+    tmp_path: Path, direction: str, expected_before: float, expected_after: float
+) -> None:
+    cfg = make_cfg(tmp_path, DIRECTION_PATTERNS, context_direction=direction)
+    assert extract("pre 5", cfg)[0].score == pytest.approx(expected_before)
+    assert extract("5 post", cfg)[0].score == pytest.approx(expected_after)
+
+
+def test_context_direction_defaults_to_both(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, DIRECTION_PATTERNS)
+    assert cfg.settings["context_direction"] == "both"
+    assert extract("pre 5 post", cfg)[0].score == pytest.approx(5.0)
+
+
+def test_context_direction_invalid(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="context_direction"):
+        make_cfg(tmp_path, DIRECTION_PATTERNS, context_direction="sideways")
+
+
 def test_keyword_after_match(tmp_path: Path) -> None:
     patterns = [
         {"label": "n", "priority": 1, "regex": "\\d+",
