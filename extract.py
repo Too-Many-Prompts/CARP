@@ -18,6 +18,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence, Union
 
@@ -27,6 +28,11 @@ from words import next_words, prev_words
 
 TIEBREAK_NAMES = ("score", "length", "priority")
 CONTEXT_DIRECTIONS = ("before", "after", "both")
+
+# Written (relative to the working directory) whenever a context selected
+# patterns but nothing was extracted. main() resets it once per CLI run.
+ERROR_LOG_PATH = "errorlog.csv"
+ERROR_LOG_FIELDS = ("timestamp", "file", "context", "text", "context_patterns", "reason")
 REQUIRED_SETTINGS = (
     "context_window_words",
     "distance_decay",
@@ -82,7 +88,9 @@ class Candidate:
 class Decision:
     """One entry of the troubleshooting log.
 
-    kind: "context" | "below_min_score" | "overlap" | "coexist"
+    kind: "context" | "context_miss" | "below_min_score" | "overlap" | "coexist"
+    restricted: True on a "context" decision when the context hit some
+    patterns and so limited which ones run on the text.
     """
 
     kind: str
@@ -90,6 +98,7 @@ class Decision:
     candidates: list[Candidate] = field(default_factory=list)
     winner: Candidate | None = None
     patterns: list[str] = field(default_factory=list)
+    restricted: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -212,8 +221,37 @@ def select_patterns(
     labels = [p.label for p in hits]
     return hits, Decision(
         "context", f"context matched {', '.join(labels)}; only these patterns used",
-        patterns=labels,
+        patterns=labels, restricted=True,
     )
+
+
+# --------------------------------------------------------------------------
+# Error log: context selected patterns but nothing was extracted
+# --------------------------------------------------------------------------
+def reset_error_log() -> None:
+    """Overwrite ERROR_LOG_PATH with just the header row."""
+    with open(ERROR_LOG_PATH, "w", encoding="utf-8", newline="") as fh:
+        csv.writer(fh).writerow(ERROR_LOG_FIELDS)
+
+
+def log_context_miss(
+    source: str, context: str, text: str, labels: list[str], reason: str
+) -> None:
+    """Append one row to ERROR_LOG_PATH (header written if the file is new)."""
+    path = Path(ERROR_LOG_PATH)
+    is_new = not path.exists() or path.stat().st_size == 0
+    with open(path, "a", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=ERROR_LOG_FIELDS, lineterminator="\n")
+        if is_new:
+            writer.writeheader()
+        writer.writerow({
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "file": source,
+            "context": context,
+            "text": text,
+            "context_patterns": ";".join(labels),
+            "reason": reason,
+        })
 
 
 # --------------------------------------------------------------------------
@@ -408,11 +446,16 @@ def _split_input(inp: ExtractInput) -> tuple[str, str | None]:
 
 
 def extract_with_report(
-    inp: ExtractInput, cfg: Config
+    inp: ExtractInput, cfg: Config, source: str = ""
 ) -> tuple[list[Candidate], list[Decision]]:
-    """Run steps 2-5 and return (matches, decision log)."""
-    text, context = _split_input(inp)
-    text = normalize(text, cfg)
+    """Run steps 2-5 and return (matches, decision log).
+
+    If the context selected patterns but nothing was extracted, the raw
+    context and text are appended to errorlog.csv (`source` fills its
+    `file` column) and a "context_miss" decision is logged.
+    """
+    raw_text, context = _split_input(inp)
+    text = normalize(raw_text, cfg)
     norm_context = normalize(context, cfg) if context else None
 
     patterns, ctx_decision = select_patterns(norm_context, cfg.patterns)
@@ -423,12 +466,23 @@ def extract_with_report(
         c.score = score_candidate(text, c, by_label[c.label], cfg.settings)
 
     matches, decisions = resolve_overlaps(cands, cfg)
-    return matches, [ctx_decision] + decisions
+    decisions = [ctx_decision] + decisions
+
+    if ctx_decision.restricted and not matches:
+        labels = ctx_decision.patterns
+        if cands:
+            reason = (f"context matched {', '.join(labels)}; {len(cands)} candidate(s) "
+                      "found in text but all dropped (min_score/overlap)")
+        else:
+            reason = f"context matched {', '.join(labels)}; no matches in text"
+        decisions.append(Decision("context_miss", reason, patterns=labels))
+        log_context_miss(source, context or "", raw_text, labels, reason)
+    return matches, decisions
 
 
-def extract(inp: ExtractInput, cfg: Config) -> list[Candidate]:
+def extract(inp: ExtractInput, cfg: Config, source: str = "") -> list[Candidate]:
     """Extract matches from text (optionally with context). See module docs."""
-    return extract_with_report(inp, cfg)[0]
+    return extract_with_report(inp, cfg, source)[0]
 
 
 # --------------------------------------------------------------------------
@@ -449,11 +503,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    reset_error_log()  # one fresh errorlog.csv per CLI run
+
     rows: list[dict[str, Any]] = []
     log: list[dict[str, Any]] = []
     for name in args.files:
         text = Path(name).read_text(encoding="utf-8", errors="replace")
-        matches, decisions = extract_with_report((args.context, text), cfg)
+        matches, decisions = extract_with_report((args.context, text), cfg, source=name)
         rows.extend({"file": name, **m.to_dict()} for m in matches)
         log.extend({"file": name, **d.to_dict()} for d in decisions)
 

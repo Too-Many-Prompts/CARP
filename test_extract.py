@@ -2,6 +2,7 @@
 end-to-end cases; the rest are focused unit tests."""
 from __future__ import annotations
 
+import csv
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,20 @@ from words import next_words, prev_words
 
 CONFIG_PATH = Path(__file__).parent / "extraction_config.yaml"
 REAL_CFG = load_config(CONFIG_PATH)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """errorlog.csv is written to the working directory; keep it out of the repo."""
+    monkeypatch.chdir(tmp_path)
+
+
+def read_error_log() -> list[dict[str, str]]:
+    path = Path("errorlog.csv")
+    if not path.exists():
+        return []
+    with open(path, encoding="utf-8", newline="") as fh:
+        return list(csv.DictReader(fh))
 
 
 def pairs(matches: list[Any]) -> Counter:
@@ -53,12 +68,18 @@ def make_cfg(
 
 
 # ---------------------------------------------------------------- config cases
+def _case_id(case: dict[str, Any]) -> str:
+    return case.get("name") or case["text"][:40]
+
+
 @pytest.mark.parametrize(
-    "case", REAL_CFG.tests, ids=[c["text"][:40] for c in REAL_CFG.tests]
+    "case", REAL_CFG.tests, ids=[_case_id(c) for c in REAL_CFG.tests]
 )
 def test_config_cases(case: dict[str, Any]) -> None:
-    expected = Counter((e["label"], e["text"]) for e in case["expect"])
-    assert pairs(extract(case["text"], REAL_CFG)) == expected
+    """Each case may carry an optional `context` string."""
+    inp = {"text": case["text"], "context": case.get("context")}
+    expected = Counter((e["label"], e["text"]) for e in case["expect"] or [])
+    assert pairs(extract(inp, REAL_CFG)) == expected
 
 
 # ---------------------------------------------------------------- overlaps
@@ -190,23 +211,14 @@ def test_invalid_regex_names_label(tmp_path: Path) -> None:
 CTX_TEXT = "Invoice INV-004521 dated 03/14/2026 on 2026-03-14"
 
 
-def test_context_restricts_to_matched_patterns() -> None:
-    result = extract({"text": CTX_TEXT, "context": "2026-03-14"}, REAL_CFG)
-    assert pairs(result) == Counter(
-        {("date", "03/14/2026"): 1, ("date", "2026-03-14"): 1}
-    )
-
-
-def test_context_no_hits_falls_back_to_all() -> None:
-    plain = pairs(extract(CTX_TEXT, REAL_CFG))
-    _, decisions = extract_with_report(("nothing relevant here", CTX_TEXT), REAL_CFG)
-    assert pairs(extract(("nothing relevant here", CTX_TEXT), REAL_CFG)) == plain
-    assert "no context hits" in decisions[0].reason
-
-
-def test_context_hit_without_text_match_returns_nothing() -> None:
-    # Context matches phone_number only; the text has no phone number.
-    assert extract(("555-123-4567", "Invoice INV-004521"), REAL_CFG) == []
+# The restrict / fall-back / no-match context scenarios live in the YAML
+# `tests` section (run by test_config_cases). These cover the decision log
+# and input forms.
+def test_context_decisions_are_logged() -> None:
+    _, no_hits = extract_with_report(("nothing relevant here", CTX_TEXT), REAL_CFG)
+    assert "no context hits" in no_hits[0].reason
+    _, hit = extract_with_report(("2026-03-14", CTX_TEXT), REAL_CFG)
+    assert hit[0].patterns == ["date"]
 
 
 def test_context_none_or_empty_matches_plain() -> None:
@@ -215,6 +227,45 @@ def test_context_none_or_empty_matches_plain() -> None:
     assert pairs(extract({"text": CTX_TEXT}, REAL_CFG)) == plain
     assert pairs(extract((None, CTX_TEXT), REAL_CFG)) == plain
     assert pairs(extract(("   ", CTX_TEXT), REAL_CFG)) == plain
+
+
+def test_context_miss_is_written_to_error_log() -> None:
+    inp = ("call 555-123-4567", "Invoice INV-004521,\nno phone here")
+    matches, decisions = extract_with_report(inp, REAL_CFG, source="doc1.txt")
+    assert matches == []
+    assert decisions[-1].kind == "context_miss"
+    rows = read_error_log()
+    assert len(rows) == 1
+    row = rows[0]
+    assert list(row) == ["timestamp", "file", "context", "text", "context_patterns", "reason"]
+    assert row["file"] == "doc1.txt"
+    assert row["context"] == "call 555-123-4567"        # raw, un-normalized
+    assert row["text"] == "Invoice INV-004521,\nno phone here"
+    assert row["context_patterns"] == "phone_number"
+    assert "no matches in text" in row["reason"]
+
+
+def test_context_miss_when_candidates_all_dropped(tmp_path: Path) -> None:
+    patterns = [
+        {"label": "n", "priority": 1, "regex": "\\d+",
+         "context": {"negative": {"bad": -1}}},
+    ]
+    cfg = make_cfg(tmp_path, patterns, min_score=0)
+    assert extract(("7", "bad 12"), cfg) == []
+    assert "dropped" in read_error_log()[0]["reason"]
+
+
+def test_no_error_log_when_not_a_context_miss() -> None:
+    extract((None, "no matches at all"), REAL_CFG)                    # no context
+    extract(("nothing relevant here", "no matches at all"), REAL_CFG)  # context, no hits
+    extract(("555-123-4567", "call 555-123-4567"), REAL_CFG)          # context hit, matched
+    assert read_error_log() == []
+
+
+def test_error_log_accumulates_within_a_run() -> None:
+    for i in range(2):
+        extract(("555-123-4567", f"nothing {i}"), REAL_CFG)
+    assert [r["text"] for r in read_error_log()] == ["nothing 0", "nothing 1"]
 
 
 def test_context_is_normalized() -> None:
@@ -250,6 +301,24 @@ def test_cli_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert out["matches"][0]["text"] == "555-123-4567"
     assert set(out["matches"][0]) == {"file", "label", "text", "start", "end", "score"}
     assert any(o["kind"] == "context" for o in out["overlaps"])
+
+
+def test_cli_overwrites_error_log_each_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    miss = tmp_path / "miss.txt"
+    miss.write_text("Invoice INV-004521", encoding="utf-8")
+    ok = tmp_path / "ok.txt"
+    ok.write_text("call 555-123-4567", encoding="utf-8")
+    args = ["--config", str(CONFIG_PATH), "--context", "555-123-4567"]
+
+    assert main(args + [str(miss), str(ok)]) == 0
+    rows = read_error_log()
+    assert [r["file"] for r in rows] == [str(miss)]       # only the miss is logged
+
+    assert main(args + [str(ok)]) == 0                     # clean run wipes old rows
+    assert read_error_log() == []
+    assert Path("errorlog.csv").read_text(encoding="utf-8").startswith("timestamp,")
 
 
 def test_cli_csv_keeps_columns_clean(

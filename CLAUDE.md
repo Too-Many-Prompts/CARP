@@ -30,6 +30,11 @@ each match using nearby context words, and resolves overlapping matches.
 ## Tests
 - `test_extract.py` (pytest) loads the `tests` section of the config and checks
   `extract()` returns exactly the expected (label, text) pairs, order-insensitive.
+  A test case may include an optional `context` string (and `name`), which is
+  passed to `extract()` along with `text`.
+- A context that selects patterns but yields no matches is never dropped silently:
+  `extract()` appends a row (timestamp, file, context, text, context_patterns,
+  reason) to `./errorlog.csv`. `main()` overwrites that file once per CLI run.
 - Also unit-test: coexist overlap, non-coexist overlap, length tie-break,
   multi-word keywords, invalid regex.
 - Run `pytest -q` after every change and do not report success until it passes.
