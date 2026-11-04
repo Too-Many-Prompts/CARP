@@ -134,6 +134,31 @@ def _require(mapping: Any, key: str, where: str) -> Any:
     return mapping[key]
 
 
+def _check_keyword(
+    label: str, group: str, key: str, weight: float, seen: dict[str, float]
+) -> None:
+    """Fail loudly on keywords the scorer could never match or could mis-score.
+
+    Context words are ASCII letters only (see words.py), so a keyword with a
+    digit or an accented letter would be silently reduced and match the wrong
+    words. A keyword may not appear twice in a pattern, and the weight's sign
+    must agree with its group (positive > 0, negative < 0).
+    """
+    where = f"pattern '{label}': context.{group} keyword '{key}'"
+    if not _keyword_words(key) or any(c.isalnum() and not ("a" <= c <= "z") for c in key):
+        raise ValueError(
+            f"{where} must contain only ASCII letters (digits and accented "
+            "letters can never match a context word)"
+        )
+    if key in seen:
+        raise ValueError(f"{where} is listed more than once in this pattern")
+    if (group == "positive" and weight < 0) or (group == "negative" and weight > 0):
+        raise ValueError(
+            f"{where} has weight {weight:g}; positive weights must be >= 0 "
+            "and negative weights <= 0"
+        )
+
+
 def load_config(path: str | Path) -> Config:
     """Read the YAML config and compile every regex once."""
     with open(path, encoding="utf-8", errors="replace") as fh:
@@ -175,7 +200,8 @@ def load_config(path: str | Path) -> Config:
         for group in ("positive", "negative"):
             for keyword, weight in (context.get(group) or {}).items():
                 key = str(keyword).lower()
-                weights[key] = weights.get(key, 0.0) + float(weight)
+                _check_keyword(label, group, key, float(weight), weights)
+                weights[key] = float(weight)
         patterns.append(
             Pattern(
                 label=label,
@@ -385,10 +411,10 @@ def find_candidates(text: str, patterns: list[Pattern]) -> list[Candidate]:
 # 4. score_candidate
 # --------------------------------------------------------------------------
 def _keyword_words(keyword: str) -> list[str]:
-    """Reduce a keyword/phrase to the same lowercase letter-only words that
-    prev_words/next_words produce."""
-    parts = (re.sub(r"[^a-z]", "", tok) for tok in keyword.lower().split())
-    return [p for p in parts if p]
+    """Reduce a keyword/phrase to the same lowercase words that
+    prev_words/next_words produce: apostrophes join a word ("don't" ->
+    "dont"); every other non-letter (space, hyphen, digit...) separates."""
+    return re.findall(r"[a-z]+", keyword.lower().replace("'", "").replace("’", ""))
 
 
 def _nearest_distance(
@@ -607,19 +633,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="optional context text; patterns whose positive keywords appear in it are the only ones run")
     args = parser.parse_args(argv)
 
+    # One fresh errorlog.csv and report per CLI run, even if the run fails
+    # below, so a failed run never leaves the previous run's files behind.
+    reset_error_log()
+    reset_report()
+
     try:
         cfg = load_config(args.config)
     except (ValueError, OSError, yaml.YAMLError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    reset_error_log()  # one fresh errorlog.csv and report per CLI run
-    reset_report()
+    texts: list[tuple[str, str]] = []
+    for name in args.files:  # read everything first: no partial output on a bad path
+        try:
+            texts.append((name, Path(name).read_text(encoding="utf-8", errors="replace")))
+        except OSError as exc:
+            print(f"error: cannot read {name}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
 
     rows: list[dict[str, Any]] = []
     log: list[dict[str, Any]] = []
-    for name in args.files:
-        text = Path(name).read_text(encoding="utf-8", errors="replace")
+    for name, text in texts:
         matches, decisions = extract_with_report((args.context, text), cfg, source=name)
         rows.extend({"file": name, **m.to_dict()} for m in matches)
         log.extend({"file": name, **d.to_dict()} for d in decisions)

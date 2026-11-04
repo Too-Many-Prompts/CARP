@@ -22,11 +22,17 @@ python -m venv .venv
     [--format json|csv] [--context TEXT]
 ```
 
-- `--format json` (default) prints `{"matches": [...], "overlaps": [...]}`;
-  `overlaps` is the decision log.
-- `--format csv` prints matches with the columns
-  `file,label,text,start,end,score`.
-- `--context TEXT` selects which patterns run (see [Context](#context)).
+- `--format json` (default) prints `{"matches": [...], "overlaps": [...]}`.
+  Despite its name, `overlaps` is the **whole decision log** (context,
+  `below_min_score`, overlap and coexist entries), so filter on `kind`.
+- `--format csv` prints matches on stdout with the columns
+  `file,label,text,start,end,score`. The decision log is printed to **stderr**
+  as one JSON object per line, which keeps stdout clean CSV. Redirect with
+  `2>/dev/null` if you don't want it; it is also in `extract_report.csv`.
+- `--context TEXT` selects which patterns run (see [Context](#context)). The
+  same context is applied to **every** FILE in the run.
+- Exit codes: `0` success; `2` for a config error or an unreadable input file
+  (`error: ...` on stderr, no matches printed).
 
 Example:
 
@@ -62,6 +68,8 @@ Each has `label`, `text`, `start`, `end` and `score`. Offsets refer to the
 3. **Select patterns** from the context (below).
 4. **Find candidates**: each pattern runs separately with `finditer`. Patterns
    are never combined into one alternation, so overlaps stay visible.
+   Zero-length matches (e.g. from `\d*`) are skipped: they have no text to
+   extract, and nothing is logged for them.
 5. **Score**: take up to `context_window_words` words before and/or after the
    match (`context_direction`), and add the weight of each keyword found. With
    `distance_decay`, a keyword's weight is divided by its word distance
@@ -83,6 +91,19 @@ The pattern regexes are never run on the context.
 - If the context selected patterns but nothing was extracted, the case is not
   dropped silently. It is appended to `errorlog.csv`.
 
+## Keywords
+
+Context words are ASCII letters only. Apostrophes join a word (`don't` ->
+`dont`); spaces, hyphens, digits and everything else separate words, so the
+keyword `e-mail` means the two words `e` `mail`. To avoid keywords that would
+silently match the wrong words, `load_config` fails with a message naming the
+pattern and keyword when:
+
+- a keyword has a digit or an accented letter (`w2`, `1099`, `café`) or no letters;
+- the same keyword appears twice in a pattern (including once under `positive`
+  and once under `negative`);
+- a weight has the wrong sign (`positive` must be >= 0, `negative` <= 0).
+
 ## Config
 
 `extraction_config.yaml` is the source of truth. Keys:
@@ -98,7 +119,9 @@ The pattern regexes are never run on the context.
 ## Output files
 
 Both are written to the working directory and overwritten once per CLI run
-(library calls append). Both are gitignored.
+(library calls append). They are reset at the start of every run, so a run that
+fails (bad config, missing input file) leaves them empty rather than stale.
+Both are gitignored.
 
 - `errorlog.csv`: `timestamp, file, context, text, context_patterns, reason`,
   one row per context miss.

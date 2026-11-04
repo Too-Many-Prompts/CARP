@@ -437,3 +437,63 @@ def test_cli_csv_keeps_columns_clean(
     assert captured.out.splitlines()[0] == "file,label,text,start,end,score"
     assert "account_number" in captured.out
     assert "overlap" in captured.err
+
+
+# ---------------------------------------------------------------- keyword validation
+@pytest.mark.parametrize("keyword", ["w2", "1099", "café", "$"])
+def test_keyword_that_can_never_match_is_rejected(tmp_path: Path, keyword: str) -> None:
+    patterns = [{"label": "p", "priority": 1, "regex": "x",
+                 "context": {"positive": {keyword: 1}}}]
+    with pytest.raises(ValueError, match=r"pattern 'p'.*ASCII letters"):
+        make_cfg(tmp_path, patterns)
+
+
+def test_keyword_in_both_groups_is_rejected(tmp_path: Path) -> None:
+    patterns = [{"label": "p", "priority": 1, "regex": "x",
+                 "context": {"positive": {"invoice": 3}, "negative": {"Invoice": -3}}}]
+    with pytest.raises(ValueError, match="more than once"):
+        make_cfg(tmp_path, patterns)
+
+
+@pytest.mark.parametrize(
+    "group,weight", [("positive", -2), ("negative", 3)]
+)
+def test_wrong_signed_weight_is_rejected(tmp_path: Path, group: str, weight: int) -> None:
+    patterns = [{"label": "p", "priority": 1, "regex": "x",
+                 "context": {group: {"word": weight}}}]
+    with pytest.raises(ValueError, match="weight"):
+        make_cfg(tmp_path, patterns)
+
+
+def test_hyphenated_keyword_matches_like_context_words(tmp_path: Path) -> None:
+    # words.py splits on hyphens, so "e-mail" must be the two words e + mail.
+    patterns = [{"label": "p", "priority": 1, "regex": r"\d+",
+                 "context": {"positive": {"e-mail": 2}}}]
+    cfg = make_cfg(tmp_path, patterns)
+    assert extract("e-mail 42", cfg)[0].score == 2.0
+
+
+# ---------------------------------------------------------------- CLI failure paths
+def test_cli_missing_file_is_a_clean_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    good = tmp_path / "good.txt"
+    good.write_text("call 555-123-4567", encoding="utf-8")
+    rc = main(["--config", str(CONFIG_PATH), str(good), str(tmp_path / "nope.txt")])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "cannot read" in captured.err and "nope.txt" in captured.err
+    assert captured.out == ""                       # no partial output
+    assert read_report() == []                      # nothing written for good.txt
+
+
+def test_cli_failed_config_clears_stale_logs(tmp_path: Path) -> None:
+    ok = tmp_path / "ok.txt"
+    ok.write_text("Invoice INV-004521", encoding="utf-8")
+    assert main(["--config", str(CONFIG_PATH), "--context", "call", str(ok)]) == 0
+    assert read_error_log() and read_report()       # populated by a good run
+
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("settings: {}\n", encoding="utf-8")
+    assert main(["--config", str(bad), str(ok)]) == 2
+    assert read_error_log() == [] and read_report() == []   # stale rows gone

@@ -42,6 +42,9 @@ each match using nearby context words, and resolves overlapping matches.
 - The decision log from `extract_with_report()` is also written as CSV, one row
   per decision, to `./extract_report.csv` (`write_report_csv()`). `main()`
   overwrites it once per CLI run.
+- Context keywords are ASCII letters only (matching `words.py`); `load_config`
+  rejects digit/accented keywords, duplicate keywords within a pattern and
+  wrong-signed weights.
 - Also unit-test: coexist overlap, non-coexist overlap, length tie-break,
   multi-word keywords, invalid regex.
 - Run `pytest -q` after every change and do not report success until it passes.
