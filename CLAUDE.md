@@ -32,6 +32,10 @@ each match using nearby context words, and resolves overlapping matches.
   `extract()` returns exactly the expected (label, text) pairs, order-insensitive.
   A test case may include an optional `context` string (and `name`), which is
   passed to `extract()` along with `text`.
+- A context is matched (whole words/phrases, case-insensitive) against each
+  pattern's `context.positive` keywords; only patterns with a hit run on the
+  text. No context or no hits: all patterns run. Pattern regexes are never run
+  on the context.
 - A context that selects patterns but yields no matches is never dropped silently:
   `extract()` appends a row (timestamp, file, context, text, context_patterns,
   reason) to `./errorlog.csv`. `main()` overwrites that file once per CLI run.

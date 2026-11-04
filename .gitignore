@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 errorlog.csv
 extract_report.csv
+.claude/

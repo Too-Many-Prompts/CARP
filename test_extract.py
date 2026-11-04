@@ -18,6 +18,7 @@ from extract import (
     extract_with_report,
     load_config,
     main,
+    select_patterns,
     write_report_csv,
 )
 from words import next_words, prev_words
@@ -220,8 +221,9 @@ CTX_TEXT = "Invoice INV-004521 dated 03/14/2026 on 2026-03-14"
 def test_context_decisions_are_logged() -> None:
     _, no_hits = extract_with_report(("nothing relevant here", CTX_TEXT), REAL_CFG)
     assert "no context hits" in no_hits[0].reason
-    _, hit = extract_with_report(("2026-03-14", CTX_TEXT), REAL_CFG)
+    _, hit = extract_with_report(("dated", CTX_TEXT), REAL_CFG)
     assert hit[0].patterns == ["date"]
+    assert "date (dated)" in hit[0].reason
 
 
 def test_context_none_or_empty_matches_plain() -> None:
@@ -233,7 +235,7 @@ def test_context_none_or_empty_matches_plain() -> None:
 
 
 def test_context_miss_is_written_to_error_log() -> None:
-    inp = ("call 555-123-4567", "Invoice INV-004521,\nno phone here")
+    inp = ("please call", "Invoice INV-004521,\nno phone here")
     matches, decisions = extract_with_report(inp, REAL_CFG, source="doc1.txt")
     assert matches == []
     assert decisions[-1].kind == "context_miss"
@@ -242,7 +244,7 @@ def test_context_miss_is_written_to_error_log() -> None:
     row = rows[0]
     assert list(row) == ["timestamp", "file", "context", "text", "context_patterns", "reason"]
     assert row["file"] == "doc1.txt"
-    assert row["context"] == "call 555-123-4567"        # raw, un-normalized
+    assert row["context"] == "please call"              # raw, un-normalized
     assert row["text"] == "Invoice INV-004521,\nno phone here"
     assert row["context_patterns"] == "phone_number"
     assert "no matches in text" in row["reason"]
@@ -251,31 +253,64 @@ def test_context_miss_is_written_to_error_log() -> None:
 def test_context_miss_when_candidates_all_dropped(tmp_path: Path) -> None:
     patterns = [
         {"label": "n", "priority": 1, "regex": "\\d+",
-         "context": {"negative": {"bad": -1}}},
+         "context": {"positive": {"num": 1}, "negative": {"bad": -1}}},
     ]
     cfg = make_cfg(tmp_path, patterns, min_score=0)
-    assert extract(("7", "bad 12"), cfg) == []
+    assert extract(("num", "bad 12"), cfg) == []
     assert "dropped" in read_error_log()[0]["reason"]
 
 
 def test_no_error_log_when_not_a_context_miss() -> None:
     extract((None, "no matches at all"), REAL_CFG)                    # no context
     extract(("nothing relevant here", "no matches at all"), REAL_CFG)  # context, no hits
-    extract(("555-123-4567", "call 555-123-4567"), REAL_CFG)          # context hit, matched
+    extract(("tel", "call 555-123-4567"), REAL_CFG)                   # context hit, matched
     assert read_error_log() == []
 
 
 def test_error_log_accumulates_within_a_run() -> None:
     for i in range(2):
-        extract(("555-123-4567", f"nothing {i}"), REAL_CFG)
+        extract(("tel", f"nothing {i}"), REAL_CFG)
     assert [r["text"] for r in read_error_log()] == ["nothing 0", "nothing 1"]
 
 
-def test_context_is_normalized() -> None:
-    # Context uses an en dash; normalization turns it into a hyphen so the
-    # date pattern still hits.
-    result = extract(("2026–03–14", CTX_TEXT), REAL_CFG)
-    assert {m.label for m in result} == {"date"}
+def test_context_match_ignores_case_and_punctuation() -> None:
+    result = extract(("ACCT:", "Acct 5551234567 call 555-123-4567"), REAL_CFG)
+    assert {m.label for m in result} == {"account_number"}
+
+
+def _sel(context: str) -> list[str]:
+    chosen, _ = select_patterns(context, REAL_CFG.patterns)
+    return [p.label for p in chosen]
+
+
+def test_select_patterns_whole_words_only() -> None:
+    # 'tel' inside 'hotel' is not a hit, so nothing is selected and all run.
+    chosen, decision = select_patterns("hotel", REAL_CFG.patterns)
+    assert not decision.restricted
+    assert [p.label for p in chosen] == [p.label for p in REAL_CFG.patterns]
+
+
+def test_select_patterns_phrase_must_be_contiguous() -> None:
+    assert "amount" in _sel("amount due")
+    assert _sel("due total") != _sel("amount due")      # 'amount due' phrase absent
+    assert "invoice_number" not in _sel("due total")
+
+
+def test_select_patterns_negative_keywords_do_not_select(tmp_path: Path) -> None:
+    patterns = [
+        {"label": "A", "priority": 1, "regex": "a", "context": {"positive": {"yes": 1}}},
+        {"label": "B", "priority": 2, "regex": "b", "context": {"negative": {"no": -1}}},
+    ]
+    cfg = make_cfg(tmp_path, patterns)
+    chosen, decision = select_patterns("no", cfg.patterns)   # only B's negative word
+    assert [p.label for p in chosen] == ["A", "B"] and not decision.restricted
+    chosen, decision = select_patterns("yes no", cfg.patterns)
+    assert [p.label for p in chosen] == ["A"] and decision.restricted
+
+
+def test_select_patterns_never_runs_regex_on_context() -> None:
+    # A phone number in the context has no keyword, so nothing is selected.
+    assert _sel("555-123-4567") == [p.label for p in REAL_CFG.patterns]
 
 
 def test_bad_input_type() -> None:
@@ -332,10 +367,10 @@ def test_decision_rows_overlap_and_coexist(tmp_path: Path) -> None:
 def test_decision_rows_min_score_and_context_miss(tmp_path: Path) -> None:
     patterns = [
         {"label": "n", "priority": 1, "regex": "\\d+",
-         "context": {"negative": {"bad": -1}}},
+         "context": {"positive": {"num": 1}, "negative": {"bad": -1}}},
     ]
     cfg = make_cfg(tmp_path, patterns, min_score=0)
-    _, decisions = extract_with_report(("7", "bad 12"), cfg)
+    _, decisions = extract_with_report(("num", "bad 12"), cfg)
     rows = {r["kind"]: r for r in decision_rows(decisions)}
     assert rows["context"]["outcome"] == "patterns_restricted"
     assert rows["context"]["patterns"] == "n"
@@ -381,7 +416,7 @@ def test_cli_overwrites_error_log_each_run(
     miss.write_text("Invoice INV-004521", encoding="utf-8")
     ok = tmp_path / "ok.txt"
     ok.write_text("call 555-123-4567", encoding="utf-8")
-    args = ["--config", str(CONFIG_PATH), "--context", "555-123-4567"]
+    args = ["--config", str(CONFIG_PATH), "--context", "tel"]
 
     assert main(args + [str(miss), str(ok)]) == 0
     rows = read_error_log()

@@ -11,7 +11,7 @@ CLI:
                [--context TEXT]
 
 Files written to the working directory:
-    errorlog.csv       context hit some patterns but nothing was extracted
+    errorlog.csv       context selected patterns (by positive keywords) but nothing was extracted
     extract_report.csv one row per decision (context, min_score, overlaps)
 Both are overwritten once per CLI run. Library callers can use
 write_report_csv(decisions, source) with the log from extract_with_report().
@@ -219,25 +219,52 @@ def select_patterns(
 ) -> tuple[list[Pattern], Decision]:
     """Return the patterns to run on the input text.
 
-    A pattern "matches" the (already normalized) context on any raw regex hit.
-    If at least one does, only those run. With no context, or no hits, all run.
+    A pattern "matches" the context when any of its positive keywords/phrases
+    (weight > 0 under `context.positive` in the YAML) occurs in it as whole
+    words, case-insensitively. The pattern regexes are NOT run on the context.
+    If at least one pattern matches, only those run on the text. With no
+    context, or no matches, all run.
     """
     if not context or not context.strip():
         return list(patterns), Decision(
             "context", "no context supplied, all patterns used",
             patterns=[p.label for p in patterns],
         )
-    hits = [p for p in patterns if p.regex.search(context) is not None]
+    words = _context_words(context)
+    hits: list[Pattern] = []
+    found: list[str] = []
+    for p in patterns:
+        kws = _context_hits(words, p)
+        if kws:
+            hits.append(p)
+            found.append(f"{p.label} ({', '.join(kws)})")
     if not hits:
         return list(patterns), Decision(
             "context", "no context hits, all patterns used",
             patterns=[p.label for p in patterns],
         )
-    labels = [p.label for p in hits]
     return hits, Decision(
-        "context", f"context matched {', '.join(labels)}; only these patterns used",
-        patterns=labels, restricted=True,
+        "context", f"context matched {', '.join(found)}; only these patterns used",
+        patterns=[p.label for p in hits], restricted=True,
     )
+
+
+def _context_words(context: str) -> list[str]:
+    """Lowercase letter-only words of the context (same reduction as keywords)."""
+    return _keyword_words(context)
+
+
+def _context_hits(words: list[str], pattern: Pattern) -> list[str]:
+    """Positive keywords of `pattern` that occur in `words` as a contiguous phrase."""
+    hits: list[str] = []
+    for keyword, weight in pattern.weights.items():
+        kw = _keyword_words(keyword)
+        size = len(kw)
+        if weight <= 0 or size == 0:
+            continue
+        if any(words[i:i + size] == kw for i in range(len(words) - size + 1)):
+            hits.append(keyword)
+    return hits
 
 
 # --------------------------------------------------------------------------
@@ -577,7 +604,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("files", nargs="+", metavar="FILE")
     parser.add_argument("--format", choices=("json", "csv"), default="json")
     parser.add_argument("--context", default=None,
-                        help="optional context text; patterns matching it are the only ones run")
+                        help="optional context text; patterns whose positive keywords appear in it are the only ones run")
     args = parser.parse_args(argv)
 
     try:

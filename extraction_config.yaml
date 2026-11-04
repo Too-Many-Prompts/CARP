@@ -92,15 +92,23 @@ tests:
       - {label: timestamp, text: "2026-03-14 09:30:00"}
       - {label: date, text: "2026-03-14"}
 
-  # Optional `context` per case: patterns that match it are the only ones run.
-  - name: context narrows to matched patterns (date only)
-    context: "2026-03-14"
-    text: "Invoice INV-004521 dated 03/14/2026 on 2026-03-14"
+  # Optional `context` per case: it is matched against each pattern's
+  # `positive` keywords; patterns with a hit are the only ones run on the text.
+  - name: context keyword narrows to its pattern (account_number only)
+    context: "Acct"
+    text: "Acct 5551234567 call 555-123-4567"
     expect:
-      - {label: date, text: "03/14/2026"}
-      - {label: date, text: "2026-03-14"}
+      - {label: account_number, text: "5551234567"}
 
-  - name: context with no hits falls back to all patterns
+  - name: context phrase selects every pattern listing it (phone excluded)
+    context: "amount due"
+    text: "Invoice INV-004521 dated 03/14/2026, amount due $1,250.00 call 555-123-4567"
+    expect:
+      - {label: invoice_number, text: "INV-004521"}
+      - {label: date, text: "03/14/2026"}
+      - {label: amount, text: "$1,250.00"}
+
+  - name: context with no keyword hits falls back to all patterns
     context: "nothing relevant here"
     text: "Invoice INV-004521 dated 03/14/2026 on 2026-03-14"
     expect:
@@ -108,7 +116,7 @@ tests:
       - {label: date, text: "03/14/2026"}
       - {label: date, text: "2026-03-14"}
 
-  - name: context hits phone_number but text has no phone number
-    context: "555-123-4567"
+  - name: context hits phone_number keywords but text has no phone number
+    context: "call me"
     text: "Invoice INV-004521"
     expect: []
