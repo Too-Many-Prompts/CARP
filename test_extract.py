@@ -11,11 +11,14 @@ import pytest
 import yaml
 
 from extract import (
+    REPORT_FIELDS,
     Config,
+    decision_rows,
     extract,
     extract_with_report,
     load_config,
     main,
+    write_report_csv,
 )
 from words import next_words, prev_words
 
@@ -301,6 +304,74 @@ def test_cli_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert out["matches"][0]["text"] == "555-123-4567"
     assert set(out["matches"][0]) == {"file", "label", "text", "start", "end", "score"}
     assert any(o["kind"] == "context" for o in out["overlaps"])
+
+
+def read_report() -> list[dict[str, str]]:
+    with open("extract_report.csv", encoding="utf-8", newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def test_decision_rows_overlap_and_coexist(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, OVERLAP_PATTERNS)
+    _, decisions = extract_with_report("abc12", cfg)
+    rows = {r["kind"]: r for r in decision_rows(decisions, source="f.txt")}
+    overlap = rows["overlap"]
+    assert overlap["file"] == "f.txt"
+    assert overlap["outcome"] == "a_wins_b_dropped"
+    assert overlap["a_label"] != overlap["b_label"] and overlap["b_label"]
+    assert overlap["reason"]
+    assert rows["context"]["outcome"] == "all_patterns_used"
+
+    co_cfg = make_cfg(tmp_path, OVERLAP_PATTERNS, coexist=[["A", "B"]])
+    _, co_decisions = extract_with_report("abc12", co_cfg)
+    co = [r for r in decision_rows(co_decisions) if r["kind"] == "coexist"][0]
+    assert co["outcome"] == "both_kept"
+    assert {co["a_label"], co["b_label"]} == {"A", "B"}
+
+
+def test_decision_rows_min_score_and_context_miss(tmp_path: Path) -> None:
+    patterns = [
+        {"label": "n", "priority": 1, "regex": "\\d+",
+         "context": {"negative": {"bad": -1}}},
+    ]
+    cfg = make_cfg(tmp_path, patterns, min_score=0)
+    _, decisions = extract_with_report(("7", "bad 12"), cfg)
+    rows = {r["kind"]: r for r in decision_rows(decisions)}
+    assert rows["context"]["outcome"] == "patterns_restricted"
+    assert rows["context"]["patterns"] == "n"
+    dropped = rows["below_min_score"]
+    assert (dropped["outcome"], dropped["a_label"], dropped["a_text"]) == ("dropped", "n", "12")
+    assert dropped["b_label"] == ""
+    assert rows["context_miss"]["outcome"] == "context_miss"
+
+
+def test_write_report_csv_header_once_and_appends(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, OVERLAP_PATTERNS)
+    _, decisions = extract_with_report("abc12", cfg)
+    write_report_csv(decisions, source="one")
+    write_report_csv(decisions, source="two")
+    text = Path("extract_report.csv").read_text(encoding="utf-8")
+    assert text.count(",".join(REPORT_FIELDS)) == 1
+    assert [r["file"] for r in read_report()][-1] == "two"
+    assert {r["file"] for r in read_report()} == {"one", "two"}
+
+
+def test_cli_writes_and_overwrites_report(tmp_path: Path) -> None:
+    f = tmp_path / "in.txt"
+    f.write_text("Acct 5551234567 is overdue.", encoding="utf-8")
+    args = ["--config", str(CONFIG_PATH), str(f)]
+
+    assert main(args) == 0
+    rows = read_report()
+    overlap = [r for r in rows if r["kind"] == "overlap"]
+    assert len(overlap) == 1
+    assert overlap[0]["file"] == str(f)
+    assert overlap[0]["a_label"] == "account_number"
+    assert overlap[0]["b_label"] == "phone_number"
+    assert "score 3.00 > 0.00" in overlap[0]["reason"]
+
+    assert main(args) == 0                      # second run overwrites, not appends
+    assert len(read_report()) == len(rows)
 
 
 def test_cli_overwrites_error_log_each_run(

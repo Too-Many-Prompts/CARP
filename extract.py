@@ -9,6 +9,12 @@ Library use:
 CLI:
     extract.py --config extraction_config.yaml FILE... [--format json|csv]
                [--context TEXT]
+
+Files written to the working directory:
+    errorlog.csv       context hit some patterns but nothing was extracted
+    extract_report.csv one row per decision (context, min_score, overlaps)
+Both are overwritten once per CLI run. Library callers can use
+write_report_csv(decisions, source) with the log from extract_with_report().
 """
 from __future__ import annotations
 
@@ -33,6 +39,15 @@ CONTEXT_DIRECTIONS = ("before", "after", "both")
 # patterns but nothing was extracted. main() resets it once per CLI run.
 ERROR_LOG_PATH = "errorlog.csv"
 ERROR_LOG_FIELDS = ("timestamp", "file", "context", "text", "context_patterns", "reason")
+
+# The decision report (extract_with_report's log) as CSV; main() resets it once per run.
+REPORT_PATH = "extract_report.csv"
+_CAND_COLS = ("label", "text", "start", "end", "score")
+REPORT_FIELDS = (
+    ("file", "kind", "outcome", "reason", "patterns")
+    + tuple(f"a_{k}" for k in _CAND_COLS)
+    + tuple(f"b_{k}" for k in _CAND_COLS)
+)
 REQUIRED_SETTINGS = (
     "context_window_words",
     "distance_decay",
@@ -228,30 +243,98 @@ def select_patterns(
 # --------------------------------------------------------------------------
 # Error log: context selected patterns but nothing was extracted
 # --------------------------------------------------------------------------
+def _reset_csv(path: str, fields: Sequence[str]) -> None:
+    """Overwrite `path` with just a header row."""
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        csv.writer(fh, lineterminator="\n").writerow(fields)
+
+
+def _append_csv_rows(
+    path: str, fields: Sequence[str], rows: list[dict[str, Any]]
+) -> None:
+    """Append rows to `path`, writing the header first if the file is new."""
+    target = Path(path)
+    is_new = not target.exists() or target.stat().st_size == 0
+    with open(target, "a", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields, lineterminator="\n")
+        if is_new:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
 def reset_error_log() -> None:
     """Overwrite ERROR_LOG_PATH with just the header row."""
-    with open(ERROR_LOG_PATH, "w", encoding="utf-8", newline="") as fh:
-        csv.writer(fh).writerow(ERROR_LOG_FIELDS)
+    _reset_csv(ERROR_LOG_PATH, ERROR_LOG_FIELDS)
 
 
 def log_context_miss(
     source: str, context: str, text: str, labels: list[str], reason: str
 ) -> None:
     """Append one row to ERROR_LOG_PATH (header written if the file is new)."""
-    path = Path(ERROR_LOG_PATH)
-    is_new = not path.exists() or path.stat().st_size == 0
-    with open(path, "a", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=ERROR_LOG_FIELDS, lineterminator="\n")
-        if is_new:
-            writer.writeheader()
-        writer.writerow({
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
+    _append_csv_rows(ERROR_LOG_PATH, ERROR_LOG_FIELDS, [{
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "file": source,
+        "context": context,
+        "text": text,
+        "context_patterns": ";".join(labels),
+        "reason": reason,
+    }])
+
+
+# --------------------------------------------------------------------------
+# Report CSV: one flat row per decision
+# --------------------------------------------------------------------------
+def _cand_columns(prefix: str, cand: Candidate | None) -> dict[str, Any]:
+    data = cand.to_dict() if cand else {}
+    return {f"{prefix}_{k}": data.get(k, "") for k in _CAND_COLS}
+
+
+def decision_rows(decisions: list[Decision], source: str = "") -> list[dict[str, Any]]:
+    """Map decisions to flat report rows.
+
+    a_* / b_* are the candidates involved. overlap: a = winner, b = dropped.
+    below_min_score: a = dropped. coexist: a and b are both kept.
+    """
+    rows: list[dict[str, Any]] = []
+    for d in decisions:
+        a: Candidate | None = None
+        b: Candidate | None = None
+        if d.kind == "overlap":
+            a = d.winner
+            b = next((c for c in d.candidates if c is not d.winner), None)
+            outcome = "a_wins_b_dropped"
+        elif d.kind == "below_min_score":
+            a = d.candidates[0] if d.candidates else None
+            outcome = "dropped"
+        elif d.kind == "coexist":
+            a, b = d.candidates[0], d.candidates[1]
+            outcome = "both_kept"
+        elif d.kind == "context_miss":
+            outcome = "context_miss"
+        else:  # context
+            outcome = "patterns_restricted" if d.restricted else "all_patterns_used"
+        rows.append({
             "file": source,
-            "context": context,
-            "text": text,
-            "context_patterns": ";".join(labels),
-            "reason": reason,
+            "kind": d.kind,
+            "outcome": outcome,
+            "reason": d.reason,
+            "patterns": ";".join(d.patterns),
+            **_cand_columns("a", a),
+            **_cand_columns("b", b),
         })
+    return rows
+
+
+def reset_report(path: str = REPORT_PATH) -> None:
+    """Overwrite the report CSV with just the header row."""
+    _reset_csv(path, REPORT_FIELDS)
+
+
+def write_report_csv(
+    decisions: list[Decision], source: str = "", path: str = REPORT_PATH
+) -> None:
+    """Append the decisions as rows to the report CSV (header if file is new)."""
+    _append_csv_rows(path, REPORT_FIELDS, decision_rows(decisions, source))
 
 
 # --------------------------------------------------------------------------
@@ -503,7 +586,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    reset_error_log()  # one fresh errorlog.csv per CLI run
+    reset_error_log()  # one fresh errorlog.csv and report per CLI run
+    reset_report()
 
     rows: list[dict[str, Any]] = []
     log: list[dict[str, Any]] = []
@@ -512,6 +596,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         matches, decisions = extract_with_report((args.context, text), cfg, source=name)
         rows.extend({"file": name, **m.to_dict()} for m in matches)
         log.extend({"file": name, **d.to_dict()} for d in decisions)
+        write_report_csv(decisions, source=name)
 
     fields = ["file", "label", "text", "start", "end", "score"]
     if args.format == "json":

@@ -35,6 +35,9 @@ each match using nearby context words, and resolves overlapping matches.
 - A context that selects patterns but yields no matches is never dropped silently:
   `extract()` appends a row (timestamp, file, context, text, context_patterns,
   reason) to `./errorlog.csv`. `main()` overwrites that file once per CLI run.
+- The decision log from `extract_with_report()` is also written as CSV, one row
+  per decision, to `./extract_report.csv` (`write_report_csv()`). `main()`
+  overwrites it once per CLI run.
 - Also unit-test: coexist overlap, non-coexist overlap, length tie-break,
   multi-word keywords, invalid regex.
 - Run `pytest -q` after every change and do not report success until it passes.
