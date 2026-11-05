@@ -339,17 +339,18 @@ def reset_error_log() -> None:
     _reset_csv(ERROR_LOG_PATH, ERROR_LOG_FIELDS)
 
 
-def log_context_miss(
-    source: str, context: str, text: str, labels: list[str], reason: str
-) -> None:
-    """Append one row to ERROR_LOG_PATH (header written if the file is new)."""
+def log_context_miss(source: str, context: str, text: str, miss: Decision) -> None:
+    """Append one row to ERROR_LOG_PATH (header written if the file is new).
+
+    `miss` is the "context_miss" decision; it supplies the patterns and reason.
+    """
     _append_csv_rows(ERROR_LOG_PATH, ERROR_LOG_FIELDS, [{
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "file": source,
         "context": context,
         "text": text,
-        "context_patterns": ";".join(labels),
-        "reason": reason,
+        "context_patterns": miss["patterns"],
+        "reason": miss["reason"],
     }])
 
 
@@ -597,8 +598,9 @@ def extract_with_report(
                       "found in text but all dropped (min_score/overlap)")
         else:
             reason = f"context matched {', '.join(labels)}; no matches in text"
-        decisions.append(_decision("context_miss", "context_miss", reason, patterns=labels))
-        log_context_miss(source, context or "", raw_text, labels, reason)
+        miss = _decision("context_miss", "context_miss", reason, patterns=labels)
+        decisions.append(miss)
+        log_context_miss(source, context or "", raw_text, miss)
     return matches, [{**d, "file": source} for d in decisions]
 
 
