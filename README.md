@@ -22,13 +22,13 @@ python -m venv .venv
     [--format json|csv] [--context TEXT]
 ```
 
-- `--format json` (default) prints `{"matches": [...], "overlaps": [...]}`.
-  Despite its name, `overlaps` is the **whole decision log** (context,
-  `below_min_score`, overlap and coexist entries), so filter on `kind`.
+- `--format json` (default) prints `{"matches": [...], "decisions": [...]}`.
+  `decisions` is the whole decision log (context, `below_min_score`, overlap
+  and coexist entries) as flat rows with the same columns as
+  `extract_report.csv`, so filter on `kind`.
 - `--format csv` prints matches on stdout with the columns
-  `file,label,text,start,end,score`. The decision log is printed to **stderr**
-  as one JSON object per line, which keeps stdout clean CSV. Redirect with
-  `2>/dev/null` if you don't want it; it is also in `extract_report.csv`.
+  `file,label,text,start,end,score`. The decision log is not printed; it is
+  in `extract_report.csv`.
 - `--context TEXT` selects which patterns run (see [Context](#context)). The
   same context is applied to **every** FILE in the run.
 - Exit codes: `0` success; `2` for a config error or an unreadable input file
@@ -131,7 +131,8 @@ Both are gitignored.
   (`label, text, start, end, score`).
   - `kind` is `context`, `context_miss`, `below_min_score`, `overlap` or `coexist`.
   - In an `overlap` row, `a` is the winner and `b` the dropped candidate.
-  - Library callers write it with `write_report_csv(decisions, source)`.
+  - Library callers write it with `write_report_csv(decisions)`; pass `source=` to
+    `extract_with_report()` to fill the `file` column.
 
 ## Tests
 

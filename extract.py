@@ -14,7 +14,7 @@ Files written to the working directory:
     errorlog.csv       context selected patterns (by positive keywords) but nothing was extracted
     extract_report.csv one row per decision (context, min_score, overlaps)
 Both are overwritten once per CLI run. Library callers can use
-write_report_csv(decisions, source) with the log from extract_with_report().
+write_report_csv(decisions) with the log from extract_with_report(..., source=...).
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ import csv
 import json
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence, Union
@@ -99,30 +99,40 @@ class Candidate:
         }
 
 
-@dataclass
-class Decision:
-    """One entry of the troubleshooting log.
+# One entry of the troubleshooting log: a flat dict with the REPORT_FIELDS
+# columns (file, kind, outcome, reason, patterns, a_*, b_*). It is the single
+# form used for extract_report.csv, errorlog.csv and the CLI JSON output.
+#
+# kind: "context" | "context_miss" | "below_min_score" | "overlap" | "coexist"
+Decision = dict[str, Any]
 
-    kind: "context" | "context_miss" | "below_min_score" | "overlap" | "coexist"
-    restricted: True on a "context" decision when the context hit some
-    patterns and so limited which ones run on the text.
+
+def _cand_columns(prefix: str, cand: Candidate | None) -> dict[str, Any]:
+    data = cand.to_dict() if cand else {}
+    return {f"{prefix}_{k}": data.get(k, "") for k in _CAND_COLS}
+
+
+def _decision(
+    kind: str,
+    outcome: str,
+    reason: str,
+    a: Candidate | None = None,
+    b: Candidate | None = None,
+    patterns: Sequence[str] = (),
+) -> Decision:
+    """Build one log row. a/b are the candidates involved:
+    overlap: a = winner, b = dropped. below_min_score: a = dropped.
+    coexist: a and b are both kept. The `file` column is filled in later.
     """
-
-    kind: str
-    reason: str
-    candidates: list[Candidate] = field(default_factory=list)
-    winner: Candidate | None = None
-    patterns: list[str] = field(default_factory=list)
-    restricted: bool = False
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "kind": self.kind,
-            "reason": self.reason,
-            "patterns": list(self.patterns),
-            "candidates": [c.to_dict() for c in self.candidates],
-            "winner": self.winner.to_dict() if self.winner else None,
-        }
+    return {
+        "file": "",
+        "kind": kind,
+        "outcome": outcome,
+        "reason": reason,
+        "patterns": ";".join(patterns),
+        **_cand_columns("a", a),
+        **_cand_columns("b", b),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -260,8 +270,8 @@ def select_patterns(
     context, or no matches, all run.
     """
     if not context or not context.strip():
-        return list(patterns), Decision(
-            "context", "no context supplied, all patterns used",
+        return list(patterns), _decision(
+            "context", "all_patterns_used", "no context supplied, all patterns used",
             patterns=[p.label for p in patterns],
         )
     words = _context_words(context)
@@ -273,13 +283,14 @@ def select_patterns(
             hits.append(p)
             found.append(f"{p.label} ({', '.join(kws)})")
     if not hits:
-        return list(patterns), Decision(
-            "context", "no context hits, all patterns used",
+        return list(patterns), _decision(
+            "context", "all_patterns_used", "no context hits, all patterns used",
             patterns=[p.label for p in patterns],
         )
-    return hits, Decision(
-        "context", f"context matched {', '.join(found)}; only these patterns used",
-        patterns=[p.label for p in hits], restricted=True,
+    return hits, _decision(
+        "context", "patterns_restricted",
+        f"context matched {', '.join(found)}; only these patterns used",
+        patterns=[p.label for p in hits],
     )
 
 
@@ -345,57 +356,14 @@ def log_context_miss(
 # --------------------------------------------------------------------------
 # Report CSV: one flat row per decision
 # --------------------------------------------------------------------------
-def _cand_columns(prefix: str, cand: Candidate | None) -> dict[str, Any]:
-    data = cand.to_dict() if cand else {}
-    return {f"{prefix}_{k}": data.get(k, "") for k in _CAND_COLS}
-
-
-def decision_rows(decisions: list[Decision], source: str = "") -> list[dict[str, Any]]:
-    """Map decisions to flat report rows.
-
-    a_* / b_* are the candidates involved. overlap: a = winner, b = dropped.
-    below_min_score: a = dropped. coexist: a and b are both kept.
-    """
-    rows: list[dict[str, Any]] = []
-    for d in decisions:
-        a: Candidate | None = None
-        b: Candidate | None = None
-        if d.kind == "overlap":
-            a = d.winner
-            b = next((c for c in d.candidates if c is not d.winner), None)
-            outcome = "a_wins_b_dropped"
-        elif d.kind == "below_min_score":
-            a = d.candidates[0] if d.candidates else None
-            outcome = "dropped"
-        elif d.kind == "coexist":
-            a, b = d.candidates[0], d.candidates[1]
-            outcome = "both_kept"
-        elif d.kind == "context_miss":
-            outcome = "context_miss"
-        else:  # context
-            outcome = "patterns_restricted" if d.restricted else "all_patterns_used"
-        rows.append({
-            "file": source,
-            "kind": d.kind,
-            "outcome": outcome,
-            "reason": d.reason,
-            "patterns": ";".join(d.patterns),
-            **_cand_columns("a", a),
-            **_cand_columns("b", b),
-        })
-    return rows
-
-
 def reset_report(path: str = REPORT_PATH) -> None:
     """Overwrite the report CSV with just the header row."""
     _reset_csv(path, REPORT_FIELDS)
 
 
-def write_report_csv(
-    decisions: list[Decision], source: str = "", path: str = REPORT_PATH
-) -> None:
+def write_report_csv(decisions: list[Decision], path: str = REPORT_PATH) -> None:
     """Append the decisions as rows to the report CSV (header if file is new)."""
-    _append_csv_rows(path, REPORT_FIELDS, decision_rows(decisions, source))
+    _append_csv_rows(path, REPORT_FIELDS, decisions)
 
 
 # --------------------------------------------------------------------------
@@ -548,8 +516,8 @@ def resolve_overlaps(
     for c in cands:
         if c.score < min_score:
             decisions.append(
-                Decision("below_min_score",
-                         f"score {c.score:.2f} < min_score {min_score}", [c])
+                _decision("below_min_score", "dropped",
+                          f"score {c.score:.2f} < min_score {min_score}", a=c)
             )
         else:
             survivors.append(c)
@@ -563,13 +531,14 @@ def resolve_overlaps(
                 continue
             if frozenset((a.label, c.label)) in cfg.coexist:
                 pending.append(
-                    Decision("coexist",
-                             f"{a.label}/{c.label} pair is in coexist; both kept",
-                             [a, c])
+                    _decision("coexist", "both_kept",
+                              f"{a.label}/{c.label} pair is in coexist; both kept",
+                              a=a, b=c)
                 )
             else:
                 decisions.append(
-                    Decision("overlap", _why_wins(a, c, order), [a, c], winner=a)
+                    _decision("overlap", "a_wins_b_dropped",
+                              _why_wins(a, c, order), a=a, b=c)
                 )
                 beaten = True
                 break
@@ -621,16 +590,16 @@ def extract_with_report(
     matches, decisions = resolve_overlaps(cands, cfg)
     decisions = [ctx_decision] + decisions
 
-    if ctx_decision.restricted and not matches:
-        labels = ctx_decision.patterns
+    if ctx_decision["outcome"] == "patterns_restricted" and not matches:
+        labels = [p.label for p in patterns]
         if cands:
             reason = (f"context matched {', '.join(labels)}; {len(cands)} candidate(s) "
                       "found in text but all dropped (min_score/overlap)")
         else:
             reason = f"context matched {', '.join(labels)}; no matches in text"
-        decisions.append(Decision("context_miss", reason, patterns=labels))
+        decisions.append(_decision("context_miss", "context_miss", reason, patterns=labels))
         log_context_miss(source, context or "", raw_text, labels, reason)
-    return matches, decisions
+    return matches, [{**d, "file": source} for d in decisions]
 
 
 def extract(inp: ExtractInput, cfg: Config, source: str = "") -> list[Candidate]:
@@ -670,23 +639,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
 
     rows: list[dict[str, Any]] = []
-    log: list[dict[str, Any]] = []
+    log: list[Decision] = []
     for name, text in texts:
         matches, decisions = extract_with_report((args.context, text), cfg, source=name)
         rows.extend({"file": name, **m.to_dict()} for m in matches)
-        log.extend({"file": name, **d.to_dict()} for d in decisions)
-        write_report_csv(decisions, source=name)
+        log.extend(decisions)
+        write_report_csv(decisions)
 
     fields = ["file", "label", "text", "start", "end", "score"]
     if args.format == "json":
-        json.dump({"matches": rows, "overlaps": log}, sys.stdout, indent=2, ensure_ascii=False)
+        json.dump({"matches": rows, "decisions": log}, sys.stdout, indent=2, ensure_ascii=False)
         sys.stdout.write("\n")
     else:
         writer = csv.DictWriter(sys.stdout, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
-        for entry in log:  # keep CSV columns clean: decisions go to stderr
-            print(json.dumps(entry, ensure_ascii=False), file=sys.stderr)
     return 0
 
 

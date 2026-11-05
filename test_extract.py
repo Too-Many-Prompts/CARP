@@ -14,7 +14,6 @@ import yaml
 from extract import (
     REPORT_FIELDS,
     Config,
-    decision_rows,
     extract,
     extract_with_report,
     load_config,
@@ -98,16 +97,16 @@ def test_coexist_overlap_keeps_both(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, OVERLAP_PATTERNS, coexist=[["B", "A"]])  # order-insensitive
     matches, decisions = extract_with_report("abc12", cfg)
     assert pairs(matches) == Counter({("A", "abc1"): 1, ("B", "c12"): 1})
-    assert any(d.kind == "coexist" for d in decisions)
+    assert any(d["kind"] == "coexist" for d in decisions)
 
 
 def test_non_coexist_overlap_keeps_one(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, OVERLAP_PATTERNS)
     matches, decisions = extract_with_report("abc12", cfg)
     assert len(matches) == 1
-    overlap = [d for d in decisions if d.kind == "overlap"]
+    overlap = [d for d in decisions if d["kind"] == "overlap"]
     assert len(overlap) == 1
-    assert overlap[0].winner is not None and overlap[0].reason
+    assert overlap[0]["a_label"] and overlap[0]["reason"]
 
 
 def test_length_tiebreak(tmp_path: Path) -> None:
@@ -118,7 +117,7 @@ def test_length_tiebreak(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, patterns)
     matches, decisions = extract_with_report("abcd", cfg)
     assert pairs(matches) == Counter({("long", "abcd"): 1})
-    assert "length 4 > 2" in [d for d in decisions if d.kind == "overlap"][0].reason
+    assert "length 4 > 2" in [d for d in decisions if d["kind"] == "overlap"][0]["reason"]
 
 
 def test_priority_breaks_full_tie(tmp_path: Path) -> None:
@@ -139,7 +138,7 @@ def test_min_score_is_strict(tmp_path: Path) -> None:
     assert len(extract("12", cfg)) == 1           # score 0 == min_score: kept
     matches, decisions = extract_with_report("bad 12", cfg)  # score -1: dropped
     assert matches == []
-    assert any(d.kind == "below_min_score" for d in decisions)
+    assert any(d["kind"] == "below_min_score" for d in decisions)
 
 
 # ---------------------------------------------------------------- keywords
@@ -248,10 +247,10 @@ CTX_TEXT = "Invoice INV-004521 dated 03/14/2026 on 2026-03-14"
 # and input forms.
 def test_context_decisions_are_logged() -> None:
     _, no_hits = extract_with_report(("nothing relevant here", CTX_TEXT), REAL_CFG)
-    assert "no context hits" in no_hits[0].reason
+    assert "no context hits" in no_hits[0]["reason"]
     _, hit = extract_with_report(("dated", CTX_TEXT), REAL_CFG)
-    assert hit[0].patterns == ["date"]
-    assert "date (dated)" in hit[0].reason
+    assert hit[0]["patterns"] == "date"
+    assert "date (dated)" in hit[0]["reason"]
 
 
 def test_context_none_or_empty_matches_plain() -> None:
@@ -266,7 +265,7 @@ def test_context_miss_is_written_to_error_log() -> None:
     inp = ("please call", "Invoice INV-004521,\nno phone here")
     matches, decisions = extract_with_report(inp, REAL_CFG, source="doc1.txt")
     assert matches == []
-    assert decisions[-1].kind == "context_miss"
+    assert decisions[-1]["kind"] == "context_miss"
     rows = read_error_log()
     assert len(rows) == 1
     row = rows[0]
@@ -314,7 +313,7 @@ def _sel(context: str) -> list[str]:
 def test_select_patterns_whole_words_only() -> None:
     # 'tel' inside 'hotel' is not a hit, so nothing is selected and all run.
     chosen, decision = select_patterns("hotel", REAL_CFG.patterns)
-    assert not decision.restricted
+    assert decision["outcome"] == "all_patterns_used"
     assert [p.label for p in chosen] == [p.label for p in REAL_CFG.patterns]
 
 
@@ -331,9 +330,9 @@ def test_select_patterns_negative_keywords_do_not_select(tmp_path: Path) -> None
     ]
     cfg = make_cfg(tmp_path, patterns)
     chosen, decision = select_patterns("no", cfg.patterns)   # only B's negative word
-    assert [p.label for p in chosen] == ["A", "B"] and not decision.restricted
+    assert [p.label for p in chosen] == ["A", "B"] and decision["outcome"] == "all_patterns_used"
     chosen, decision = select_patterns("yes no", cfg.patterns)
-    assert [p.label for p in chosen] == ["A"] and decision.restricted
+    assert [p.label for p in chosen] == ["A"] and decision["outcome"] == "patterns_restricted"
 
 
 def test_select_patterns_never_runs_regex_on_context() -> None:
@@ -366,7 +365,7 @@ def test_cli_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     out = json.loads(capsys.readouterr().out)
     assert out["matches"][0]["text"] == "555-123-4567"
     assert set(out["matches"][0]) == {"file", "label", "text", "start", "end", "score"}
-    assert any(o["kind"] == "context" for o in out["overlaps"])
+    assert any(o["kind"] == "context" for o in out["decisions"])
 
 
 def read_report() -> list[dict[str, str]]:
@@ -374,10 +373,10 @@ def read_report() -> list[dict[str, str]]:
         return list(csv.DictReader(fh))
 
 
-def test_decision_rows_overlap_and_coexist(tmp_path: Path) -> None:
+def test_decision_log_overlap_and_coexist(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, OVERLAP_PATTERNS)
-    _, decisions = extract_with_report("abc12", cfg)
-    rows = {r["kind"]: r for r in decision_rows(decisions, source="f.txt")}
+    _, decisions = extract_with_report("abc12", cfg, source="f.txt")
+    rows = {r["kind"]: r for r in decisions}
     overlap = rows["overlap"]
     assert overlap["file"] == "f.txt"
     assert overlap["outcome"] == "a_wins_b_dropped"
@@ -387,19 +386,19 @@ def test_decision_rows_overlap_and_coexist(tmp_path: Path) -> None:
 
     co_cfg = make_cfg(tmp_path, OVERLAP_PATTERNS, coexist=[["A", "B"]])
     _, co_decisions = extract_with_report("abc12", co_cfg)
-    co = [r for r in decision_rows(co_decisions) if r["kind"] == "coexist"][0]
+    co = [r for r in co_decisions if r["kind"] == "coexist"][0]
     assert co["outcome"] == "both_kept"
     assert {co["a_label"], co["b_label"]} == {"A", "B"}
 
 
-def test_decision_rows_min_score_and_context_miss(tmp_path: Path) -> None:
+def test_decision_log_min_score_and_context_miss(tmp_path: Path) -> None:
     patterns = [
         {"label": "n", "priority": 1, "regex": "\\d+",
          "context": {"positive": {"num": 1}, "negative": {"bad": -1}}},
     ]
     cfg = make_cfg(tmp_path, patterns, min_score=0)
     _, decisions = extract_with_report(("num", "bad 12"), cfg)
-    rows = {r["kind"]: r for r in decision_rows(decisions)}
+    rows = {r["kind"]: r for r in decisions}
     assert rows["context"]["outcome"] == "patterns_restricted"
     assert rows["context"]["patterns"] == "n"
     dropped = rows["below_min_score"]
@@ -410,9 +409,8 @@ def test_decision_rows_min_score_and_context_miss(tmp_path: Path) -> None:
 
 def test_write_report_csv_header_once_and_appends(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, OVERLAP_PATTERNS)
-    _, decisions = extract_with_report("abc12", cfg)
-    write_report_csv(decisions, source="one")
-    write_report_csv(decisions, source="two")
+    write_report_csv(extract_with_report("abc12", cfg, source="one")[1])
+    write_report_csv(extract_with_report("abc12", cfg, source="two")[1])
     text = Path("extract_report.csv").read_text(encoding="utf-8")
     assert text.count(",".join(REPORT_FIELDS)) == 1
     assert [r["file"] for r in read_report()][-1] == "two"
@@ -464,7 +462,8 @@ def test_cli_csv_keeps_columns_clean(
     captured = capsys.readouterr()
     assert captured.out.splitlines()[0] == "file,label,text,start,end,score"
     assert "account_number" in captured.out
-    assert "overlap" in captured.err
+    assert captured.err == ""                       # decisions live in extract_report.csv
+    assert any(r["kind"] == "overlap" for r in read_report())
 
 
 # ---------------------------------------------------------------- keyword validation
