@@ -662,6 +662,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     text = args.text
     if text is None:
+        if sys.stdin.isatty():
+            parser.error("no text: pass --text TEXT or pipe the text on stdin")
         text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
 
     matches, decisions = extract((args.context, text), cfg)

@@ -19,7 +19,8 @@ each match using nearby context words, and resolves overlapping matches.
 4. `score_candidate(...)`: take words before/after the match (per
    `settings.context_direction`: `before`, `after` or `both`, default `both`), add each matching
    keyword's weight (phrases allowed), divided by word distance if
-   `distance_decay` is true.
+   `distance_decay` is true. Words are taken only up to the first `settings.stop_at`
+   character (default `""`, none), e.g. `".!?"` keeps the scan in one sentence.
 5. `resolve_overlaps(...)`: drop below `min_score`; for overlapping spans keep
    both if the label pair is in `coexist`, else apply `overlap_tiebreak` in
    order (score, length, priority). Identical spans count as overlapping.

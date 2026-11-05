@@ -6,7 +6,7 @@ settings:
   context_window_words: 8        # words to look at on each side of a match
   context_direction: both        # which side(s) to search: before | after | both
   stop_at: ""                    # chars that end the context scan, e.g. ".!?" to stay in one sentence
-  distance_decay: true          # closer keywords count more (weight / distance)
+  distance_decay: true           # closer keywords count more (weight / distance)
   min_score: 0                   # drop candidates scoring below this
   case_sensitive: false
   overlap_tiebreak:              # applied in order when overlapping spans conflict

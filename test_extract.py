@@ -582,3 +582,17 @@ def test_stop_at_keeps_context_after_period(stop_at: str) -> None:
     matches = matches_of("acct. phone is 123-456-2342", _real_cfg_with_stop_at(stop_at))
     assert [(m.label, m.text) for m in matches] == [("phone_number", "123-456-2342")]
     assert matches[0].score == pytest.approx(1.5)
+
+
+def test_cli_without_text_on_a_terminal_is_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Tty:
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(sys, "stdin", Tty())
+    with pytest.raises(SystemExit) as exc:
+        main(["--config", str(CONFIG_PATH)])
+    assert exc.value.code == 2
+    assert "no text" in capsys.readouterr().err
