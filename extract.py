@@ -13,8 +13,14 @@ CLI:
 Files written to the working directory:
     errorlog.csv       context selected patterns (by positive keywords) but nothing was extracted
     extract_report.csv one row per decision (context, min_score, overlaps)
-Both are overwritten once per CLI run. Library callers can use
-write_report_csv(decisions) with the log from extract_with_report(..., source=...).
+Both are overwritten once per CLI run. Library callers append the log from
+extract_with_report(..., source=...) with write_report_csv(decisions), or with
+open_report() when making many calls (opens the file once, holds nothing).
+
+Memory: for large runs, write decisions as you go (open_report) instead of
+collecting them in a list. The CLI reads every input file into memory before
+processing, and --format json also holds all matches and decisions until the
+end; --format csv streams its output.
 """
 from __future__ import annotations
 
@@ -23,10 +29,11 @@ import csv
 import json
 import re
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Sequence, Union
+from typing import Any, Callable, Iterable, Iterator, Sequence, Union
 
 import yaml
 
@@ -362,9 +369,36 @@ def reset_report(path: str = REPORT_PATH) -> None:
     _reset_csv(path, REPORT_FIELDS)
 
 
-def write_report_csv(decisions: list[Decision], path: str = REPORT_PATH) -> None:
-    """Append the decisions as rows to the report CSV (header if file is new)."""
-    _append_csv_rows(path, REPORT_FIELDS, decisions)
+@contextmanager
+def open_report(path: str = REPORT_PATH) -> Iterator[Callable[[Iterable[Decision]], None]]:
+    """Keep the report CSV open while many extractions run.
+
+    Yields write(decisions), which appends rows straight to the file, so
+    nothing accumulates in memory and the file is opened once, not per call:
+
+        with open_report() as write:
+            for rid, text in big_input:
+                write(extract_with_report(text, cfg, source=rid)[1])
+
+    The header is written first if the file is new or empty.
+    """
+    target = Path(path)
+    is_new = not target.exists() or target.stat().st_size == 0
+    with open(target, "a", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=REPORT_FIELDS, lineterminator="\n")
+        if is_new:
+            writer.writeheader()
+        yield writer.writerows
+
+
+def write_report_csv(decisions: Iterable[Decision], path: str = REPORT_PATH) -> None:
+    """Append the decisions as rows to the report CSV (header if file is new).
+
+    Fine for a single call. For many calls use open_report(), which avoids
+    reopening the file every time.
+    """
+    with open_report(path) as write:
+        write(decisions)
 
 
 # --------------------------------------------------------------------------
@@ -640,22 +674,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"error: cannot read {name}: {exc.strerror or exc}", file=sys.stderr)
             return 2
 
+    # JSON is one object, so its matches and decisions must be held in memory
+    # until the end. CSV streams: matches are written as each file finishes
+    # and the decision log goes only to extract_report.csv.
+    as_json = args.format == "json"
     rows: list[dict[str, Any]] = []
     log: list[Decision] = []
-    for name, text in texts:
-        matches, decisions = extract_with_report((args.context, text), cfg, source=name)
-        rows.extend({"file": name, **m.to_dict()} for m in matches)
-        log.extend(decisions)
-        write_report_csv(decisions)
+    writer = csv.DictWriter(
+        sys.stdout, fieldnames=["file", "label", "text", "start", "end", "score"],
+        lineterminator="\n",
+    )
+    if not as_json:
+        writer.writeheader()
+    with open_report() as write_decisions:
+        for name, text in texts:
+            matches, decisions = extract_with_report((args.context, text), cfg, source=name)
+            match_rows = [{"file": name, **m.to_dict()} for m in matches]
+            write_decisions(decisions)
+            if as_json:
+                rows.extend(match_rows)
+                log.extend(decisions)
+            else:
+                writer.writerows(match_rows)
 
-    fields = ["file", "label", "text", "start", "end", "score"]
-    if args.format == "json":
+    if as_json:
         json.dump({"matches": rows, "decisions": log}, sys.stdout, indent=2, ensure_ascii=False)
         sys.stdout.write("\n")
-    else:
-        writer = csv.DictWriter(sys.stdout, fieldnames=fields, lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(rows)
     return 0
 
 

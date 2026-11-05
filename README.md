@@ -28,7 +28,7 @@ python -m venv .venv
   `extract_report.csv`, so filter on `kind`.
 - `--format csv` prints matches on stdout with the columns
   `file,label,text,start,end,score`. The decision log is not printed; it is
-  in `extract_report.csv`.
+  in `extract_report.csv`. Output is streamed per file (see the memory note below).
 - `--context TEXT` selects which patterns run (see [Context](#context)). The
   same context is applied to **every** FILE in the run.
 - Exit codes: `0` success; `2` for a config error or an unreadable input file
@@ -133,6 +133,15 @@ Both are gitignored.
   - In an `overlap` row, `a` is the winner and `b` the dropped candidate.
   - Library callers write it with `write_report_csv(decisions)`; pass `source=` to
     `extract_with_report()` to fill the `file` column.
+  - For many calls, use `with open_report() as write:` and call
+    `write(extract_with_report(text, cfg, source=id)[1])` in your loop. It opens
+    the file once and holds nothing in memory.
+
+> **Memory:** do not collect decisions from many calls in a list; write them as
+> you go with `open_report()`. The CLI reads every input file into memory
+> before processing, and `--format json` also holds all matches and decisions
+> until it prints one object. `--format csv` streams matches per file, so
+> prefer it for large runs.
 
 ## Tests
 

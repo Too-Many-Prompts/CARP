@@ -18,6 +18,7 @@ from extract import (
     extract_with_report,
     load_config,
     main,
+    open_report,
     select_patterns,
     write_report_csv,
 )
@@ -415,6 +416,22 @@ def test_write_report_csv_header_once_and_appends(tmp_path: Path) -> None:
     assert text.count(",".join(REPORT_FIELDS)) == 1
     assert [r["file"] for r in read_report()][-1] == "two"
     assert {r["file"] for r in read_report()} == {"one", "two"}
+
+
+def test_open_report_streams_many_calls_with_one_header(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, OVERLAP_PATTERNS)
+    with open_report() as write:
+        for i in range(3):
+            write(extract_with_report("abc12", cfg, source=f"row-{i}")[1])
+    text = Path("extract_report.csv").read_text(encoding="utf-8")
+    assert text.count(",".join(REPORT_FIELDS)) == 1
+    assert [r["file"] for r in read_report() if r["kind"] == "context"] == [
+        "row-0", "row-1", "row-2",
+    ]
+    with open_report() as write:                       # reopening appends, no 2nd header
+        write(extract_with_report("abc12", cfg, source="row-3")[1])
+    assert Path("extract_report.csv").read_text(encoding="utf-8").count("file,kind") == 1
+    assert read_report()[-1]["file"] == "row-3"
 
 
 def test_cli_writes_and_overwrites_report(tmp_path: Path) -> None:
