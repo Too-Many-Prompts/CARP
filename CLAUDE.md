@@ -1,6 +1,6 @@
 # Regex extractor
 
-Command-line Python program that extracts regex matches from text files, scores
+Command-line Python program that extracts regex matches from text, scores
 each match using nearby context words, and resolves overlapping matches.
 
 ## Contract
@@ -24,8 +24,9 @@ each match using nearby context words, and resolves overlapping matches.
    both if the label pair is in `coexist`, else apply `overlap_tiebreak` in
    order (score, length, priority). Identical spans count as overlapping.
 6. `extract(text, cfg, source="")` chains 2-5 and returns `(matches, decisions)`; it writes no files. `main()` is an argparse CLI:
-   `extract.py --config extraction_config.yaml FILE... [--format json|csv]`
-   with output fields `file, label, text, start, end, score`.
+   `extract.py --config extraction_config.yaml [--text TEXT | stdin] [--context TEXT] [--report] [--error-log]`
+   It scans one text and prints the matches as a JSON list (`label, text, start,
+   end, score`); the library is the main interface, so the CLI takes no files.
 
 ## Tests
 - `test_extract.py` (pytest) loads the `tests` section of the config and checks
@@ -38,12 +39,12 @@ each match using nearby context words, and resolves overlapping matches.
   on the context.
 - A context that selects patterns but yields no matches is never dropped silently:
   `extract()` returns a `context_miss` decision. The library writes no files;
-  `main()` appends a row (timestamp, file, context, text, context_patterns,
-  reason) to `./errorlog.csv` for each one (`log_context_miss()`) and
-  overwrites that file once per CLI run.
-- The decisions from `extract()` are flat dicts (`REPORT_FIELDS`). `main()`
-  writes them as CSV, one row per decision, to `./extract_report.csv`
-  (`write_report_csv()` / `open_report()`) and overwrites it once per CLI run.
+  with `--error-log`, `main()` writes a row (timestamp, file, context, text,
+  context_patterns, reason) to `./errorlog.csv` for each one
+  (`log_context_miss()`), overwriting the file.
+- The decisions from `extract()` are flat dicts (`REPORT_FIELDS`). with
+  `--report`, `main()` writes them as CSV, one row per decision, to
+  `./extract_report.csv` (`write_report_csv()` / `open_report()`), overwriting it.
   Library callers may use the same helpers.
 - Context keywords are ASCII letters only (matching `words.py`); `load_config`
   rejects digit/accented keywords, duplicate keywords within a pattern and

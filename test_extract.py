@@ -3,6 +3,7 @@ end-to-end cases; the rest are focused unit tests."""
 from __future__ import annotations
 
 import csv
+import sys
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -389,16 +390,28 @@ def test_next_words_mirrors_prev_words() -> None:
 
 
 # ---------------------------------------------------------------- CLI
-def test_cli_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    f = tmp_path / "in.txt"
-    f.write_text("Please call 555-123-4567 about the order.", encoding="utf-8")
-    assert main(["--config", str(CONFIG_PATH), str(f)]) == 0
+def test_cli_text_prints_matches_and_writes_nothing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     import json
 
+    assert main(["--config", str(CONFIG_PATH),
+                 "--text", "Please call 555-123-4567 about the order."]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["matches"][0]["text"] == "555-123-4567"
-    assert set(out["matches"][0]) == {"file", "label", "text", "start", "end", "score"}
-    assert any(o["kind"] == "context" for o in out["decisions"])
+    assert out[0]["text"] == "555-123-4567"
+    assert set(out[0]) == {"label", "text", "start", "end", "score"}
+    assert not Path("extract_report.csv").exists()
+    assert not Path("errorlog.csv").exists()
+
+
+def test_cli_reads_text_from_stdin(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import io, json
+
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"call 555-123-4567")))
+    assert main(["--config", str(CONFIG_PATH), "--context", "phone"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["label"] == "phone_number"
 
 
 def read_report() -> list[dict[str, str]]:
@@ -466,16 +479,13 @@ def test_open_report_streams_many_calls_with_one_header(tmp_path: Path) -> None:
     assert read_report()[-1]["file"] == "row-3"
 
 
-def test_cli_writes_and_overwrites_report(tmp_path: Path) -> None:
-    f = tmp_path / "in.txt"
-    f.write_text("Acct 5551234567 is overdue.", encoding="utf-8")
-    args = ["--config", str(CONFIG_PATH), str(f)]
+def test_cli_report_flag_writes_and_overwrites_report() -> None:
+    args = ["--config", str(CONFIG_PATH), "--text", "Acct 5551234567 is overdue.", "--report"]
 
     assert main(args) == 0
     rows = read_report()
     overlap = [r for r in rows if r["kind"] == "overlap"]
     assert len(overlap) == 1
-    assert overlap[0]["file"] == str(f)
     assert overlap[0]["a_label"] == "account_number"
     assert overlap[0]["b_label"] == "phone_number"
     assert "score 3.00 > 0.00" in overlap[0]["reason"]
@@ -484,35 +494,20 @@ def test_cli_writes_and_overwrites_report(tmp_path: Path) -> None:
     assert len(read_report()) == len(rows)
 
 
-def test_cli_overwrites_error_log_each_run(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    miss = tmp_path / "miss.txt"
-    miss.write_text("Invoice INV-004521", encoding="utf-8")
-    ok = tmp_path / "ok.txt"
-    ok.write_text("call 555-123-4567", encoding="utf-8")
-    args = ["--config", str(CONFIG_PATH), "--context", "tel"]
+def test_cli_error_log_flag_overwrites_each_run() -> None:
+    args = ["--config", str(CONFIG_PATH), "--context", "tel", "--error-log"]
 
-    assert main(args + [str(miss), str(ok)]) == 0
+    assert main(args + ["--text", "Invoice INV-004521"]) == 0
     rows = read_error_log()
-    assert [r["file"] for r in rows] == [str(miss)]       # only the miss is logged
+    assert len(rows) == 1 and rows[0]["text"] == "Invoice INV-004521"
+    assert rows[0]["context"] == "tel"                     # raw context kept
 
-    assert main(args + [str(ok)]) == 0                     # clean run wipes old rows
+    assert main(args + ["--text", "call 555-123-4567"]) == 0   # clean run wipes old rows
     assert read_error_log() == []
     assert Path("errorlog.csv").read_text(encoding="utf-8").startswith("timestamp,")
 
 
-def test_cli_csv_keeps_columns_clean(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    f = tmp_path / "in.txt"
-    f.write_text("Acct 5551234567 is overdue.", encoding="utf-8")
-    assert main(["--config", str(CONFIG_PATH), str(f), "--format", "csv"]) == 0
-    captured = capsys.readouterr()
-    assert captured.out.splitlines()[0] == "file,label,text,start,end,score"
-    assert "account_number" in captured.out
-    assert captured.err == ""                       # decisions live in extract_report.csv
-    assert any(r["kind"] == "overlap" for r in read_report())
+
 
 
 # ---------------------------------------------------------------- keyword validation
@@ -550,29 +545,18 @@ def test_hyphenated_keyword_matches_like_context_words(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------- CLI failure paths
-def test_cli_missing_file_is_a_clean_error(
+
+
+
+def test_cli_bad_config_is_a_clean_error(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    good = tmp_path / "good.txt"
-    good.write_text("call 555-123-4567", encoding="utf-8")
-    rc = main(["--config", str(CONFIG_PATH), str(good), str(tmp_path / "nope.txt")])
-    captured = capsys.readouterr()
-    assert rc == 2
-    assert "cannot read" in captured.err and "nope.txt" in captured.err
-    assert captured.out == ""                       # no partial output
-    assert read_report() == []                      # nothing written for good.txt
-
-
-def test_cli_failed_config_clears_stale_logs(tmp_path: Path) -> None:
-    ok = tmp_path / "ok.txt"
-    ok.write_text("Invoice INV-004521", encoding="utf-8")
-    assert main(["--config", str(CONFIG_PATH), "--context", "call", str(ok)]) == 0
-    assert read_error_log() and read_report()       # populated by a good run
-
     bad = tmp_path / "bad.yaml"
     bad.write_text("settings: {}\n", encoding="utf-8")
-    assert main(["--config", str(bad), str(ok)]) == 2
-    assert read_error_log() == [] and read_report() == []   # stale rows gone
+    assert main(["--config", str(bad), "--text", "x", "--report"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.startswith("error:") and captured.out == ""
+    assert not Path("extract_report.csv").exists()
 
 
 def _real_cfg_with_stop_at(stop_at: str) -> Config:

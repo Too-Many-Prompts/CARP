@@ -17,28 +17,30 @@ python -m venv .venv
 
 ### CLI
 
+Scans one text per run. For many texts, or a CSV of them, use the library.
+
 ```bash
-.venv/bin/python extract.py --config extraction_config.yaml FILE... \
-    [--format json|csv] [--context TEXT]
+.venv/bin/python extract.py --config extraction_config.yaml \
+    [--text TEXT] [--context TEXT] [--report] [--error-log]
 ```
 
-- `--format json` (default) prints `{"matches": [...], "decisions": [...]}`.
-  `decisions` is the whole decision log (context, `below_min_score`, overlap
-  and coexist entries) as flat rows with the same columns as
-  `extract_report.csv`, so filter on `kind`.
-- `--format csv` prints matches on stdout with the columns
-  `file,label,text,start,end,score`. The decision log is not printed; it is
-  in `extract_report.csv`. Output is streamed per file (see the memory note below).
-- `--context TEXT` selects which patterns run (see [Context](#context)). The
-  same context is applied to **every** FILE in the run.
-- Exit codes: `0` success; `2` for a config error or an unreadable input file
-  (`error: ...` on stderr, no matches printed).
+- `--text TEXT` is the text to scan. If omitted, the text is read from stdin
+  (UTF-8, `errors="replace"`).
+- `--context TEXT` selects which patterns run (see [Context](#context)).
+- Prints the matches as a JSON list of `{label, text, start, end, score}`.
+- Writes nothing else unless asked (both files are overwritten each time the
+  flag is given):
+  - `--report` writes the decision log to `./extract_report.csv`.
+  - `--error-log` writes `./errorlog.csv` (raw context and text of a context miss).
+- Exit codes: `0` success; `2` for a config error (`error: ...` on stderr,
+  nothing printed).
 
 Example:
 
 ```bash
-printf 'Invoice INV-004521 dated 03/14/2026, amount due $1,250.00\n' > sample.txt
-.venv/bin/python extract.py --config extraction_config.yaml --format csv sample.txt
+.venv/bin/python extract.py --config extraction_config.yaml --report \
+    --text 'Invoice INV-004521 dated 03/14/2026, amount due $1,250.00'
+echo 'call 555-123-4567' | .venv/bin/python extract.py --config extraction_config.yaml --context phone
 ```
 
 ### Library
@@ -59,6 +61,26 @@ has `label`, `text`, `start`, `end` and `score`. Offsets refer to the
 **normalized** text. `decisions` is the flat decision log (see
 [Output files](#output-files)); ignore it, keep it, or write it with the helpers
 below. `source` fills its `file` column.
+
+Looping over many inputs, writing the report as you go:
+
+```python
+from extract import load_config, extract, open_report, reset_report, reset_error_log, log_context_miss
+
+cfg = load_config("extraction_config.yaml")
+reset_report()
+reset_error_log()                      # only if you use log_context_miss
+items = [("id-1", "call", "Call 555-123-4567"), ("id-2", "", "Invoice INV-004521")]
+
+with open_report() as write:           # opens the file once, holds nothing in memory
+    for id, context, text in items:
+        matches, decisions = extract((context, text), cfg, source=id)
+        write(decisions)
+        for d in decisions:            # optional: deep troubleshooting
+            if d["kind"] == "context_miss":
+                log_context_miss(id, context, text, d)
+        # use `matches` here
+```
 
 ## How it works
 
@@ -91,7 +113,7 @@ The pattern regexes are never run on the context.
 - No context, or no keyword hits: all patterns run.
 - Negative keywords never select a pattern.
 - If the context selected patterns but nothing was extracted, the case is not
-  dropped silently. It is appended to `errorlog.csv`.
+  dropped silently. `extract()` returns it as a `context_miss` decision.
 
 ## Keywords
 
@@ -120,31 +142,26 @@ pattern and keyword when:
 
 ## Output files
 
-The CLI writes both to the working directory and overwrites them once per run.
-They are reset at the start of every run, so a run that fails (bad config,
-missing input file) leaves them empty rather than stale. Both are gitignored.
-The library writes nothing on its own.
+`extract()` writes nothing. Both files are written to the working directory
+by the CLI only when asked (`--report`, `--error-log`), or by the library
+helpers below. Both are gitignored.
 
 - `errorlog.csv`: `timestamp, file, context, text, context_patterns, reason`,
-  one row per context miss.
+  one row per context miss. Unlike the report row it keeps the raw
+  (un-normalized) context and the full text.
 - `extract_report.csv`: the decision log, one row per decision. Columns:
   `file, kind, outcome, reason, patterns` plus `a_*` and `b_*` candidate columns
   (`label, text, start, end, score`).
   - `kind` is `context`, `context_miss`, `below_min_score`, `overlap` or `coexist`.
   - In an `overlap` row, `a` is the winner and `b` the dropped candidate.
-  - Library helpers (all optional, none called by `extract()`): `write_report_csv(decisions)`
-    appends rows; `reset_report()` / `reset_error_log()` start a fresh file;
-    `log_context_miss(source, context, text, decision)` appends an `errorlog.csv`
-    row for a `context_miss` decision.
-  - For many calls, use `with open_report() as write:` and call
-    `write(extract(text, cfg, source=id)[1])` in your loop. It opens the file
-    once and holds nothing in memory.
+- Library helpers (all optional, none called by `extract()`): `write_report_csv(decisions)`
+  appends rows; `reset_report()` / `reset_error_log()` start a fresh file;
+  `log_context_miss(source, context, text, decision)` appends an `errorlog.csv`
+  row for a `context_miss` decision; `open_report()` opens the report once for
+  many calls (see the loop above).
 
 > **Memory:** do not collect decisions from many calls in a list; write them as
-> you go with `open_report()`. The CLI reads every input file into memory
-> before processing, and `--format json` also holds all matches and decisions
-> until it prints one object. `--format csv` streams matches per file, so
-> prefer it for large runs.
+> you go with `open_report()`.
 
 ## Tests
 

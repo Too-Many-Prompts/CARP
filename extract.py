@@ -10,18 +10,16 @@ extract() writes no files; the caller decides what to do with `decisions`
 (flat dicts, columns REPORT_FIELDS). Optional helpers: write_report_csv(),
 open_report(), log_context_miss(), reset_report(), reset_error_log().
 
-CLI:
-    extract.py --config extraction_config.yaml FILE... [--format json|csv]
-               [--context TEXT]
+CLI (one text per run; for many texts use the library):
+    extract.py --config extraction_config.yaml [--text TEXT | < stdin]
+               [--context TEXT] [--report] [--error-log]
+Prints the matches as a JSON list. Nothing is written unless asked:
+    --report     ./extract_report.csv  one row per decision (context, min_score, overlaps)
+    --error-log  ./errorlog.csv        raw context and text of a context miss
+Both files are overwritten when their flag is given.
 
-Files the CLI writes to the working directory (overwritten once per run):
-    errorlog.csv       context selected patterns (by positive keywords) but nothing was extracted
-    extract_report.csv one row per decision (context, min_score, overlaps)
-
-Memory: for large runs, write decisions as you go (open_report) instead of
-collecting them in a list. The CLI reads every input file into memory before
-processing, and --format json also holds all matches and decisions until the
-end; --format csv streams its output.
+Memory: for many texts, write decisions as you go (open_report) instead of
+collecting them in a list.
 """
 from __future__ import annotations
 
@@ -643,18 +641,18 @@ def extract(
 # CLI
 # --------------------------------------------------------------------------
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Extract regex matches with context scoring.")
+    parser = argparse.ArgumentParser(
+        description="Extract regex matches with context scoring from one text. "
+                    "Prints the matches as JSON. For many texts, use the library.")
     parser.add_argument("--config", required=True, help="path to extraction_config.yaml")
-    parser.add_argument("files", nargs="+", metavar="FILE")
-    parser.add_argument("--format", choices=("json", "csv"), default="json")
+    parser.add_argument("--text", default=None, help="the text to scan (default: read stdin)")
     parser.add_argument("--context", default=None,
                         help="optional context text; patterns whose positive keywords appear in it are the only ones run")
+    parser.add_argument("--report", action="store_true",
+                        help=f"write the decision log to ./{REPORT_PATH} (overwritten)")
+    parser.add_argument("--error-log", action="store_true",
+                        help=f"write ./{ERROR_LOG_PATH} (overwritten): raw context and text of a context miss")
     args = parser.parse_args(argv)
-
-    # One fresh errorlog.csv and report per CLI run, even if the run fails
-    # below, so a failed run never leaves the previous run's files behind.
-    reset_error_log()
-    reset_report()
 
     try:
         cfg = load_config(args.config)
@@ -662,43 +660,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    texts: list[tuple[str, str]] = []
-    for name in args.files:  # read everything first: no partial output on a bad path
-        try:
-            texts.append((name, Path(name).read_text(encoding="utf-8", errors="replace")))
-        except OSError as exc:
-            print(f"error: cannot read {name}: {exc.strerror or exc}", file=sys.stderr)
-            return 2
+    text = args.text
+    if text is None:
+        text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
 
-    # JSON is one object, so its matches and decisions must be held in memory
-    # until the end. CSV streams: matches are written as each file finishes
-    # and the decision log goes only to extract_report.csv.
-    as_json = args.format == "json"
-    rows: list[dict[str, Any]] = []
-    log: list[Decision] = []
-    writer = csv.DictWriter(
-        sys.stdout, fieldnames=["file", "label", "text", "start", "end", "score"],
-        lineterminator="\n",
-    )
-    if not as_json:
-        writer.writeheader()
-    with open_report() as write_decisions:
-        for name, text in texts:
-            matches, decisions = extract((args.context, text), cfg, source=name)
-            match_rows = [{"file": name, **m.to_dict()} for m in matches]
-            write_decisions(decisions)
-            for d in decisions:
-                if d["kind"] == "context_miss":
-                    log_context_miss(name, args.context or "", text, d)
-            if as_json:
-                rows.extend(match_rows)
-                log.extend(decisions)
-            else:
-                writer.writerows(match_rows)
+    matches, decisions = extract((args.context, text), cfg)
 
-    if as_json:
-        json.dump({"matches": rows, "decisions": log}, sys.stdout, indent=2, ensure_ascii=False)
-        sys.stdout.write("\n")
+    if args.report:
+        reset_report()
+        write_report_csv(decisions)
+    if args.error_log:
+        reset_error_log()
+        for d in decisions:
+            if d["kind"] == "context_miss":
+                log_context_miss("", args.context or "", text, d)
+
+    json.dump([m.to_dict() for m in matches], sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
     return 0
 
 
