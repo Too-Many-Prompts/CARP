@@ -1,7 +1,14 @@
+from string import ascii_letters
+
+# Set membership is much faster than calling .lower() and comparing for every
+# character, and this check runs once per character scanned.
+_LETTERS = frozenset(ascii_letters)
+
+
 def _is_letter(c: str) -> bool:
     # True only for ASCII a-z / A-Z. Digits, punctuation, spaces and
     # accented letters all count as "not a letter" (i.e. separators).
-    return "a" <= c.lower() <= "z"
+    return c in _LETTERS
 
 
 def prev_words(text, pos, n=3, join="'’", stop_at=""):
