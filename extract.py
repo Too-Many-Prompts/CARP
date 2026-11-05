@@ -182,6 +182,14 @@ def load_config(path: str | Path) -> Config:
         )
     settings["context_direction"] = direction
 
+    stop_at = settings.get("stop_at", "")
+    if not isinstance(stop_at, str):
+        raise ValueError(
+            f"settings.stop_at: expected a string of characters, "
+            f"got {type(stop_at).__name__}"
+        )
+    settings["stop_at"] = stop_at
+
     flags = 0 if settings["case_sensitive"] else re.IGNORECASE
     patterns: list[Pattern] = []
     seen: set[str] = set()
@@ -446,13 +454,22 @@ def score_candidate(
 
     settings["context_direction"] ("before", "after" or "both", default
     "both") chooses which side(s) of the match are searched.
+    settings["stop_at"] (default "") lists characters, e.g. ".!?", that end
+    the context scan early on either side.
 
     Keyword matching is always lowercase; case_sensitive only affects regex.
     """
     n = int(settings["context_window_words"])
     direction = settings.get("context_direction", "both")
-    before = prev_words(text, cand.start, n) if direction in ("before", "both") else []
-    after = next_words(text, cand.end, n) if direction in ("after", "both") else []
+    stop_at = settings.get("stop_at", "")
+    before = (
+        prev_words(text, cand.start, n, stop_at=stop_at)
+        if direction in ("before", "both") else []
+    )
+    after = (
+        next_words(text, cand.end, n, stop_at=stop_at)
+        if direction in ("after", "both") else []
+    )
     decay = bool(settings["distance_decay"])
 
     total = 0.0

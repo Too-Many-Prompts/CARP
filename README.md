@@ -71,7 +71,8 @@ Each has `label`, `text`, `start`, `end` and `score`. Offsets refer to the
    Zero-length matches (e.g. from `\d*`) are skipped: they have no text to
    extract, and nothing is logged for them.
 5. **Score**: take up to `context_window_words` words before and/or after the
-   match (`context_direction`), and add the weight of each keyword found. With
+   match (`context_direction`), stopping early at any `stop_at` character, and
+   add the weight of each keyword found. With
    `distance_decay`, a keyword's weight is divided by its word distance
    (nearest word = 1). Only the nearest occurrence of each keyword counts.
 6. **Drop** candidates with `score < min_score`.
@@ -110,7 +111,7 @@ pattern and keyword when:
 
 | Key | Purpose |
 | --- | --- |
-| `settings` | `context_window_words`, `context_direction` (`before`/`after`/`both`, default `both`), `distance_decay`, `min_score`, `case_sensitive`, `overlap_tiebreak` |
+| `settings` | `context_window_words`, `context_direction` (`before`/`after`/`both`, default `both`), `stop_at` (characters that end the context scan, default `""`), `distance_decay`, `min_score`, `case_sensitive`, `overlap_tiebreak` |
 | `normalize` | `collapse_whitespace`, `unicode_dashes_to_hyphen`, `smart_quotes_to_ascii` |
 | `patterns` | `label`, `priority`, `regex`, and `context.positive` / `context.negative` keyword weights |
 | `coexist` | label pairs that may both be kept when they overlap |

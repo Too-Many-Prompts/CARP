@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -193,6 +194,33 @@ def test_context_direction_defaults_to_both(tmp_path: Path) -> None:
 def test_context_direction_invalid(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="context_direction"):
         make_cfg(tmp_path, DIRECTION_PATTERNS, context_direction="sideways")
+
+
+@pytest.mark.parametrize(
+    "stop_at, before_score, after_score",
+    [("", 2.0, 3.0), (".!?", 0.0, 0.0)],
+)
+def test_stop_at(
+    tmp_path: Path, stop_at: str, before_score: float, after_score: float
+) -> None:
+    cfg = make_cfg(tmp_path, DIRECTION_PATTERNS, stop_at=stop_at)
+    assert extract("pre. 5", cfg)[0].score == pytest.approx(before_score)
+    assert extract("5. post", cfg)[0].score == pytest.approx(after_score)
+
+
+def test_stop_at_keeps_same_sentence_context(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, DIRECTION_PATTERNS, stop_at=".!?")
+    assert extract("pre 5 post", cfg)[0].score == pytest.approx(5.0)
+
+
+def test_stop_at_defaults_to_empty(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, DIRECTION_PATTERNS)
+    assert cfg.settings["stop_at"] == ""
+
+
+def test_stop_at_invalid(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="stop_at"):
+        make_cfg(tmp_path, DIRECTION_PATTERNS, stop_at=5)
 
 
 def test_keyword_after_match(tmp_path: Path) -> None:
@@ -497,3 +525,28 @@ def test_cli_failed_config_clears_stale_logs(tmp_path: Path) -> None:
     bad.write_text("settings: {}\n", encoding="utf-8")
     assert main(["--config", str(bad), str(ok)]) == 2
     assert read_error_log() == [] and read_report() == []   # stale rows gone
+
+
+def _real_cfg_with_stop_at(stop_at: str) -> Config:
+    return replace(REAL_CFG, settings={**REAL_CFG.settings, "stop_at": stop_at})
+
+
+@pytest.mark.parametrize(
+    "stop_at, expected_label",
+    [("", "account_number"), (".!?", "phone_number")],
+)
+def test_stop_at_period_changes_overlap_winner(stop_at: str, expected_label: str) -> None:
+    """'Acct' sits before a period. Without stop_at it boosts account_number
+    (+3) so it beats phone_number. With stop_at='.' the scan ends at the period,
+    both scores are 0, and the priority tie-break picks phone_number."""
+    matches = extract("Acct. 5551234567", _real_cfg_with_stop_at(stop_at))
+    assert [(m.label, m.text) for m in matches] == [(expected_label, "5551234567")]
+
+
+@pytest.mark.parametrize("stop_at", ["", ".!?"])
+def test_stop_at_keeps_context_after_period(stop_at: str) -> None:
+    """'phone' is after the period and before the number, so it still counts
+    whether or not stop_at is set: phone/2 words away = 1.5."""
+    matches = extract("acct. phone is 123-456-2342", _real_cfg_with_stop_at(stop_at))
+    assert [(m.label, m.text) for m in matches] == [("phone_number", "123-456-2342")]
+    assert matches[0].score == pytest.approx(1.5)
