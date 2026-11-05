@@ -348,10 +348,12 @@ def test_bad_input_type() -> None:
 
 # ---------------------------------------------------------------- words
 def test_context_words_are_ascii_letters_only() -> None:
-    # Non-ASCII characters that lowercase to ASCII-looking text (U+0130 'İ',
-    # U+212A Kelvin sign) are separators, like every other non-ASCII char.
-    assert prev_words("alpha İ beta K gamma 5", 22, 5) == ["alpha", "beta", "gamma"]
-    assert next_words("5 alpha İ beta K gamma", 1, 5) == ["alpha", "beta", "gamma"]
+    # Non-ASCII characters that lowercase to ASCII-looking text (U+0130, the
+    # Kelvin sign U+212A) are separators, like every other non-ASCII char.
+    text = "alpha \u0130 beta \u212a gamma 5"
+    assert prev_words(text, len(text) - 1, 5) == ["alpha", "beta", "gamma"]
+    text = "5 alpha \u0130 beta \u212a gamma"
+    assert next_words(text, 1, 5) == ["alpha", "beta", "gamma"]
 
 
 def test_next_words_mirrors_prev_words() -> None:
