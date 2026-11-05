@@ -44,20 +44,21 @@ printf 'Invoice INV-004521 dated 03/14/2026, amount due $1,250.00\n' > sample.tx
 ### Library
 
 ```python
-from extract import load_config, extract, extract_with_report
+from extract import load_config, extract
 
 cfg = load_config("extraction_config.yaml")
 
-extract("some text", cfg)
-extract({"text": "some text", "context": "call"}, cfg)
-extract(("call", "some text"), cfg)                    # (context, text)
-
-matches, decisions = extract_with_report(("call", "some text"), cfg)
+matches, decisions = extract("some text", cfg)
+matches, _ = extract({"text": "some text", "context": "call"}, cfg)   # ignore the log
+matches, decisions = extract(("call", "some text"), cfg, source="id-1")  # (context, text)
 ```
 
-`extract()` returns the matches that survived scoring and overlap resolution.
-Each has `label`, `text`, `start`, `end` and `score`. Offsets refer to the
-**normalized** text.
+`extract()` returns `(matches, decisions)` and **writes no files**.
+`matches` are the candidates that survived scoring and overlap resolution; each
+has `label`, `text`, `start`, `end` and `score`. Offsets refer to the
+**normalized** text. `decisions` is the flat decision log (see
+[Output files](#output-files)); ignore it, keep it, or write it with the helpers
+below. `source` fills its `file` column.
 
 ## How it works
 
@@ -119,10 +120,10 @@ pattern and keyword when:
 
 ## Output files
 
-Both are written to the working directory and overwritten once per CLI run
-(library calls append). They are reset at the start of every run, so a run that
-fails (bad config, missing input file) leaves them empty rather than stale.
-Both are gitignored.
+The CLI writes both to the working directory and overwrites them once per run.
+They are reset at the start of every run, so a run that fails (bad config,
+missing input file) leaves them empty rather than stale. Both are gitignored.
+The library writes nothing on its own.
 
 - `errorlog.csv`: `timestamp, file, context, text, context_patterns, reason`,
   one row per context miss.
@@ -131,11 +132,13 @@ Both are gitignored.
   (`label, text, start, end, score`).
   - `kind` is `context`, `context_miss`, `below_min_score`, `overlap` or `coexist`.
   - In an `overlap` row, `a` is the winner and `b` the dropped candidate.
-  - Library callers write it with `write_report_csv(decisions)`; pass `source=` to
-    `extract_with_report()` to fill the `file` column.
+  - Library helpers (all optional, none called by `extract()`): `write_report_csv(decisions)`
+    appends rows; `reset_report()` / `reset_error_log()` start a fresh file;
+    `log_context_miss(source, context, text, decision)` appends an `errorlog.csv`
+    row for a `context_miss` decision.
   - For many calls, use `with open_report() as write:` and call
-    `write(extract_with_report(text, cfg, source=id)[1])` in your loop. It opens
-    the file once and holds nothing in memory.
+    `write(extract(text, cfg, source=id)[1])` in your loop. It opens the file
+    once and holds nothing in memory.
 
 > **Memory:** do not collect decisions from many calls in a list; write them as
 > you go with `open_report()`. The CLI reads every input file into memory

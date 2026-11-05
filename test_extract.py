@@ -15,8 +15,8 @@ from extract import (
     REPORT_FIELDS,
     Config,
     extract,
-    extract_with_report,
     load_config,
+    log_context_miss,
     main,
     open_report,
     select_patterns,
@@ -40,6 +40,11 @@ def read_error_log() -> list[dict[str, str]]:
         return []
     with open(path, encoding="utf-8", newline="") as fh:
         return list(csv.DictReader(fh))
+
+
+def matches_of(inp: Any, cfg: Config) -> list[Any]:
+    """extract() without the decision log."""
+    return extract(inp, cfg)[0]
 
 
 def pairs(matches: list[Any]) -> Counter:
@@ -84,7 +89,7 @@ def test_config_cases(case: dict[str, Any]) -> None:
     """Each case may carry an optional `context` string."""
     inp = {"text": case["text"], "context": case.get("context")}
     expected = Counter((e["label"], e["text"]) for e in case["expect"] or [])
-    assert pairs(extract(inp, REAL_CFG)) == expected
+    assert pairs(matches_of(inp, REAL_CFG)) == expected
 
 
 # ---------------------------------------------------------------- overlaps
@@ -96,14 +101,14 @@ OVERLAP_PATTERNS = [
 
 def test_coexist_overlap_keeps_both(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, OVERLAP_PATTERNS, coexist=[["B", "A"]])  # order-insensitive
-    matches, decisions = extract_with_report("abc12", cfg)
+    matches, decisions = extract("abc12", cfg)
     assert pairs(matches) == Counter({("A", "abc1"): 1, ("B", "c12"): 1})
     assert any(d["kind"] == "coexist" for d in decisions)
 
 
 def test_non_coexist_overlap_keeps_one(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, OVERLAP_PATTERNS)
-    matches, decisions = extract_with_report("abc12", cfg)
+    matches, decisions = extract("abc12", cfg)
     assert len(matches) == 1
     overlap = [d for d in decisions if d["kind"] == "overlap"]
     assert len(overlap) == 1
@@ -116,7 +121,7 @@ def test_length_tiebreak(tmp_path: Path) -> None:
         {"label": "long", "priority": 9, "regex": "abcd"},
     ]
     cfg = make_cfg(tmp_path, patterns)
-    matches, decisions = extract_with_report("abcd", cfg)
+    matches, decisions = extract("abcd", cfg)
     assert pairs(matches) == Counter({("long", "abcd"): 1})
     assert "length 4 > 2" in [d for d in decisions if d["kind"] == "overlap"][0]["reason"]
 
@@ -127,7 +132,7 @@ def test_priority_breaks_full_tie(tmp_path: Path) -> None:
         {"label": "first", "priority": 1, "regex": "abcd"},
     ]
     cfg = make_cfg(tmp_path, patterns)
-    assert pairs(extract("abcd", cfg)) == Counter({("first", "abcd"): 1})
+    assert pairs(matches_of("abcd", cfg)) == Counter({("first", "abcd"): 1})
 
 
 def test_min_score_is_strict(tmp_path: Path) -> None:
@@ -136,8 +141,8 @@ def test_min_score_is_strict(tmp_path: Path) -> None:
          "context": {"negative": {"bad": -1}}},
     ]
     cfg = make_cfg(tmp_path, patterns, min_score=0)
-    assert len(extract("12", cfg)) == 1           # score 0 == min_score: kept
-    matches, decisions = extract_with_report("bad 12", cfg)  # score -1: dropped
+    assert len(matches_of("12", cfg)) == 1           # score 0 == min_score: kept
+    matches, decisions = extract("bad 12", cfg)  # score -1: dropped
     assert matches == []
     assert any(d["kind"] == "below_min_score" for d in decisions)
 
@@ -149,9 +154,9 @@ def test_multi_word_keyword(tmp_path: Path) -> None:
          "context": {"positive": {"amount due": 4}}},
     ]
     cfg = make_cfg(tmp_path, patterns)
-    assert extract("amount due 100", cfg)[0].score == pytest.approx(4.0)  # due = distance 1
-    assert extract("amount now due 100", cfg)[0].score == 0               # phrase broken
-    assert extract("due amount 100", cfg)[0].score == 0                   # wrong order
+    assert matches_of("amount due 100", cfg)[0].score == pytest.approx(4.0)  # due = distance 1
+    assert matches_of("amount now due 100", cfg)[0].score == 0               # phrase broken
+    assert matches_of("due amount 100", cfg)[0].score == 0                   # wrong order
 
 
 def test_distance_decay_and_nearest_occurrence(tmp_path: Path) -> None:
@@ -161,10 +166,10 @@ def test_distance_decay_and_nearest_occurrence(tmp_path: Path) -> None:
     ]
     cfg = make_cfg(tmp_path, patterns)
     # "tel" occurs at distance 3 and distance 1; only the nearest counts.
-    assert extract("tel a b tel 5", cfg)[0].score == pytest.approx(6.0)
-    assert extract("tel a b 5", cfg)[0].score == pytest.approx(2.0)
+    assert matches_of("tel a b tel 5", cfg)[0].score == pytest.approx(6.0)
+    assert matches_of("tel a b 5", cfg)[0].score == pytest.approx(2.0)
     no_decay = make_cfg(tmp_path, patterns, distance_decay=False)
-    assert extract("tel a b 5", no_decay)[0].score == pytest.approx(6.0)
+    assert matches_of("tel a b 5", no_decay)[0].score == pytest.approx(6.0)
 
 
 DIRECTION_PATTERNS = [
@@ -181,14 +186,14 @@ def test_context_direction(
     tmp_path: Path, direction: str, expected_before: float, expected_after: float
 ) -> None:
     cfg = make_cfg(tmp_path, DIRECTION_PATTERNS, context_direction=direction)
-    assert extract("pre 5", cfg)[0].score == pytest.approx(expected_before)
-    assert extract("5 post", cfg)[0].score == pytest.approx(expected_after)
+    assert matches_of("pre 5", cfg)[0].score == pytest.approx(expected_before)
+    assert matches_of("5 post", cfg)[0].score == pytest.approx(expected_after)
 
 
 def test_context_direction_defaults_to_both(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, DIRECTION_PATTERNS)
     assert cfg.settings["context_direction"] == "both"
-    assert extract("pre 5 post", cfg)[0].score == pytest.approx(5.0)
+    assert matches_of("pre 5 post", cfg)[0].score == pytest.approx(5.0)
 
 
 def test_context_direction_invalid(tmp_path: Path) -> None:
@@ -204,13 +209,13 @@ def test_stop_at(
     tmp_path: Path, stop_at: str, before_score: float, after_score: float
 ) -> None:
     cfg = make_cfg(tmp_path, DIRECTION_PATTERNS, stop_at=stop_at)
-    assert extract("pre. 5", cfg)[0].score == pytest.approx(before_score)
-    assert extract("5. post", cfg)[0].score == pytest.approx(after_score)
+    assert matches_of("pre. 5", cfg)[0].score == pytest.approx(before_score)
+    assert matches_of("5. post", cfg)[0].score == pytest.approx(after_score)
 
 
 def test_stop_at_keeps_same_sentence_context(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, DIRECTION_PATTERNS, stop_at=".!?")
-    assert extract("pre 5 post", cfg)[0].score == pytest.approx(5.0)
+    assert matches_of("pre 5 post", cfg)[0].score == pytest.approx(5.0)
 
 
 def test_stop_at_defaults_to_empty(tmp_path: Path) -> None:
@@ -229,7 +234,7 @@ def test_keyword_after_match(tmp_path: Path) -> None:
          "context": {"positive": {"usd": 2}}},
     ]
     cfg = make_cfg(tmp_path, patterns)
-    assert extract("5 usd", cfg)[0].score == pytest.approx(2.0)
+    assert matches_of("5 usd", cfg)[0].score == pytest.approx(2.0)
 
 
 # ---------------------------------------------------------------- invalid regex
@@ -247,29 +252,42 @@ CTX_TEXT = "Invoice INV-004521 dated 03/14/2026 on 2026-03-14"
 # `tests` section (run by test_config_cases). These cover the decision log
 # and input forms.
 def test_context_decisions_are_logged() -> None:
-    _, no_hits = extract_with_report(("nothing relevant here", CTX_TEXT), REAL_CFG)
+    _, no_hits = extract(("nothing relevant here", CTX_TEXT), REAL_CFG)
     assert "no context hits" in no_hits[0]["reason"]
-    _, hit = extract_with_report(("dated", CTX_TEXT), REAL_CFG)
+    _, hit = extract(("dated", CTX_TEXT), REAL_CFG)
     assert hit[0]["patterns"] == "date"
     assert "date (dated)" in hit[0]["reason"]
 
 
 def test_context_none_or_empty_matches_plain() -> None:
-    plain = pairs(extract(CTX_TEXT, REAL_CFG))
-    assert pairs(extract({"text": CTX_TEXT, "context": None}, REAL_CFG)) == plain
-    assert pairs(extract({"text": CTX_TEXT}, REAL_CFG)) == plain
-    assert pairs(extract((None, CTX_TEXT), REAL_CFG)) == plain
-    assert pairs(extract(("   ", CTX_TEXT), REAL_CFG)) == plain
+    plain = pairs(matches_of(CTX_TEXT, REAL_CFG))
+    assert pairs(matches_of({"text": CTX_TEXT, "context": None}, REAL_CFG)) == plain
+    assert pairs(matches_of({"text": CTX_TEXT}, REAL_CFG)) == plain
+    assert pairs(matches_of((None, CTX_TEXT), REAL_CFG)) == plain
+    assert pairs(matches_of(("   ", CTX_TEXT), REAL_CFG)) == plain
 
 
-def test_context_miss_is_written_to_error_log() -> None:
+def _misses(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [d for d in decisions if d["kind"] == "context_miss"]
+
+
+def test_context_miss_is_returned_and_nothing_is_written() -> None:
     inp = ("please call", "Invoice INV-004521,\nno phone here")
-    matches, decisions = extract_with_report(inp, REAL_CFG, source="doc1.txt")
+    matches, decisions = extract(inp, REAL_CFG, source="doc1.txt")
     assert matches == []
-    assert decisions[-1]["kind"] == "context_miss"
-    rows = read_error_log()
-    assert len(rows) == 1
-    row = rows[0]
+    (miss,) = _misses(decisions)
+    assert miss["file"] == "doc1.txt"
+    assert miss["patterns"] == "phone_number"
+    assert "no matches in text" in miss["reason"]
+    assert not Path("errorlog.csv").exists()            # the library writes no files
+    assert not Path("extract_report.csv").exists()
+
+
+def test_log_context_miss_writes_error_log_row() -> None:
+    context, text = "please call", "Invoice INV-004521,\nno phone here"
+    _, decisions = extract((context, text), REAL_CFG, source="doc1.txt")
+    log_context_miss("doc1.txt", context, text, _misses(decisions)[0])
+    (row,) = read_error_log()
     assert list(row) == ["timestamp", "file", "context", "text", "context_patterns", "reason"]
     assert row["file"] == "doc1.txt"
     assert row["context"] == "please call"              # raw, un-normalized
@@ -284,25 +302,30 @@ def test_context_miss_when_candidates_all_dropped(tmp_path: Path) -> None:
          "context": {"positive": {"num": 1}, "negative": {"bad": -1}}},
     ]
     cfg = make_cfg(tmp_path, patterns, min_score=0)
-    assert extract(("num", "bad 12"), cfg) == []
-    assert "dropped" in read_error_log()[0]["reason"]
+    matches, decisions = extract(("num", "bad 12"), cfg)
+    assert matches == []
+    assert "dropped" in _misses(decisions)[0]["reason"]
 
 
-def test_no_error_log_when_not_a_context_miss() -> None:
-    extract((None, "no matches at all"), REAL_CFG)                    # no context
-    extract(("nothing relevant here", "no matches at all"), REAL_CFG)  # context, no hits
-    extract(("tel", "call 555-123-4567"), REAL_CFG)                   # context hit, matched
-    assert read_error_log() == []
+def test_no_context_miss_when_not_a_miss() -> None:
+    for inp in (
+        (None, "no matches at all"),                     # no context
+        ("nothing relevant here", "no matches at all"),  # context, no hits
+        ("tel", "call 555-123-4567"),                    # context hit, matched
+    ):
+        assert _misses(extract(inp, REAL_CFG)[1]) == []
 
 
-def test_error_log_accumulates_within_a_run() -> None:
+def test_log_context_miss_accumulates_within_a_run() -> None:
     for i in range(2):
-        extract(("tel", f"nothing {i}"), REAL_CFG)
+        text = f"nothing {i}"
+        _, decisions = extract(("tel", text), REAL_CFG)
+        log_context_miss("", "tel", text, _misses(decisions)[0])
     assert [r["text"] for r in read_error_log()] == ["nothing 0", "nothing 1"]
 
 
 def test_context_match_ignores_case_and_punctuation() -> None:
-    result = extract(("ACCT:", "Acct 5551234567 call 555-123-4567"), REAL_CFG)
+    result = matches_of(("ACCT:", "Acct 5551234567 call 555-123-4567"), REAL_CFG)
     assert {m.label for m in result} == {"account_number"}
 
 
@@ -385,7 +408,7 @@ def read_report() -> list[dict[str, str]]:
 
 def test_decision_log_overlap_and_coexist(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, OVERLAP_PATTERNS)
-    _, decisions = extract_with_report("abc12", cfg, source="f.txt")
+    _, decisions = extract("abc12", cfg, source="f.txt")
     rows = {r["kind"]: r for r in decisions}
     overlap = rows["overlap"]
     assert overlap["file"] == "f.txt"
@@ -395,7 +418,7 @@ def test_decision_log_overlap_and_coexist(tmp_path: Path) -> None:
     assert rows["context"]["outcome"] == "all_patterns_used"
 
     co_cfg = make_cfg(tmp_path, OVERLAP_PATTERNS, coexist=[["A", "B"]])
-    _, co_decisions = extract_with_report("abc12", co_cfg)
+    _, co_decisions = extract("abc12", co_cfg)
     co = [r for r in co_decisions if r["kind"] == "coexist"][0]
     assert co["outcome"] == "both_kept"
     assert {co["a_label"], co["b_label"]} == {"A", "B"}
@@ -407,7 +430,7 @@ def test_decision_log_min_score_and_context_miss(tmp_path: Path) -> None:
          "context": {"positive": {"num": 1}, "negative": {"bad": -1}}},
     ]
     cfg = make_cfg(tmp_path, patterns, min_score=0)
-    _, decisions = extract_with_report(("num", "bad 12"), cfg)
+    _, decisions = extract(("num", "bad 12"), cfg)
     rows = {r["kind"]: r for r in decisions}
     assert rows["context"]["outcome"] == "patterns_restricted"
     assert rows["context"]["patterns"] == "n"
@@ -419,8 +442,8 @@ def test_decision_log_min_score_and_context_miss(tmp_path: Path) -> None:
 
 def test_write_report_csv_header_once_and_appends(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, OVERLAP_PATTERNS)
-    write_report_csv(extract_with_report("abc12", cfg, source="one")[1])
-    write_report_csv(extract_with_report("abc12", cfg, source="two")[1])
+    write_report_csv(extract("abc12", cfg, source="one")[1])
+    write_report_csv(extract("abc12", cfg, source="two")[1])
     text = Path("extract_report.csv").read_text(encoding="utf-8")
     assert text.count(",".join(REPORT_FIELDS)) == 1
     assert [r["file"] for r in read_report()][-1] == "two"
@@ -431,14 +454,14 @@ def test_open_report_streams_many_calls_with_one_header(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, OVERLAP_PATTERNS)
     with open_report() as write:
         for i in range(3):
-            write(extract_with_report("abc12", cfg, source=f"row-{i}")[1])
+            write(extract("abc12", cfg, source=f"row-{i}")[1])
     text = Path("extract_report.csv").read_text(encoding="utf-8")
     assert text.count(",".join(REPORT_FIELDS)) == 1
     assert [r["file"] for r in read_report() if r["kind"] == "context"] == [
         "row-0", "row-1", "row-2",
     ]
     with open_report() as write:                       # reopening appends, no 2nd header
-        write(extract_with_report("abc12", cfg, source="row-3")[1])
+        write(extract("abc12", cfg, source="row-3")[1])
     assert Path("extract_report.csv").read_text(encoding="utf-8").count("file,kind") == 1
     assert read_report()[-1]["file"] == "row-3"
 
@@ -523,7 +546,7 @@ def test_hyphenated_keyword_matches_like_context_words(tmp_path: Path) -> None:
     patterns = [{"label": "p", "priority": 1, "regex": r"\d+",
                  "context": {"positive": {"e-mail": 2}}}]
     cfg = make_cfg(tmp_path, patterns)
-    assert extract("e-mail 42", cfg)[0].score == 2.0
+    assert matches_of("e-mail 42", cfg)[0].score == 2.0
 
 
 # ---------------------------------------------------------------- CLI failure paths
@@ -564,7 +587,7 @@ def test_stop_at_period_changes_overlap_winner(stop_at: str, expected_label: str
     """'Acct' sits before a period. Without stop_at it boosts account_number
     (+3) so it beats phone_number. With stop_at='.' the scan ends at the period,
     both scores are 0, and the priority tie-break picks phone_number."""
-    matches = extract("Acct. 5551234567", _real_cfg_with_stop_at(stop_at))
+    matches = matches_of("Acct. 5551234567", _real_cfg_with_stop_at(stop_at))
     assert [(m.label, m.text) for m in matches] == [(expected_label, "5551234567")]
 
 
@@ -572,6 +595,6 @@ def test_stop_at_period_changes_overlap_winner(stop_at: str, expected_label: str
 def test_stop_at_keeps_context_after_period(stop_at: str) -> None:
     """'phone' is after the period and before the number, so it still counts
     whether or not stop_at is set: phone/2 words away = 1.5."""
-    matches = extract("acct. phone is 123-456-2342", _real_cfg_with_stop_at(stop_at))
+    matches = matches_of("acct. phone is 123-456-2342", _real_cfg_with_stop_at(stop_at))
     assert [(m.label, m.text) for m in matches] == [("phone_number", "123-456-2342")]
     assert matches[0].score == pytest.approx(1.5)

@@ -2,20 +2,21 @@
 
 Library use:
     cfg = load_config("extraction_config.yaml")
-    matches = extract("some text", cfg)
-    matches = extract({"text": "...", "context": "..."}, cfg)
-    matches, decisions = extract_with_report(("context text", "text"), cfg)
+    matches, decisions = extract("some text", cfg)
+    matches, _ = extract({"text": "...", "context": "..."}, cfg)   # ignore the log
+    matches, decisions = extract(("context text", "text"), cfg, source="id-1")
+
+extract() writes no files; the caller decides what to do with `decisions`
+(flat dicts, columns REPORT_FIELDS). Optional helpers: write_report_csv(),
+open_report(), log_context_miss(), reset_report(), reset_error_log().
 
 CLI:
     extract.py --config extraction_config.yaml FILE... [--format json|csv]
                [--context TEXT]
 
-Files written to the working directory:
+Files the CLI writes to the working directory (overwritten once per run):
     errorlog.csv       context selected patterns (by positive keywords) but nothing was extracted
     extract_report.csv one row per decision (context, min_score, overlaps)
-Both are overwritten once per CLI run. Library callers append the log from
-extract_with_report(..., source=...) with write_report_csv(decisions), or with
-open_report() when making many calls (opens the file once, holds nothing).
 
 Memory: for large runs, write decisions as you go (open_report) instead of
 collecting them in a list. The CLI reads every input file into memory before
@@ -47,7 +48,7 @@ CONTEXT_DIRECTIONS = ("before", "after", "both")
 ERROR_LOG_PATH = "errorlog.csv"
 ERROR_LOG_FIELDS = ("timestamp", "file", "context", "text", "context_patterns", "reason")
 
-# The decision report (extract_with_report's log) as CSV; main() resets it once per run.
+# The decision report (extract's log) as CSV; main() resets it once per run.
 REPORT_PATH = "extract_report.csv"
 _CAND_COLS = ("label", "text", "start", "end", "score")
 REPORT_FIELDS = (
@@ -378,7 +379,7 @@ def open_report(path: str = REPORT_PATH) -> Iterator[Callable[[Iterable[Decision
 
         with open_report() as write:
             for rid, text in big_input:
-                write(extract_with_report(text, cfg, source=rid)[1])
+                write(extract(text, cfg, source=rid)[1])
 
     The header is written first if the file is new or empty.
     """
@@ -602,14 +603,15 @@ def _split_input(inp: ExtractInput) -> tuple[str, str | None]:
     raise ValueError("input must be str, {'text','context'} dict, or (context, text)")
 
 
-def extract_with_report(
+def extract(
     inp: ExtractInput, cfg: Config, source: str = ""
 ) -> tuple[list[Candidate], list[Decision]]:
-    """Run steps 2-5 and return (matches, decision log).
+    """Run steps 2-5 and return (matches, decisions). Writes no files.
 
-    If the context selected patterns but nothing was extracted, the raw
-    context and text are appended to errorlog.csv (`source` fills its
-    `file` column) and a "context_miss" decision is logged.
+    `decisions` is the flat decision log; `source` fills its `file` column.
+    If the context selected patterns but nothing was extracted, it includes a
+    "context_miss" row. Ignore the log with `matches, _ = extract(...)`, or
+    write it with write_report_csv() / open_report() / log_context_miss().
     """
     raw_text, context = _split_input(inp)
     text = normalize(raw_text, cfg)
@@ -634,13 +636,7 @@ def extract_with_report(
             reason = f"context matched {', '.join(labels)}; no matches in text"
         miss = _decision("context_miss", "context_miss", reason, patterns=labels)
         decisions.append(miss)
-        log_context_miss(source, context or "", raw_text, miss)
     return matches, [{**d, "file": source} for d in decisions]
-
-
-def extract(inp: ExtractInput, cfg: Config, source: str = "") -> list[Candidate]:
-    """Extract matches from text (optionally with context). See module docs."""
-    return extract_with_report(inp, cfg, source)[0]
 
 
 # --------------------------------------------------------------------------
@@ -688,9 +684,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         writer.writeheader()
     with open_report() as write_decisions:
         for name, text in texts:
-            matches, decisions = extract_with_report((args.context, text), cfg, source=name)
+            matches, decisions = extract((args.context, text), cfg, source=name)
             match_rows = [{"file": name, **m.to_dict()} for m in matches]
             write_decisions(decisions)
+            for d in decisions:
+                if d["kind"] == "context_miss":
+                    log_context_miss(name, args.context or "", text, d)
             if as_json:
                 rows.extend(match_rows)
                 log.extend(decisions)

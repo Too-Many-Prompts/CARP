@@ -23,7 +23,7 @@ each match using nearby context words, and resolves overlapping matches.
 5. `resolve_overlaps(...)`: drop below `min_score`; for overlapping spans keep
    both if the label pair is in `coexist`, else apply `overlap_tiebreak` in
    order (score, length, priority). Identical spans count as overlapping.
-6. `extract(text, cfg)` chains 2-5. `main()` is an argparse CLI:
+6. `extract(text, cfg, source="")` chains 2-5 and returns `(matches, decisions)`; it writes no files. `main()` is an argparse CLI:
    `extract.py --config extraction_config.yaml FILE... [--format json|csv]`
    with output fields `file, label, text, start, end, score`.
 
@@ -31,17 +31,20 @@ each match using nearby context words, and resolves overlapping matches.
 - `test_extract.py` (pytest) loads the `tests` section of the config and checks
   `extract()` returns exactly the expected (label, text) pairs, order-insensitive.
   A test case may include an optional `context` string (and `name`), which is
-  passed to `extract()` along with `text`.
+  passed to `extract()` along with `text`. Tests unpack `matches, _ = extract(...)`.
 - A context is matched (whole words/phrases, case-insensitive) against each
   pattern's `context.positive` keywords; only patterns with a hit run on the
   text. No context or no hits: all patterns run. Pattern regexes are never run
   on the context.
 - A context that selects patterns but yields no matches is never dropped silently:
-  `extract()` appends a row (timestamp, file, context, text, context_patterns,
-  reason) to `./errorlog.csv`. `main()` overwrites that file once per CLI run.
-- The decision log from `extract_with_report()` is also written as CSV, one row
-  per decision, to `./extract_report.csv` (`write_report_csv()`). `main()`
-  overwrites it once per CLI run.
+  `extract()` returns a `context_miss` decision. The library writes no files;
+  `main()` appends a row (timestamp, file, context, text, context_patterns,
+  reason) to `./errorlog.csv` for each one (`log_context_miss()`) and
+  overwrites that file once per CLI run.
+- The decisions from `extract()` are flat dicts (`REPORT_FIELDS`). `main()`
+  writes them as CSV, one row per decision, to `./extract_report.csv`
+  (`write_report_csv()` / `open_report()`) and overwrites it once per CLI run.
+  Library callers may use the same helpers.
 - Context keywords are ASCII letters only (matching `words.py`); `load_config`
   rejects digit/accented keywords, duplicate keywords within a pattern and
   wrong-signed weights.
