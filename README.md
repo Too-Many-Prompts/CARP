@@ -1,6 +1,17 @@
-# Regex extractor
+# CARP: Context-Aware Regex Parser
 
-A command-line Python tool (and importable module) that extracts regex matches
+```text
+                       ___..----..___
+                 _..-''  ::  ::  ::  ``-._          .
+             _.-'   ____  ><><><><><><>    `-._  .-'|
+           ,' ,-. ,'    `.  ><><><><><><>      `'  /
+          /  ( o )   ..   \  ><><><><><><>      _  <
+       ~~<   `-'    ''     /  ><><><><><>    ,-' `. \
+          \  ~~~~~~~~~    ,'-._            _.'-._.'`-|
+           `-.._____..--'     ``--.______.-'
+```
+
+CARP is a command-line Python tool (and importable module) that extracts regex matches
 from text, scores each match using nearby context words, and resolves
 overlapping matches. Every rule lives in `extraction_config.yaml`.
 
