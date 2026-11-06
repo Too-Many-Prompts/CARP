@@ -1,4 +1,4 @@
-# Regex extractor
+# CARP: Context-Aware Regex Parser
 
 Command-line Python program that extracts regex matches from text, scores
 each match using nearby context words, and resolves overlapping matches.
