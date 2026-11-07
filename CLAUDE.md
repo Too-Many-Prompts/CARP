@@ -35,7 +35,8 @@ each match using nearby context words, and resolves overlapping matches.
    It scans one text and prints the matches as a JSON list (`label, text, start,
    end, score`); the library is the main interface, so the CLI takes no files.
    Load warnings go to stderr as `warning: ...` (exit code unchanged).
-7. `summarize_overlaps(path=REPORT_PATH)` reads a report CSV's `overlap` rows
+7. `summarize_overlaps(path=REPORT_PATH)` (in `summarize.py`, a leaf module
+   that imports nothing from `extract.py`; `extract.py` re-exports it) reads a report CSV's `overlap` rows
    and summarizes them per label pair (counts by `decided_by`, `no_evidence`,
    examples, hint). CLI: `extract.py --summarize [PATH]` (no `--config`; not
    combinable with the scan flags).
@@ -45,7 +46,11 @@ each match using nearby context words, and resolves overlapping matches.
   `extract()` returns exactly the expected (label, text) pairs, order-insensitive.
   A test case may include an optional `context` string (and `name`), which is
   passed to `extract()` along with `text`. Tests unpack `matches, _ = extract(...)`.
-- Pattern keywords: `context.positive` (word list; selects the pattern from
+- Pattern keywords: the `keywords` shorthand (word -> signed weight) expands at
+  load time: > 0 into `context.positive` + `nearby`, < 0 into `nearby` +
+  `context.penalize`, 0 is an error, and a word may not also be in an explicit
+  key. Only explicit `context.penalize` words trigger the unused-penalize
+  warning. The explicit keys: `context.positive` (word list; selects the pattern from
   the context string), `context.penalize` (word -> weight <= 0; only the
   `context_penalty` tie-break), `nearby` (word -> signed weight; scores the
   text window only). Old `context.positive` maps, `context.negative` and
@@ -78,8 +83,9 @@ each match using nearby context words, and resolves overlapping matches.
   `context_penalty` tie-break (and its context gate), `nearby`/`context_penalty`
   parity, empty `overlap_tiebreak`, multi-word keywords, invalid regex,
   old-format errors, the load warning, the skipped note, every `decided_by`
-  value, `summarize_overlaps` and `--summarize`, and the public API as the
-  README shows it.
+  value, `summarize_overlaps` and `--summarize`, the `keywords` shorthand
+  (expansion, conflicts, warning, and the example config loading exactly as
+  its explicit form), and the public API as the README shows it.
 - Run `pytest -q` after every change and do not report success until it passes.
 
 ## Constraints

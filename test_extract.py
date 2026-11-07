@@ -911,10 +911,11 @@ def test_cli_shows_load_warning_on_stderr(
     path = tmp_path / "warn.yaml"
     raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     raw["settings"]["overlap_tiebreak"] = ["score", "length", "priority"]
+    raw["patterns"][0]["context"] = {"penalize": {"memo": -1}}   # explicit penalize warns
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     assert main(["--config", str(path), "--text", "call 555-123-4567"]) == 0
     captured = capsys.readouterr()
-    assert captured.err.startswith("warning: context.penalize is set for invoice_number, ")
+    assert captured.err.startswith("warning: context.penalize is set for invoice_number but ")
     assert json.loads(captured.out)[0]["label"] == "phone_number"
 
 
@@ -1157,6 +1158,7 @@ def test_public_api_as_documented(
     import json
 
     import extract as mod
+    import summarize
     from extract import (format_summary, open_report, reset_error_log, reset_report,
                          summarize_overlaps)
 
@@ -1196,9 +1198,9 @@ def test_public_api_as_documented(
 
     # Summary from the library and its table.
     rows = summarize_overlaps()
-    assert rows and all(list(r) == list(mod.SUMMARY_FIELDS) for r in rows)
+    assert rows and all(list(r) == list(summarize.SUMMARY_FIELDS) for r in rows)
     assert rows[0]["pair"] == "account_number/phone_number"
-    assert format_summary(rows).splitlines()[0].split() == list(mod.SUMMARY_FIELDS)
+    assert format_summary(rows).splitlines()[0].split() == list(summarize.SUMMARY_FIELDS)
 
     # CLI, as in the README examples.
     config = str(CONFIG_PATH)
@@ -1239,7 +1241,7 @@ def test_bare_yaml_on_in_a_file_is_rejected(tmp_path: Path) -> None:
     raw = CONFIG_PATH.read_text(encoding="utf-8").replace('"on": 1', "on: 1")
     assert raw != CONFIG_PATH.read_text(encoding="utf-8")
     path.write_text(raw, encoding="utf-8")
-    with pytest.raises(ValueError, match="pattern 'date': nearby keyword True must be a string"):
+    with pytest.raises(ValueError, match="pattern 'date': keywords keyword True must be a string"):
         load_config(path)
 
 
@@ -1276,7 +1278,7 @@ def test_positive_and_penalize_compare_reduced_words(tmp_path: Path) -> None:
 
 # ------------------------------------------------- summary: bounded examples, rounding
 def test_summary_keeps_at_most_three_examples_per_pair(monkeypatch: pytest.MonkeyPatch) -> None:
-    import extract as mod
+    import summarize as mod
 
     peak: list[int] = []
     real = mod._PairStats.add_example
@@ -1334,8 +1336,8 @@ def test_blank_keyword_entry_is_rejected(
 def test_blank_list_item_in_a_file_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "blank.yaml"
     raw = CONFIG_PATH.read_text(encoding="utf-8").replace(
-        "positive: [phone, tel, call, mobile, fax]",
-        "positive:\n        - phone\n        -")
+        "keywords: {phone: 3, tel: 3, call: 2, mobile: 2, fax: 1, invoice: -2, account: -2, order: -1}",
+        "context:\n      positive:\n        - phone\n        -")
     assert raw != CONFIG_PATH.read_text(encoding="utf-8")
     path.write_text(raw, encoding="utf-8")
     with pytest.raises(ValueError, match="pattern 'phone_number': context.positive has an empty entry"):
@@ -1357,3 +1359,172 @@ def test_missing_or_blank_keyword_keys_load_as_empty(
     for inp in ("tel 12", ("tel", "12")):
         (m,) = matches_of(inp, cfg)
         assert (m.text, m.score) == ("12", 0)
+
+
+# ------------------------------------------------- summarize.py module
+def test_summary_lives_in_summarize_and_extract_reexports_it() -> None:
+    import extract
+    import summarize
+
+    assert extract.summarize_overlaps is summarize.summarize_overlaps
+    assert extract.format_summary is summarize.format_summary
+    assert extract.REPORT_PATH == summarize.DEFAULT_REPORT_PATH == "extract_report.csv"
+    import ast
+
+    tree = ast.parse(Path(summarize.__file__).read_text(encoding="utf-8"))
+    imported = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import)
+                for a in n.names}
+    imported |= {(n.module or "").split(".")[0] for n in ast.walk(tree)
+                 if isinstance(n, ast.ImportFrom)}
+    assert not imported & {"extract", "words"}            # leaf module: stdlib only
+    assert summarize.summarize_overlaps.__module__ == "summarize"
+
+
+def test_summarize_reads_only_report_columns() -> None:
+    import summarize
+
+    assert set(summarize.COLUMNS_USED) <= set(REPORT_FIELDS)
+    # A report with only those columns summarizes the same as a full one.
+    rows = [_row("a", "b", "priority", file="d"), _row("a", "b", "score")]
+    _report(rows)
+    full = summarize_overlaps()
+    with open("slim.csv", "w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=summarize.COLUMNS_USED, lineterminator="\n",
+                                extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    assert summarize_overlaps("slim.csv") == full
+
+
+# ------------------------------------------------- keywords shorthand
+def _pat(cfg: Config) -> Any:
+    (p,) = cfg.patterns
+    return p
+
+
+def test_keywords_expand_by_sign(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, _one(keywords={"phone": 3, "Call": 2, "acct": -3}),
+                   overlap_tiebreak=["context_penalty"])
+    p = _pat(cfg)
+    assert sorted(p.positive) == ["call", "phone"]      # make_cfg's safe_dump sorts keys
+    assert p.nearby == {"phone": 3.0, "call": 2.0, "acct": -3.0}
+    assert p.penalize == {"acct": -3.0}
+
+
+def test_keywords_behave_like_the_explicit_keys(tmp_path: Path) -> None:
+    patterns = [
+        {"label": "A", "priority": 1, "regex": r"\d{4}", "keywords": {"alpha": 2, "bad": -1}},
+        {"label": "B", "priority": 2, "regex": r"\d{4}", "keywords": {"beta": 1}},
+    ]
+    cfg = make_cfg(tmp_path, patterns, overlap_tiebreak=CTX_PEN_ORDER)
+    (m,) = matches_of("alpha 1234", cfg)                         # nearby: alpha scores A
+    assert (m.label, m.score) == ("A", 2.0)
+    assert _sel_in(cfg, "beta") == ["B"]                         # positive: beta selects B
+    (m,) = matches_of(("alpha beta bad", "1234"), cfg)           # penalize: bad hits A
+    assert m.label == "B"
+
+
+def test_keywords_weight_zero_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError) as exc:
+        make_cfg(tmp_path, _one(keywords={"tel": 0}))
+    assert str(exc.value) == (
+        "pattern 'p': keywords word 'tel' has weight 0; give it a sign or remove it"
+    )
+
+
+def test_keywords_merge_with_explicit_keys(tmp_path: Path) -> None:
+    keys = {"keywords": {"phone": 3, "acct": -3},
+            "context": {"positive": ["mobile"], "penalize": {"order": -1}},
+            "nearby": {"cell": 1}}
+    p = _pat(make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"]))
+    assert p.positive == ["mobile", "phone"]            # explicit words first
+    assert p.penalize == {"order": -1.0, "acct": -3.0}
+    assert p.nearby == {"cell": 1.0, "phone": 3.0, "acct": -3.0}
+
+
+@pytest.mark.parametrize(
+    "keys, where, word, same",
+    [
+        ({"keywords": {"tel": 1}, "context": {"positive": ["tel"]}}, "context.positive", "tel", ""),
+        ({"keywords": {"bad": -1}, "context": {"penalize": {"bad": -1}}},
+         "context.penalize", "bad", ""),
+        ({"keywords": {"tel": 1}, "nearby": {"Tel": 2}}, "nearby", "tel", ""),
+        ({"keywords": {"e-mail": 1}, "nearby": {"e mail": 2}}, "nearby", "e-mail",
+         " (same words as 'e mail')"),
+        ({"keywords": {"e-mail": 1}, "context": {"positive": ["e mail"]}}, "context.positive",
+         "e-mail", " (same words as 'e mail')"),
+        ({"keywords": {"e-mail": -1}, "context": {"penalize": {"e mail": -2}}},
+         "context.penalize", "e-mail", " (same words as 'e mail')"),
+        ({"keywords": {"bad": -1}, "context": {"positive": ["bad"]}}, "context.positive", "bad", ""),
+    ],
+)
+def test_word_in_keywords_and_explicit_key_is_rejected(
+    tmp_path: Path, keys: dict[str, Any], where: str, word: str, same: str
+) -> None:
+    with pytest.raises(ValueError) as exc:
+        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+    assert str(exc.value) == f"pattern 'p': keyword '{word}' is in both keywords and {where}{same}"
+
+
+@pytest.mark.parametrize(
+    "value, message",
+    [
+        ({"w2": 1}, "pattern 'p': keywords keyword 'w2' must contain only ASCII letters"),
+        ({"tel": 1, "TEL": 2}, "pattern 'p': keywords keyword 'tel' is listed more than once"),
+        ({True: 1}, "pattern 'p': keywords keyword True must be a string"),
+        ({None: 1}, "pattern 'p': keywords has an empty entry; remove it"),
+        ({"tel": "high"}, "pattern 'p': keywords keyword 'tel' needs a numeric weight"),
+        (["tel"], "pattern 'p': keywords must be a map of word: weight"),
+    ],
+)
+def test_keywords_validation_names_keywords(tmp_path: Path, value: Any, message: str) -> None:
+    with pytest.raises(ValueError, match=re.escape(message)):
+        make_cfg(tmp_path, _one(keywords=value))
+
+
+@pytest.mark.parametrize("value", [None, {}])
+def test_keywords_blank_loads_as_empty(tmp_path: Path, value: Any) -> None:
+    p = _pat(make_cfg(tmp_path, _one(keywords=value)))
+    assert (p.positive, p.penalize, p.nearby) == ([], {}, {})
+
+
+def test_shorthand_negatives_do_not_warn(tmp_path: Path) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        p = _pat(make_cfg(tmp_path, _one(keywords={"tel": 2, "acct": -3}),
+                          overlap_tiebreak=["score"]))
+    assert p.penalize == {"acct": -3.0}
+
+
+def test_explicit_penalize_still_warns_alongside_keywords(tmp_path: Path) -> None:
+    keys = {"keywords": {"acct": -3}, "context": {"penalize": {"order": -1}}}
+    with pytest.warns(UserWarning, match="context.penalize is set for p but"):
+        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["score"])
+
+
+# ------------------------------------------------- example config uses keywords
+# How extraction_config.yaml loaded before it was rewritten with `keywords`:
+# the rewrite must not change any pattern.
+REAL_CFG_PATTERNS = {
+    'invoice_number': (['invoice', 'bill', 'amount due', 'ref'], {'phone': -3.0, 'tel': -3.0}, {'invoice': 3.0, 'bill': 2.0, 'amount due': 2.0, 'ref': 1.0, 'phone': -3.0, 'tel': -3.0}),
+    'phone_number': (['phone', 'tel', 'call', 'mobile', 'fax'], {'invoice': -2.0, 'account': -2.0, 'order': -1.0}, {'phone': 3.0, 'tel': 3.0, 'call': 2.0, 'mobile': 2.0, 'fax': 1.0, 'invoice': -2.0, 'account': -2.0, 'order': -1.0}),
+    'account_number': (['account', 'acct', 'routing'], {'phone': -3.0, 'call': -2.0}, {'account': 3.0, 'acct': 3.0, 'routing': 1.0, 'phone': -3.0, 'call': -2.0}),
+    'timestamp': (['at', 'logged', 'created'], {}, {'at': 1.0, 'logged': 2.0, 'created': 2.0}),
+    'date': (['date', 'due', 'dated', 'on'], {}, {'date': 2.0, 'due': 2.0, 'dated': 2.0, 'on': 1.0}),
+    'amount': (['total', 'due', 'amount', 'balance'], {}, {'total': 3.0, 'due': 2.0, 'amount': 2.0, 'balance': 2.0}),
+}
+
+
+def test_example_config_patterns_unchanged_by_keywords_rewrite() -> None:
+    loaded = {p.label: (p.positive, p.penalize, p.nearby) for p in REAL_CFG.patterns}
+    assert loaded == REAL_CFG_PATTERNS
+    for p in REAL_CFG.patterns:                      # same order, too
+        positive, penalize, nearby = REAL_CFG_PATTERNS[p.label]
+        assert list(p.penalize) == list(penalize)
+        assert list(p.nearby) == list(nearby)
+
+
+def test_example_config_uses_keywords_shorthand() -> None:
+    raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    assert all("keywords" in p and "nearby" not in p and "context" not in p
+               for p in raw["patterns"])
