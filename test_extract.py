@@ -911,10 +911,11 @@ def test_cli_shows_load_warning_on_stderr(
     path = tmp_path / "warn.yaml"
     raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     raw["settings"]["overlap_tiebreak"] = ["score", "length", "priority"]
+    raw["patterns"][0]["context"] = {"penalize": {"memo": -1}}   # explicit penalize warns
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     assert main(["--config", str(path), "--text", "call 555-123-4567"]) == 0
     captured = capsys.readouterr()
-    assert captured.err.startswith("warning: context.penalize is set for invoice_number, ")
+    assert captured.err.startswith("warning: context.penalize is set for invoice_number but ")
     assert json.loads(captured.out)[0]["label"] == "phone_number"
 
 
@@ -1240,7 +1241,7 @@ def test_bare_yaml_on_in_a_file_is_rejected(tmp_path: Path) -> None:
     raw = CONFIG_PATH.read_text(encoding="utf-8").replace('"on": 1', "on: 1")
     assert raw != CONFIG_PATH.read_text(encoding="utf-8")
     path.write_text(raw, encoding="utf-8")
-    with pytest.raises(ValueError, match="pattern 'date': nearby keyword True must be a string"):
+    with pytest.raises(ValueError, match="pattern 'date': keywords keyword True must be a string"):
         load_config(path)
 
 
@@ -1335,8 +1336,8 @@ def test_blank_keyword_entry_is_rejected(
 def test_blank_list_item_in_a_file_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "blank.yaml"
     raw = CONFIG_PATH.read_text(encoding="utf-8").replace(
-        "positive: [phone, tel, call, mobile, fax]",
-        "positive:\n        - phone\n        -")
+        "keywords: {phone: 3, tel: 3, call: 2, mobile: 2, fax: 1, invoice: -2, account: -2, order: -1}",
+        "context:\n      positive:\n        - phone\n        -")
     assert raw != CONFIG_PATH.read_text(encoding="utf-8")
     path.write_text(raw, encoding="utf-8")
     with pytest.raises(ValueError, match="pattern 'phone_number': context.positive has an empty entry"):
@@ -1488,3 +1489,29 @@ def test_explicit_penalize_still_warns_alongside_keywords(tmp_path: Path) -> Non
     keys = {"keywords": {"acct": -3}, "context": {"penalize": {"order": -1}}}
     with pytest.warns(UserWarning, match="context.penalize is set for p but"):
         make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["score"])
+
+
+# ------------------------------------------------- example config uses keywords
+# How extraction_config.yaml loaded before it was rewritten with `keywords`:
+# the rewrite must not change any pattern.
+REAL_CFG_PATTERNS = {
+    'invoice_number': (['invoice', 'bill', 'amount due', 'ref'], {'phone': -3.0, 'tel': -3.0}, {'invoice': 3.0, 'bill': 2.0, 'amount due': 2.0, 'ref': 1.0, 'phone': -3.0, 'tel': -3.0}),
+    'phone_number': (['phone', 'tel', 'call', 'mobile', 'fax'], {'invoice': -2.0, 'account': -2.0, 'order': -1.0}, {'phone': 3.0, 'tel': 3.0, 'call': 2.0, 'mobile': 2.0, 'fax': 1.0, 'invoice': -2.0, 'account': -2.0, 'order': -1.0}),
+    'account_number': (['account', 'acct', 'routing'], {'phone': -3.0, 'call': -2.0}, {'account': 3.0, 'acct': 3.0, 'routing': 1.0, 'phone': -3.0, 'call': -2.0}),
+    'timestamp': (['at', 'logged', 'created'], {}, {'at': 1.0, 'logged': 2.0, 'created': 2.0}),
+    'date': (['date', 'due', 'dated', 'on'], {}, {'date': 2.0, 'due': 2.0, 'dated': 2.0, 'on': 1.0}),
+    'amount': (['total', 'due', 'amount', 'balance'], {}, {'total': 3.0, 'due': 2.0, 'amount': 2.0, 'balance': 2.0}),
+}
+
+
+def test_example_config_patterns_unchanged_by_keywords_rewrite() -> None:
+    loaded = {p.label: (p.positive, p.penalize, p.nearby) for p in REAL_CFG.patterns}
+    assert loaded == REAL_CFG_PATTERNS
+    for p in REAL_CFG.patterns:                      # same order, too
+        assert list(p.nearby) == list(REAL_CFG_PATTERNS[p.label][2])
+
+
+def test_example_config_uses_keywords_shorthand() -> None:
+    raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    assert all("keywords" in p and "nearby" not in p and "context" not in p
+               for p in raw["patterns"])
