@@ -3,6 +3,7 @@ end-to-end cases; the rest are focused unit tests."""
 from __future__ import annotations
 
 import csv
+import re
 import sys
 from collections import Counter
 from dataclasses import replace
@@ -15,6 +16,8 @@ import yaml
 from extract import (
     REPORT_FIELDS,
     Config,
+    _context_penalty,
+    _context_words,
     extract,
     load_config,
     log_context_miss,
@@ -139,7 +142,7 @@ def test_priority_breaks_full_tie(tmp_path: Path) -> None:
 def test_min_score_is_strict(tmp_path: Path) -> None:
     patterns = [
         {"label": "n", "priority": 1, "regex": "\\d+",
-         "context": {"negative": {"bad": -1}}},
+         "nearby": {"bad": -1}},
     ]
     cfg = make_cfg(tmp_path, patterns, min_score=0)
     assert len(matches_of("12", cfg)) == 1           # score 0 == min_score: kept
@@ -152,7 +155,7 @@ def test_min_score_is_strict(tmp_path: Path) -> None:
 def test_multi_word_keyword(tmp_path: Path) -> None:
     patterns = [
         {"label": "n", "priority": 1, "regex": "\\d+",
-         "context": {"positive": {"amount due": 4}}},
+         "nearby": {"amount due": 4}},
     ]
     cfg = make_cfg(tmp_path, patterns)
     assert matches_of("amount due 100", cfg)[0].score == pytest.approx(4.0)  # due = distance 1
@@ -163,7 +166,7 @@ def test_multi_word_keyword(tmp_path: Path) -> None:
 def test_distance_decay_and_nearest_occurrence(tmp_path: Path) -> None:
     patterns = [
         {"label": "n", "priority": 1, "regex": "\\d+",
-         "context": {"positive": {"tel": 6}}},
+         "nearby": {"tel": 6}},
     ]
     cfg = make_cfg(tmp_path, patterns)
     # "tel" occurs at distance 3 and distance 1; only the nearest counts.
@@ -175,7 +178,7 @@ def test_distance_decay_and_nearest_occurrence(tmp_path: Path) -> None:
 
 DIRECTION_PATTERNS = [
     {"label": "n", "priority": 1, "regex": "\\d+",
-     "context": {"positive": {"pre": 2, "post": 3}}},
+     "nearby": {"pre": 2, "post": 3}},
 ]
 
 
@@ -232,7 +235,7 @@ def test_stop_at_invalid(tmp_path: Path) -> None:
 def test_keyword_after_match(tmp_path: Path) -> None:
     patterns = [
         {"label": "n", "priority": 1, "regex": "\\d+",
-         "context": {"positive": {"usd": 2}}},
+         "nearby": {"usd": 2}},
     ]
     cfg = make_cfg(tmp_path, patterns)
     assert matches_of("5 usd", cfg)[0].score == pytest.approx(2.0)
@@ -300,7 +303,7 @@ def test_log_context_miss_writes_error_log_row() -> None:
 def test_context_miss_when_candidates_all_dropped(tmp_path: Path) -> None:
     patterns = [
         {"label": "n", "priority": 1, "regex": "\\d+",
-         "context": {"positive": {"num": 1}, "negative": {"bad": -1}}},
+         "context": {"positive": ["num"]}, "nearby": {"bad": -1}},
     ]
     cfg = make_cfg(tmp_path, patterns, min_score=0)
     matches, decisions = extract(("num", "bad 12"), cfg)
@@ -348,13 +351,14 @@ def test_select_patterns_phrase_must_be_contiguous() -> None:
     assert "invoice_number" not in _sel("due total")
 
 
-def test_select_patterns_negative_keywords_do_not_select(tmp_path: Path) -> None:
+def test_select_patterns_penalize_and_nearby_words_do_not_select(tmp_path: Path) -> None:
     patterns = [
-        {"label": "A", "priority": 1, "regex": "a", "context": {"positive": {"yes": 1}}},
-        {"label": "B", "priority": 2, "regex": "b", "context": {"negative": {"no": -1}}},
+        {"label": "A", "priority": 1, "regex": "a", "context": {"positive": ["yes"]}},
+        {"label": "B", "priority": 2, "regex": "b", "context": {"penalize": {"no": -1}},
+         "nearby": {"maybe": 2}},
     ]
-    cfg = make_cfg(tmp_path, patterns)
-    chosen, decision = select_patterns("no", cfg.patterns)   # only B's negative word
+    cfg = make_cfg(tmp_path, patterns, overlap_tiebreak=["context_penalty"])
+    chosen, decision = select_patterns("no maybe", cfg.patterns)   # only B's penalize/nearby words
     assert [p.label for p in chosen] == ["A", "B"] and decision["outcome"] == "all_patterns_used"
     chosen, decision = select_patterns("yes no", cfg.patterns)
     assert [p.label for p in chosen] == ["A"] and decision["outcome"] == "patterns_restricted"
@@ -440,7 +444,7 @@ def test_decision_log_overlap_and_coexist(tmp_path: Path) -> None:
 def test_decision_log_min_score_and_context_miss(tmp_path: Path) -> None:
     patterns = [
         {"label": "n", "priority": 1, "regex": "\\d+",
-         "context": {"positive": {"num": 1}, "negative": {"bad": -1}}},
+         "context": {"positive": ["num"]}, "nearby": {"bad": -1}},
     ]
     cfg = make_cfg(tmp_path, patterns, min_score=0)
     _, decisions = extract(("num", "bad 12"), cfg)
@@ -511,37 +515,120 @@ def test_cli_error_log_flag_overwrites_each_run() -> None:
 
 
 # ---------------------------------------------------------------- keyword validation
+def _one(**keys: Any) -> list[dict[str, Any]]:
+    return [{"label": "p", "priority": 1, "regex": "x", **keys}]
+
+
 @pytest.mark.parametrize("keyword", ["w2", "1099", "café", "$"])
-def test_keyword_that_can_never_match_is_rejected(tmp_path: Path, keyword: str) -> None:
-    patterns = [{"label": "p", "priority": 1, "regex": "x",
-                 "context": {"positive": {keyword: 1}}}]
-    with pytest.raises(ValueError, match=r"pattern 'p'.*ASCII letters"):
-        make_cfg(tmp_path, patterns)
-
-
-def test_keyword_in_both_groups_is_rejected(tmp_path: Path) -> None:
-    patterns = [{"label": "p", "priority": 1, "regex": "x",
-                 "context": {"positive": {"invoice": 3}, "negative": {"Invoice": -3}}}]
-    with pytest.raises(ValueError, match="more than once"):
-        make_cfg(tmp_path, patterns)
+@pytest.mark.parametrize(
+    "where, build",
+    [
+        ("context.positive", lambda k: {"context": {"positive": [k]}}),
+        ("context.penalize", lambda k: {"context": {"penalize": {k: -1}}}),
+        ("nearby", lambda k: {"nearby": {k: 1}}),
+    ],
+)
+def test_keyword_that_can_never_match_is_rejected(
+    tmp_path: Path, keyword: str, where: str, build: Any
+) -> None:
+    with pytest.raises(ValueError, match=rf"pattern 'p': {where} keyword .*ASCII letters"):
+        make_cfg(tmp_path, _one(**build(keyword)), overlap_tiebreak=["context_penalty"])
 
 
 @pytest.mark.parametrize(
-    "group,weight", [("positive", -2), ("negative", 3)]
+    "keys, where",
+    [
+        ({"context": {"positive": ["invoice", "Invoice"]}}, "context.positive"),
+        ({"context": {"penalize": {"bad": -1, "BAD": -2}}}, "context.penalize"),
+        ({"nearby": {"tel": 1, "Tel": 2}}, "nearby"),
+    ],
 )
-def test_wrong_signed_weight_is_rejected(tmp_path: Path, group: str, weight: int) -> None:
-    patterns = [{"label": "p", "priority": 1, "regex": "x",
-                 "context": {group: {"word": weight}}}]
-    with pytest.raises(ValueError, match="weight"):
-        make_cfg(tmp_path, patterns)
+def test_duplicate_keyword_within_a_key_is_rejected(
+    tmp_path: Path, keys: dict[str, Any], where: str
+) -> None:
+    with pytest.raises(ValueError, match=rf"pattern 'p': {where} keyword .* more than once"):
+        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+
+
+def test_keyword_in_positive_and_penalize_is_rejected(tmp_path: Path) -> None:
+    keys = {"context": {"positive": ["invoice"], "penalize": {"Invoice": -3}}}
+    with pytest.raises(ValueError, match="pattern 'p': keyword 'invoice' is in both"):
+        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+
+
+def test_keyword_may_be_in_context_and_nearby(tmp_path: Path) -> None:
+    keys = {"context": {"positive": ["tel"], "penalize": {"fax": -1}},
+            "nearby": {"tel": 2, "fax": -1}}
+    cfg = make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+    assert cfg.patterns[0].positive == ["tel"] and cfg.patterns[0].nearby == {"tel": 2, "fax": -1}
+
+
+def test_positive_penalize_weight_is_rejected(tmp_path: Path) -> None:
+    keys = {"context": {"penalize": {"word": 3}}}
+    with pytest.raises(ValueError, match="context.penalize keyword 'word' has weight 3"):
+        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+
+
+@pytest.mark.parametrize("weight", [-2, 0, 2.5])
+def test_nearby_weights_may_have_any_sign(tmp_path: Path, weight: float) -> None:
+    cfg = make_cfg(tmp_path, _one(nearby={"word": weight}))
+    assert cfg.patterns[0].nearby == {"word": float(weight)}
+
+
+@pytest.mark.parametrize(
+    "keys, message",
+    [
+        ({"nearby": {"word": "high"}}, "nearby keyword 'word' needs a numeric weight"),
+        ({"nearby": ["word"]}, "nearby must be a map"),
+        ({"context": {"penalize": ["word"]}}, "context.penalize must be a map"),
+        ({"context": {"positive": "word"}}, "context.positive` must be a list"),
+        ({"context": {"positive": [True]}}, "context.positive keyword True must be a string"),
+    ],
+)
+def test_malformed_keyword_keys_are_rejected(
+    tmp_path: Path, keys: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ValueError, match=re.escape(message)):
+        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+
+
+# Old-format configs fail with a message that says what to change.
+def test_old_positive_map_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError) as exc:
+        make_cfg(tmp_path, _one(context={"positive": {"phone": 3}}))
+    assert str(exc.value) == (
+        "pattern 'p': `context.positive` is now a list of words; "
+        "move weights for text scoring to `nearby`."
+    )
+
+
+def test_old_negative_key_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError) as exc:
+        make_cfg(tmp_path, _one(context={"negative": {"acct": -3}}))
+    assert str(exc.value) == (
+        "pattern 'p': `context.negative` was renamed to `context.penalize`; "
+        "it no longer affects the text score (use `nearby`)."
+    )
+
+
+def test_old_context_negative_tiebreak_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError) as exc:
+        make_cfg(tmp_path, _one(), overlap_tiebreak=["score", "context_negative"])
+    assert str(exc.value) == "`context_negative` was renamed to `context_penalty`."
 
 
 def test_hyphenated_keyword_matches_like_context_words(tmp_path: Path) -> None:
     # words.py splits on hyphens, so "e-mail" must be the two words e + mail.
     patterns = [{"label": "p", "priority": 1, "regex": r"\d+",
-                 "context": {"positive": {"e-mail": 2}}}]
+                 "context": {"positive": ["e-mail"]}, "nearby": {"e-mail": 2}}]
     cfg = make_cfg(tmp_path, patterns)
     assert matches_of("e-mail 42", cfg)[0].score == 2.0
+    assert _sel_in(cfg, "send e-mail") == ["p"]
+
+
+def _sel_in(cfg: Config, context: str) -> list[str]:
+    chosen, decision = select_patterns(context, cfg.patterns)
+    return [p.label for p in chosen] if decision["outcome"] == "patterns_restricted" else []
 
 
 # ---------------------------------------------------------------- CLI failure paths
@@ -598,50 +685,106 @@ def test_cli_without_text_on_a_terminal_is_a_usage_error(
     assert "no text" in capsys.readouterr().err
 
 
-# ------------------------------------------------- context_negative tie-break
+# ------------------------------------------------- context_penalty tie-break
 # Two patterns match the same span "abcd"; both have a positive hit in the
 # context. B has the higher priority number, so priority alone would pick A.
-CTX_NEG_PATTERNS = [
+CTX_PEN_PATTERNS = [
     {"label": "A", "priority": 1, "regex": "abcd",
-     "context": {"positive": {"alpha": 1}, "negative": {"bad": -2, "very bad": -3}}},
+     "context": {"positive": ["alpha"], "penalize": {"bad": -2, "very bad": -3}}},
     {"label": "B", "priority": 2, "regex": "abcd",
-     "context": {"positive": {"beta": 1}, "negative": {}}},
+     "context": {"positive": ["beta"], "penalize": {}}},
 ]
-CTX_NEG_ORDER = ["score", "context_negative", "length", "priority"]
+CTX_PEN_ORDER = ["score", "context_penalty", "length", "priority"]
 
 
-def test_context_negative_breaks_tie(tmp_path: Path) -> None:
-    cfg = make_cfg(tmp_path, CTX_NEG_PATTERNS, overlap_tiebreak=CTX_NEG_ORDER)
+def test_context_penalty_applies_when_context_selected_patterns(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, CTX_PEN_PATTERNS, overlap_tiebreak=CTX_PEN_ORDER)
     matches, decisions = extract({"text": "abcd", "context": "alpha beta bad"}, cfg)
     assert pairs(matches) == Counter({("B", "abcd"): 1})
     overlap = [d for d in decisions if d["kind"] == "overlap"][0]
-    assert "context negatives 0 > -2" in overlap["reason"]
+    assert "context penalty 0 > -2" in overlap["reason"]
 
 
-def test_context_negative_phrase(tmp_path: Path) -> None:
-    cfg = make_cfg(tmp_path, CTX_NEG_PATTERNS, overlap_tiebreak=CTX_NEG_ORDER)
+def test_context_penalty_phrase(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, CTX_PEN_PATTERNS, overlap_tiebreak=CTX_PEN_ORDER)
     matches, decisions = extract({"text": "abcd", "context": "alpha beta very bad"}, cfg)
     assert pairs(matches) == Counter({("B", "abcd"): 1})
     # "bad" (-2) and "very bad" (-3) both occur: sum is -5
     assert "-5" in [d for d in decisions if d["kind"] == "overlap"][0]["reason"]
 
 
-def test_context_negative_is_opt_in(tmp_path: Path) -> None:
-    cfg = make_cfg(tmp_path, CTX_NEG_PATTERNS)  # default order, no context_negative
+def test_context_penalty_is_opt_in(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, CTX_PEN_PATTERNS)  # default order, no context_penalty
     matches, _ = extract({"text": "abcd", "context": "alpha beta bad"}, cfg)
     assert pairs(matches) == Counter({("A", "abcd"): 1})  # priority decides
 
 
-def test_context_negative_needs_context(tmp_path: Path) -> None:
-    cfg = make_cfg(tmp_path, CTX_NEG_PATTERNS, overlap_tiebreak=CTX_NEG_ORDER)
+def test_context_penalty_ties_without_context(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, CTX_PEN_PATTERNS, overlap_tiebreak=CTX_PEN_ORDER)
     assert pairs(matches_of("abcd", cfg)) == Counter({("A", "abcd"): 1})
 
 
-def test_context_negative_ignored_when_context_selects_nothing(tmp_path: Path) -> None:
-    """Context with no positive hits runs all patterns: negatives must NOT apply."""
-    cfg = make_cfg(tmp_path, CTX_NEG_PATTERNS, overlap_tiebreak=CTX_NEG_ORDER)
+def test_context_penalty_ties_when_context_selects_nothing(tmp_path: Path) -> None:
+    """Context with no positive hits runs all patterns: penalties must NOT apply."""
+    cfg = make_cfg(tmp_path, CTX_PEN_PATTERNS, overlap_tiebreak=CTX_PEN_ORDER)
     matches, _ = extract({"text": "abcd", "context": "bad"}, cfg)
     assert pairs(matches) == Counter({("A", "abcd"): 1})  # falls through to priority
+
+
+def test_penalize_never_lowers_score_or_selects(tmp_path: Path) -> None:
+    patterns = [{"label": "n", "priority": 1, "regex": r"\d+",
+                 "context": {"positive": ["num"], "penalize": {"bad": -5}}}]
+    cfg = make_cfg(tmp_path, patterns, overlap_tiebreak=CTX_PEN_ORDER)
+    for inp in ("bad 12", ("bad", "bad 12"), ("num bad", "bad 12")):
+        (m,) = matches_of(inp, cfg)
+        assert m.score == 0
+    assert _sel_in(cfg, "bad") == []
+
+
+def test_nearby_never_reads_context_and_positive_never_reads_text(tmp_path: Path) -> None:
+    patterns = [
+        {"label": "n", "priority": 1, "regex": r"\d+",
+         "context": {"positive": ["num"]}, "nearby": {"tel": 3}},
+        {"label": "w", "priority": 2, "regex": "zz", "context": {"positive": ["word"]}},
+    ]
+    cfg = make_cfg(tmp_path, patterns)
+    (m,) = matches_of(("num tel", "12"), cfg)          # tel only in the context
+    assert m.score == 0
+    _, decisions = extract(("tel", "num 12 zz"), cfg)  # num only in the text
+    assert decisions[0]["outcome"] == "all_patterns_used"
+    _, decisions = extract(("word", "num 12 zz"), cfg)
+    assert decisions[0]["patterns"] == "w"
+
+
+# Parity: `nearby` (no decay, window covering every word) and context_penalty
+# score the same keywords with the same rules.
+PARITY_CASES = [
+    # (weights, words around the match / context string, expected sum)
+    ({"bad": -2}, "bad", -2),
+    ({"very bad": -3, "bad": -1}, "very bad", -4),              # phrase + its last word
+    ({"very bad": -3}, "very nice bad", 0),                     # phrase must be contiguous
+    ({"dont": -2}, "don't", -2),                                # apostrophe joins
+    ({"don't": -2}, "DON'T", -2),                               # keyword apostrophe, mixed case
+    ({"e-mail": -1}, "e mail", -1),                             # hyphen separates
+    ({"bad": -2}, "bad Bad BAD", -2),                           # repeats count once
+    ({"tel": -1}, "hotel", 0),                                  # whole words only
+    ({"acct": -3, "call": -2}, "Acct: please CALL", -5),
+]
+
+
+@pytest.mark.parametrize("weights, words, expected", PARITY_CASES)
+def test_nearby_and_context_penalty_parity(
+    tmp_path: Path, weights: dict[str, float], words: str, expected: float
+) -> None:
+    patterns = [{"label": "n", "priority": 1, "regex": r"\d+",
+                 "context": {"penalize": weights}, "nearby": weights}]
+    cfg = make_cfg(tmp_path, patterns, distance_decay=False, min_score=-100,
+                   context_window_words=50, overlap_tiebreak=CTX_PEN_ORDER)
+    pattern = cfg.patterns[0]
+    nearby_before = matches_of(f"{words} 12", cfg)[0].score
+    nearby_after = matches_of(f"12 {words}", cfg)[0].score
+    penalty, _ = _context_penalty(_context_words(words), pattern)
+    assert nearby_before == nearby_after == penalty == pytest.approx(expected)
 
 
 @pytest.mark.parametrize("empty", [[], None])
@@ -663,4 +806,4 @@ def test_empty_tiebreak_uses_start_then_label(tmp_path: Path, empty: Any) -> Non
 
 def test_unknown_tiebreak_name_still_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unknown criterion 'nope'"):
-        make_cfg(tmp_path, CTX_NEG_PATTERNS, overlap_tiebreak=["nope"])
+        make_cfg(tmp_path, CTX_PEN_PATTERNS, overlap_tiebreak=["nope"])

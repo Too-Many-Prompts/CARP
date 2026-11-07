@@ -29,7 +29,7 @@ import json
 import re
 import sys
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence, Union
@@ -38,7 +38,7 @@ import yaml
 
 from words import next_words, prev_words
 
-TIEBREAK_NAMES = ("score", "context_negative", "length", "priority")
+TIEBREAK_NAMES = ("score", "context_penalty", "length", "priority")
 CONTEXT_DIRECTIONS = ("before", "after", "both")
 
 # Written (relative to the working directory) whenever a context selected
@@ -74,7 +74,9 @@ class Pattern:
     label: str
     priority: int
     regex: "re.Pattern[str]"
-    weights: dict[str, float]  # lowercase keyword/phrase -> signed weight
+    positive: list[str] = field(default_factory=list)          # context.positive: selects
+    penalize: dict[str, float] = field(default_factory=dict)   # context.penalize: weight <= 0
+    nearby: dict[str, float] = field(default_factory=dict)     # text window: signed weight
 
 
 @dataclass
@@ -150,29 +152,91 @@ def _require(mapping: Any, key: str, where: str) -> Any:
     return mapping[key]
 
 
-def _check_keyword(
-    label: str, group: str, key: str, weight: float, seen: dict[str, float]
-) -> None:
-    """Fail loudly on keywords the scorer could never match or could mis-score.
+def _check_keyword(label: str, key_name: str, key: str, seen: Iterable[str]) -> None:
+    """Fail loudly on keywords the scorer could never match.
 
-    Context words are ASCII letters only (see words.py), so a keyword with a
-    digit or an accented letter would be silently reduced and match the wrong
-    words. A keyword may not appear twice in a pattern, and the weight's sign
-    must agree with its group (positive > 0, negative < 0).
+    Words are ASCII letters only (see words.py), so a keyword with a digit or
+    an accented letter would be silently reduced and match the wrong words.
+    A keyword may not appear twice under the same key of a pattern.
     """
-    where = f"pattern '{label}': context.{group} keyword '{key}'"
+    where = f"pattern '{label}': {key_name} keyword '{key}'"
     if not _keyword_words(key) or any(c.isalnum() and not ("a" <= c <= "z") for c in key):
         raise ValueError(
             f"{where} must contain only ASCII letters (digits and accented "
-            "letters can never match a context word)"
+            "letters can never match a word)"
         )
     if key in seen:
         raise ValueError(f"{where} is listed more than once in this pattern")
-    if (group == "positive" and weight < 0) or (group == "negative" and weight > 0):
+
+
+def _weight_map(label: str, key_name: str, raw: Any, non_positive: bool) -> dict[str, float]:
+    """Validate a `word: weight` map (`nearby` or `context.penalize`)."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
         raise ValueError(
-            f"{where} has weight {weight:g}; positive weights must be >= 0 "
-            "and negative weights <= 0"
+            f"pattern '{label}': {key_name} must be a map of word: weight, "
+            f"got {type(raw).__name__}"
         )
+    out: dict[str, float] = {}
+    for keyword, weight in raw.items():
+        key = str(keyword).lower()
+        _check_keyword(label, key_name, key, out)
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+            raise ValueError(
+                f"pattern '{label}': {key_name} keyword '{key}' needs a numeric "
+                f"weight, got {weight!r}"
+            )
+        if non_positive and weight > 0:
+            raise ValueError(
+                f"pattern '{label}': {key_name} keyword '{key}' has weight "
+                f"{float(weight):g}; penalize weights must be <= 0"
+            )
+        out[key] = float(weight)
+    return out
+
+
+def _load_keywords(
+    label: str, entry: dict[str, Any]
+) -> tuple[list[str], dict[str, float], dict[str, float]]:
+    """Return (context.positive, context.penalize, nearby) for one pattern."""
+    context = entry.get("context") or {}
+    if not isinstance(context, dict):
+        raise ValueError(f"pattern '{label}': `context` must be a map (positive, penalize)")
+    if "negative" in context:
+        raise ValueError(
+            f"pattern '{label}': `context.negative` was renamed to "
+            "`context.penalize`; it no longer affects the text score (use `nearby`)."
+        )
+    raw_pos = context.get("positive")
+    if isinstance(raw_pos, dict):
+        raise ValueError(
+            f"pattern '{label}': `context.positive` is now a list of words; "
+            "move weights for text scoring to `nearby`."
+        )
+    if raw_pos is not None and not isinstance(raw_pos, list):
+        raise ValueError(
+            f"pattern '{label}': `context.positive` must be a list of words, "
+            f"got {type(raw_pos).__name__}"
+        )
+    positive: list[str] = []
+    for keyword in raw_pos or []:
+        if not isinstance(keyword, str):
+            raise ValueError(
+                f"pattern '{label}': context.positive keyword {keyword!r} must be a string"
+            )
+        key = keyword.lower()
+        _check_keyword(label, "context.positive", key, positive)
+        positive.append(key)
+    penalize = _weight_map(label, "context.penalize", context.get("penalize"), True)
+    for key in penalize:
+        if key in positive:
+            raise ValueError(
+                f"pattern '{label}': keyword '{key}' is in both context.positive "
+                "and context.penalize"
+            )
+    nearby = _weight_map(label, "nearby", entry.get("nearby"), False)
+    return positive, penalize, nearby
 
 
 def load_config(path: str | Path) -> Config:
@@ -186,6 +250,8 @@ def load_config(path: str | Path) -> Config:
     # A blank `overlap_tiebreak:` (None) means "no criteria", same as [].
     settings["overlap_tiebreak"] = settings["overlap_tiebreak"] or []
     for name in settings["overlap_tiebreak"]:
+        if name == "context_negative":
+            raise ValueError("`context_negative` was renamed to `context_penalty`.")
         if name not in TIEBREAK_NAMES:
             raise ValueError(
                 f"settings.overlap_tiebreak: unknown criterion '{name}' "
@@ -221,19 +287,15 @@ def load_config(path: str | Path) -> Config:
         except re.error as exc:
             raise ValueError(f"pattern '{label}': invalid regex: {exc}") from exc
 
-        weights: dict[str, float] = {}
-        context = entry.get("context") or {}
-        for group in ("positive", "negative"):
-            for keyword, weight in (context.get(group) or {}).items():
-                key = str(keyword).lower()
-                _check_keyword(label, group, key, float(weight), weights)
-                weights[key] = float(weight)
+        positive, penalize, nearby = _load_keywords(label, entry)
         patterns.append(
             Pattern(
                 label=label,
                 priority=int(_require(entry, "priority", f"pattern '{label}'")),
                 regex=compiled,
-                weights=weights,
+                positive=positive,
+                penalize=penalize,
+                nearby=nearby,
             )
         )
 
@@ -271,9 +333,10 @@ def select_patterns(
 ) -> tuple[list[Pattern], Decision]:
     """Return the patterns to run on the input text.
 
-    A pattern "matches" the context when any of its positive keywords/phrases
-    (weight > 0 under `context.positive` in the YAML) occurs in it as whole
-    words, case-insensitively. The pattern regexes are NOT run on the context.
+    A pattern "matches" the context when any of its `context.positive`
+    words/phrases occurs in it as whole words, case-insensitively (same
+    matcher as `nearby` scoring). The pattern regexes are NOT run on the
+    context, and `nearby` / `context.penalize` never select.
     If at least one pattern matches, only those run on the text. With no
     context, or no matches, all run.
     """
@@ -303,20 +366,15 @@ def select_patterns(
 
 
 def _context_words(context: str) -> list[str]:
-    """Lowercase letter-only words of the context (same reduction as keywords)."""
-    return _keyword_words(context)
+    """All words of the context, reduced exactly like the text window's words
+    (words.next_words). The leading space keeps the first word: next_words
+    skips a word that the start position falls inside."""
+    return next_words(" " + context, 0, len(context) + 1)
 
 
 def _context_hits(words: list[str], pattern: Pattern) -> list[str]:
-    """Positive keywords of `pattern` that occur in `words` as a contiguous phrase."""
-    hits: list[str] = []
-    for keyword, weight in pattern.weights.items():
-        kw = _keyword_words(keyword)
-        size = len(kw)
-        if weight <= 0 or size == 0:
-            continue
-        if any(words[i:i + size] == kw for i in range(len(words) - size + 1)):
-            hits.append(keyword)
+    """`context.positive` keywords of `pattern` that occur in the context words."""
+    _, hits = _sum_keywords(dict.fromkeys(pattern.positive, 1.0), _phrase_finder(words), False)
     return hits
 
 
@@ -429,21 +487,48 @@ def _keyword_words(keyword: str) -> list[str]:
     return re.findall(r"[a-z]+", keyword.lower().replace("'", "").replace("’", ""))
 
 
-def _context_penalty(words: list[str], pattern: Pattern) -> float:
-    """Sum of the pattern's negative weights whose phrase occurs in `words`.
+DistanceFinder = Callable[[list[str]], Union[int, None]]
 
-    Always <= 0 (0 means no negative hit). Used by the `context_negative`
-    tie-break; `words` come from `_context_words`.
+
+def _sum_keywords(
+    weights: dict[str, float], find: DistanceFinder, decay: bool
+) -> tuple[float, list[str]]:
+    """The one keyword matcher behind `nearby`, `context_penalty` and selection.
+
+    Each keyword/phrase is reduced with _keyword_words and handed to `find`,
+    which returns the word distance of its nearest occurrence (or None).
+    Every keyword counts once. Returns (sum of weights found, keywords found);
+    with `decay`, each weight is divided by its distance.
     """
     total = 0.0
-    for keyword, weight in pattern.weights.items():
+    hits: list[str] = []
+    for keyword, weight in weights.items():
         kw = _keyword_words(keyword)
-        size = len(kw)
-        if weight >= 0 or size == 0:
+        if not kw:
             continue
-        if any(words[i:i + size] == kw for i in range(len(words) - size + 1)):
-            total += weight
-    return total
+        dist = find(kw)
+        if dist is None:
+            continue
+        hits.append(keyword)
+        total += weight / dist if decay else weight
+    return total, hits
+
+
+def _phrase_finder(words: list[str]) -> DistanceFinder:
+    """Finder for a position-less word list (the context): 1 if the phrase
+    occurs anywhere as contiguous whole words, else None."""
+    def find(kw: list[str]) -> int | None:
+        size = len(kw)
+        found = any(words[i:i + size] == kw for i in range(len(words) - size + 1))
+        return 1 if found else None
+    return find
+
+
+def _context_penalty(words: list[str], pattern: Pattern) -> tuple[float, list[str]]:
+    """(sum, hits) of the pattern's `context.penalize` words found in the
+    context words. The sum is <= 0; closer to 0 wins the `context_penalty`
+    tie-break. Same matcher as `nearby`, without window or distance."""
+    return _sum_keywords(pattern.penalize, _phrase_finder(words), False)
 
 
 def _nearest_distance(
@@ -470,8 +555,9 @@ def _nearest_distance(
 def score_candidate(
     text: str, cand: Candidate, pattern: Pattern, settings: dict[str, Any]
 ) -> float:
-    """Sum the weight of each keyword found near the match (nearest occurrence
-    only), divided by word distance when distance_decay is true.
+    """Sum the weight of each `nearby` keyword found near the match (nearest
+    occurrence only), divided by word distance when distance_decay is true.
+    The context string is never read here.
 
     settings["context_direction"] ("before", "after" or "both", default
     "both") chooses which side(s) of the match are searched.
@@ -492,16 +578,9 @@ def score_candidate(
         if direction in ("after", "both") else []
     )
     decay = bool(settings["distance_decay"])
-
-    total = 0.0
-    for keyword, weight in pattern.weights.items():
-        kw = _keyword_words(keyword)
-        if not kw:
-            continue
-        dist = _nearest_distance(before, after, kw)
-        if dist is None:
-            continue
-        total += weight / dist if decay else weight
+    total, _ = _sum_keywords(
+        pattern.nearby, lambda kw: _nearest_distance(before, after, kw), decay
+    )
     return total
 
 
@@ -521,7 +600,7 @@ def _rank_key(
     for name in order:
         if name == "score":
             parts.append(-c.score)
-        elif name == "context_negative":  # penalty <= 0; closer to 0 wins
+        elif name == "context_penalty":  # penalty <= 0; closer to 0 wins
             parts.append(-ctx_penalty.get(c.label, 0.0))
         elif name == "length":
             parts.append(-(c.end - c.start))
@@ -543,11 +622,11 @@ def _why_wins(
         if name == "score" and winner.score != loser.score:
             detail = f"score {winner.score:.2f} > {loser.score:.2f}"
         elif (
-            name == "context_negative"
+            name == "context_penalty"
             and ctx_penalty.get(winner.label, 0.0) != ctx_penalty.get(loser.label, 0.0)
         ):
             detail = (
-                f"context negatives {ctx_penalty.get(winner.label, 0.0):g} "
+                f"context penalty {ctx_penalty.get(winner.label, 0.0):g} "
                 f"> {ctx_penalty.get(loser.label, 0.0):g}"
             )
         elif (
@@ -577,8 +656,8 @@ def resolve_overlaps(
 
     Candidates are ranked by overlap_tiebreak (in config order); if it is
     empty or everything ties, the earlier start, then the label, decides.
-    `ctx_penalty` maps label -> summed negative context weight and feeds the
-    `context_negative` criterion (empty/None: that criterion always ties).
+    `ctx_penalty` maps label -> summed context.penalize weight and feeds the
+    `context_penalty` criterion (empty/None: that criterion always ties).
     Each candidate is accepted unless it overlaps an already-accepted one
     whose label pair is not in `coexist`. Every decision is logged.
     """
@@ -664,11 +743,11 @@ def extract(
     for c in cands:
         c.score = score_candidate(text, c, by_label[c.label], cfg.settings)
 
-    # context_negative only applies when the context actually chose the patterns.
+    # context_penalty only applies when the context actually chose the patterns.
     ctx_penalty: dict[str, float] = {}
     if norm_context and ctx_decision["outcome"] == "patterns_restricted":
         ctx_words = _context_words(norm_context)
-        ctx_penalty = {p.label: _context_penalty(ctx_words, p) for p in patterns}
+        ctx_penalty = {p.label: _context_penalty(ctx_words, p)[0] for p in patterns}
 
     matches, decisions = resolve_overlaps(cands, cfg, ctx_penalty)
     decisions = [ctx_decision] + decisions
@@ -695,7 +774,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--config", required=True, help="path to extraction_config.yaml")
     parser.add_argument("--text", default=None, help="the text to scan (default: read stdin)")
     parser.add_argument("--context", default=None,
-                        help="optional context text; patterns whose positive keywords appear in it are the only ones run")
+                        help="optional context text; patterns whose context.positive words appear in it are the only ones run")
     parser.add_argument("--report", action="store_true",
                         help=f"write the decision log to ./{REPORT_PATH} (overwritten)")
     parser.add_argument("--error-log", action="store_true",
