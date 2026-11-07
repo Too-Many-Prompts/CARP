@@ -1220,7 +1220,6 @@ def test_public_api_as_documented(
     [
         ({"nearby": {True: 1}}, "nearby", "True"),                     # bare `on:` / `yes:`
         ({"context": {"penalize": {False: -1}}}, "context.penalize", "False"),  # bare `no:`
-        ({"nearby": {None: 1}}, "nearby", "None"),                      # bare `null:` / `~:`
         ({"context": {"positive": [True]}}, "context.positive", "True"),
     ],
 )
@@ -1313,3 +1312,48 @@ def test_cli_summarize_malformed_csv_is_a_clean_error(
     assert main(["--summarize"]) == 2
     captured = capsys.readouterr()
     assert captured.err.startswith("error:") and captured.out == ""
+
+
+# ------------------------------------------------- blank entries
+@pytest.mark.parametrize(
+    "keys, where",
+    [
+        ({"context": {"positive": ["tel", None]}}, "context.positive"),   # bare `-` item
+        ({"context": {"penalize": {None: -1}}}, "context.penalize"),     # blank / `~` key
+        ({"nearby": {None: 1}}, "nearby"),
+    ],
+)
+def test_blank_keyword_entry_is_rejected(
+    tmp_path: Path, keys: dict[str, Any], where: str
+) -> None:
+    with pytest.raises(ValueError) as exc:
+        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+    assert str(exc.value) == f"pattern 'p': {where} has an empty entry; remove it"
+
+
+def test_blank_list_item_in_a_file_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "blank.yaml"
+    raw = CONFIG_PATH.read_text(encoding="utf-8").replace(
+        "positive: [phone, tel, call, mobile, fax]",
+        "positive:\n        - phone\n        -")
+    assert raw != CONFIG_PATH.read_text(encoding="utf-8")
+    path.write_text(raw, encoding="utf-8")
+    with pytest.raises(ValueError, match="pattern 'phone_number': context.positive has an empty entry"):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [{}, {"context": None}, {"context": {}}, {"context": {"positive": None, "penalize": None}},
+     {"context": {"positive": [], "penalize": {}}, "nearby": None}, {"nearby": {}}],
+)
+def test_missing_or_blank_keyword_keys_load_as_empty(
+    tmp_path: Path, keys: dict[str, Any]
+) -> None:
+    cfg = make_cfg(tmp_path, [{"label": "n", "priority": 1, "regex": r"\d+", **keys}],
+                   overlap_tiebreak=["context_penalty"])
+    (p,) = cfg.patterns
+    assert (p.positive, p.penalize, p.nearby) == ([], {}, {})
+    for inp in ("tel 12", ("tel", "12")):
+        (m,) = matches_of(inp, cfg)
+        assert (m.text, m.score) == ("12", 0)

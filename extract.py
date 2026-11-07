@@ -200,7 +200,10 @@ def _same_words(key: str, seen: Iterable[str]) -> str | None:
 def _require_str(label: str, key_name: str, keyword: Any) -> None:
     """YAML reads some bare words as non-strings (on/yes/true -> True,
     off/no/false -> False, null/~ -> None); reject them instead of silently
-    turning them into the keywords "true", "false" or "none"."""
+    turning them into the keywords "true", "false" or "none". A blank entry
+    (a bare `-` list item or an empty key) also loads as None."""
+    if keyword is None:
+        raise ValueError(f"pattern '{label}': {key_name} has an empty entry; remove it")
     if not isinstance(keyword, str):
         raise ValueError(
             f"pattern '{label}': {key_name} keyword {keyword!r} must be a string "

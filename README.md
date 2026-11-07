@@ -208,10 +208,16 @@ and keyword when:
 - a `penalize` weight is above 0, or a weight is not a number.
 
 Quote YAML words that YAML would read as something else: unquoted, `on`,
-`yes`, `true` load as `True`, `off`, `no`, `false` as `False`, and `null` /
-`~` as `None`. `load_config` rejects such keywords ("must be a string (quote
-it in the YAML ...)") instead of silently turning them into "true", "false"
-or "none". Write `"on": 1`, not `on: 1`.
+`yes`, `true` load as `True`, and `off`, `no`, `false` as `False`.
+`load_config` rejects such keywords ("must be a string (quote it in the
+YAML ...)") instead of silently turning them into "true" or "false". Write
+`"on": 1`, not `on: 1`. A blank entry (a bare `-` list item, or a `null` /
+`~` key) fails with "has an empty entry; remove it".
+
+Leaving out `context`, `context.positive`, `context.penalize` or `nearby`, or
+leaving them blank (`positive:`, `penalize: {}`), is fine: the pattern simply
+has no keywords of that kind. A word without a weight (`nearby: {tel: }`) is
+an error.
 
 ## Config
 
