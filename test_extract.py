@@ -596,3 +596,71 @@ def test_cli_without_text_on_a_terminal_is_a_usage_error(
         main(["--config", str(CONFIG_PATH)])
     assert exc.value.code == 2
     assert "no text" in capsys.readouterr().err
+
+
+# ------------------------------------------------- context_negative tie-break
+# Two patterns match the same span "abcd"; both have a positive hit in the
+# context. B has the higher priority number, so priority alone would pick A.
+CTX_NEG_PATTERNS = [
+    {"label": "A", "priority": 1, "regex": "abcd",
+     "context": {"positive": {"alpha": 1}, "negative": {"bad": -2, "very bad": -3}}},
+    {"label": "B", "priority": 2, "regex": "abcd",
+     "context": {"positive": {"beta": 1}, "negative": {}}},
+]
+CTX_NEG_ORDER = ["score", "context_negative", "length", "priority"]
+
+
+def test_context_negative_breaks_tie(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, CTX_NEG_PATTERNS, overlap_tiebreak=CTX_NEG_ORDER)
+    matches, decisions = extract({"text": "abcd", "context": "alpha beta bad"}, cfg)
+    assert pairs(matches) == Counter({("B", "abcd"): 1})
+    overlap = [d for d in decisions if d["kind"] == "overlap"][0]
+    assert "context negatives 0 > -2" in overlap["reason"]
+
+
+def test_context_negative_phrase(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, CTX_NEG_PATTERNS, overlap_tiebreak=CTX_NEG_ORDER)
+    matches, decisions = extract({"text": "abcd", "context": "alpha beta very bad"}, cfg)
+    assert pairs(matches) == Counter({("B", "abcd"): 1})
+    # "bad" (-2) and "very bad" (-3) both occur: sum is -5
+    assert "-5" in [d for d in decisions if d["kind"] == "overlap"][0]["reason"]
+
+
+def test_context_negative_is_opt_in(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, CTX_NEG_PATTERNS)  # default order, no context_negative
+    matches, _ = extract({"text": "abcd", "context": "alpha beta bad"}, cfg)
+    assert pairs(matches) == Counter({("A", "abcd"): 1})  # priority decides
+
+
+def test_context_negative_needs_context(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, CTX_NEG_PATTERNS, overlap_tiebreak=CTX_NEG_ORDER)
+    assert pairs(matches_of("abcd", cfg)) == Counter({("A", "abcd"): 1})
+
+
+def test_context_negative_ignored_when_context_selects_nothing(tmp_path: Path) -> None:
+    """Context with no positive hits runs all patterns: negatives must NOT apply."""
+    cfg = make_cfg(tmp_path, CTX_NEG_PATTERNS, overlap_tiebreak=CTX_NEG_ORDER)
+    matches, _ = extract({"text": "abcd", "context": "bad"}, cfg)
+    assert pairs(matches) == Counter({("A", "abcd"): 1})  # falls through to priority
+
+
+@pytest.mark.parametrize("empty", [[], None])
+def test_empty_tiebreak_uses_start_then_label(tmp_path: Path, empty: Any) -> None:
+    patterns = [
+        {"label": "Z", "priority": 1, "regex": "abcd"},
+        {"label": "B", "priority": 9, "regex": "abcd"},
+    ]
+    cfg = make_cfg(tmp_path, patterns, overlap_tiebreak=empty)
+    assert cfg.settings["overlap_tiebreak"] == []
+    assert pairs(matches_of("abcd", cfg)) == Counter({("B", "abcd"): 1})  # label, not priority
+    early = [
+        {"label": "late", "priority": 1, "regex": "bcd"},
+        {"label": "early", "priority": 9, "regex": "abc"},
+    ]
+    cfg = make_cfg(tmp_path, early, overlap_tiebreak=empty)
+    assert pairs(matches_of("abcd", cfg)) == Counter({("early", "abc"): 1})  # earlier start
+
+
+def test_unknown_tiebreak_name_still_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unknown criterion 'nope'"):
+        make_cfg(tmp_path, CTX_NEG_PATTERNS, overlap_tiebreak=["nope"])

@@ -109,9 +109,13 @@ with open_report() as write:           # opens the file once, holds nothing in m
    `distance_decay`, a keyword's weight is divided by its word distance
    (nearest word = 1). Only the nearest occurrence of each keyword counts.
 6. **Drop** candidates with `score < min_score`.
-7. **Resolve overlaps**, best first, using `overlap_tiebreak` (in order: score,
-   length, priority). A pair of labels listed in `coexist` keeps both.
-   Identical spans count as overlapping.
+7. **Resolve overlaps**, best first, using `overlap_tiebreak` (in order; the
+   example is score, length, priority). An optional `context_negative`
+   criterion prefers the pattern with fewer/lighter negative keyword hits in
+   the passed context; it only applies when that context selected the
+   patterns, otherwise it ties. If every listed criterion ties, or the list is
+   empty, the earlier start and then the label decide. A pair of labels
+   listed in `coexist` keeps both. Identical spans count as overlapping.
 
 ### Context
 

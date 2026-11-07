@@ -38,7 +38,7 @@ import yaml
 
 from words import next_words, prev_words
 
-TIEBREAK_NAMES = ("score", "length", "priority")
+TIEBREAK_NAMES = ("score", "context_negative", "length", "priority")
 CONTEXT_DIRECTIONS = ("before", "after", "both")
 
 # Written (relative to the working directory) whenever a context selected
@@ -183,6 +183,8 @@ def load_config(path: str | Path) -> Config:
     settings = _require(raw, "settings", "config")
     for key in REQUIRED_SETTINGS:
         _require(settings, key, "settings")
+    # A blank `overlap_tiebreak:` (None) means "no criteria", same as [].
+    settings["overlap_tiebreak"] = settings["overlap_tiebreak"] or []
     for name in settings["overlap_tiebreak"]:
         if name not in TIEBREAK_NAMES:
             raise ValueError(
@@ -427,6 +429,23 @@ def _keyword_words(keyword: str) -> list[str]:
     return re.findall(r"[a-z]+", keyword.lower().replace("'", "").replace("’", ""))
 
 
+def _context_penalty(words: list[str], pattern: Pattern) -> float:
+    """Sum of the pattern's negative weights whose phrase occurs in `words`.
+
+    Always <= 0 (0 means no negative hit). Used by the `context_negative`
+    tie-break; `words` come from `_context_words`.
+    """
+    total = 0.0
+    for keyword, weight in pattern.weights.items():
+        kw = _keyword_words(keyword)
+        size = len(kw)
+        if weight >= 0 or size == 0:
+            continue
+        if any(words[i:i + size] == kw for i in range(len(words) - size + 1)):
+            total += weight
+    return total
+
+
 def _nearest_distance(
     before: list[str], after: list[str], kw: list[str]
 ) -> int | None:
@@ -495,11 +514,15 @@ def _overlaps(a: Candidate, b: Candidate) -> bool:
     return a.start < b.end and b.start < a.end
 
 
-def _rank_key(c: Candidate, order: Sequence[str]) -> tuple:
+def _rank_key(
+    c: Candidate, order: Sequence[str], ctx_penalty: dict[str, float]
+) -> tuple:
     parts: list[Any] = []
     for name in order:
         if name == "score":
             parts.append(-c.score)
+        elif name == "context_negative":  # penalty <= 0; closer to 0 wins
+            parts.append(-ctx_penalty.get(c.label, 0.0))
         elif name == "length":
             parts.append(-(c.end - c.start))
         else:  # priority: lower number wins
@@ -508,12 +531,25 @@ def _rank_key(c: Candidate, order: Sequence[str]) -> tuple:
     return tuple(parts)
 
 
-def _why_wins(winner: Candidate, loser: Candidate, order: Sequence[str]) -> str:
+def _why_wins(
+    winner: Candidate,
+    loser: Candidate,
+    order: Sequence[str],
+    ctx_penalty: dict[str, float],
+) -> str:
     """Explain which tiebreak criterion decided, naming the ones that tied."""
     tied: list[str] = []
     for name in order:
         if name == "score" and winner.score != loser.score:
             detail = f"score {winner.score:.2f} > {loser.score:.2f}"
+        elif (
+            name == "context_negative"
+            and ctx_penalty.get(winner.label, 0.0) != ctx_penalty.get(loser.label, 0.0)
+        ):
+            detail = (
+                f"context negatives {ctx_penalty.get(winner.label, 0.0):g} "
+                f"> {ctx_penalty.get(loser.label, 0.0):g}"
+            )
         elif (
             name == "length"
             and (winner.end - winner.start) != (loser.end - loser.start)
@@ -533,14 +569,20 @@ def _why_wins(winner: Candidate, loser: Candidate, order: Sequence[str]) -> str:
 
 
 def resolve_overlaps(
-    cands: list[Candidate], cfg: Config
+    cands: list[Candidate],
+    cfg: Config,
+    ctx_penalty: dict[str, float] | None = None,
 ) -> tuple[list[Candidate], list[Decision]]:
     """Drop candidates below min_score, then resolve overlaps greedily.
 
-    Candidates are ranked by overlap_tiebreak (in config order). Each is
-    accepted unless it overlaps an already-accepted candidate whose label
-    pair is not in `coexist`. Every decision is logged with its reason.
+    Candidates are ranked by overlap_tiebreak (in config order); if it is
+    empty or everything ties, the earlier start, then the label, decides.
+    `ctx_penalty` maps label -> summed negative context weight and feeds the
+    `context_negative` criterion (empty/None: that criterion always ties).
+    Each candidate is accepted unless it overlaps an already-accepted one
+    whose label pair is not in `coexist`. Every decision is logged.
     """
+    ctx_penalty = ctx_penalty or {}
     settings = cfg.settings
     order = settings["overlap_tiebreak"]
     min_score = settings["min_score"]
@@ -557,7 +599,7 @@ def resolve_overlaps(
             survivors.append(c)
 
     accepted: list[Candidate] = []
-    for c in sorted(survivors, key=lambda x: _rank_key(x, order)):
+    for c in sorted(survivors, key=lambda x: _rank_key(x, order, ctx_penalty)):
         pending: list[Decision] = []
         beaten = False
         for a in accepted:
@@ -572,7 +614,7 @@ def resolve_overlaps(
             else:
                 decisions.append(
                     _decision("overlap", "a_wins_b_dropped",
-                              _why_wins(a, c, order), a=a, b=c)
+                              _why_wins(a, c, order, ctx_penalty), a=a, b=c)
                 )
                 beaten = True
                 break
@@ -622,7 +664,13 @@ def extract(
     for c in cands:
         c.score = score_candidate(text, c, by_label[c.label], cfg.settings)
 
-    matches, decisions = resolve_overlaps(cands, cfg)
+    # context_negative only applies when the context actually chose the patterns.
+    ctx_penalty: dict[str, float] = {}
+    if norm_context and ctx_decision["outcome"] == "patterns_restricted":
+        ctx_words = _context_words(norm_context)
+        ctx_penalty = {p.label: _context_penalty(ctx_words, p) for p in patterns}
+
+    matches, decisions = resolve_overlaps(cands, cfg, ctx_penalty)
     decisions = [ctx_decision] + decisions
 
     if ctx_decision["outcome"] == "patterns_restricted" and not matches:
