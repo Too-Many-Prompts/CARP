@@ -1147,3 +1147,68 @@ def test_cli_summarize_bad_report_is_a_clean_error(
     assert main(["--summarize"]) == 2
     captured = capsys.readouterr()
     assert captured.err.startswith("error:") and captured.out == ""
+
+
+# ------------------------------------------------- public API, as the README shows it
+def test_public_api_as_documented(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import io
+    import json
+
+    import extract as mod
+    from extract import (format_summary, open_report, reset_error_log, reset_report,
+                         summarize_overlaps)
+
+    cfg = load_config(str(CONFIG_PATH))
+    assert isinstance(cfg, Config)
+
+    # Library: the three input forms, (matches, decisions) shape.
+    for inp in ("Call 555-123-4567", {"text": "Call 555-123-4567", "context": "call"},
+                ("call", "Call 555-123-4567")):
+        matches, decisions = extract(inp, cfg, source="id-1")
+        assert [set(m.to_dict()) for m in matches] == [{"label", "text", "start", "end", "score"}]
+        assert all(list(d) == list(REPORT_FIELDS) for d in decisions)
+        assert {d["file"] for d in decisions} == {"id-1"}
+    matches, _ = extract({"text": "some text", "context": "call"}, cfg)
+    assert isinstance(matches, list)
+
+    # The README loop: reset, stream with open_report, log context misses.
+    reset_report()
+    reset_error_log()
+    items = [("id-1", "call", "Call 555-123-4567"), ("id-2", "tel", "Invoice INV-004521"),
+             ("id-3", "", "Acct 5551234567 is overdue.")]
+    with open_report() as write:
+        for id, context, text in items:
+            matches, decisions = extract((context, text), cfg, source=id)
+            write(decisions)
+            for d in decisions:
+                if d["kind"] == "context_miss":
+                    log_context_miss(id, context, text, d)
+    with open("extract_report.csv", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        assert tuple(reader.fieldnames or ()) == REPORT_FIELDS
+        assert REPORT_FIELDS[-2:] == ("decided_by", "penalty_skipped")
+        assert {r["file"] for r in reader} == {"id-1", "id-2", "id-3"}
+    (miss,) = read_error_log()
+    assert list(miss) == list(mod.ERROR_LOG_FIELDS) and miss["file"] == "id-2"
+    write_report_csv(extract("abc", cfg)[1])            # appends, no second header
+
+    # Summary from the library and its table.
+    rows = summarize_overlaps()
+    assert rows and all(list(r) == list(mod.SUMMARY_FIELDS) for r in rows)
+    assert rows[0]["pair"] == "account_number/phone_number"
+    assert format_summary(rows).splitlines()[0].split() == list(mod.SUMMARY_FIELDS)
+
+    # CLI, as in the README examples.
+    config = str(CONFIG_PATH)
+    assert main(["--config", config, "--report", "--text",
+                 "Invoice INV-004521 dated 03/14/2026, amount due $1,250.00"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert {m["label"] for m in out} == {"invoice_number", "date", "amount"}
+    assert all(set(m) == {"label", "text", "start", "end", "score"} for m in out)
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"call 555-123-4567")))
+    assert main(["--config", config, "--context", "phone"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["label"] == "phone_number"
+    assert main(["--summarize"]) == 0
+    assert capsys.readouterr().out.split()[:2] == ["pair", "overlaps"]

@@ -8,11 +8,17 @@ Library use:
 
 extract() writes no files; the caller decides what to do with `decisions`
 (flat dicts, columns REPORT_FIELDS). Optional helpers: write_report_csv(),
-open_report(), log_context_miss(), reset_report(), reset_error_log().
+open_report(), log_context_miss(), reset_report(), reset_error_log(),
+summarize_overlaps() / format_summary() (per label pair overlap summary).
+
+Pattern keywords: `context.positive` selects patterns from the context
+string, `context.penalize` feeds the context_penalty tie-break, `nearby`
+scores the text window. Each reads only its own input.
 
 CLI (one text per run; for many texts use the library):
     extract.py --config extraction_config.yaml [--text TEXT | < stdin]
                [--context TEXT] [--report] [--error-log]
+    extract.py --summarize [PATH]
 Prints the matches as a JSON list. Nothing is written unless asked:
     --report     ./extract_report.csv  one row per decision (context, min_score, overlaps)
     --error-log  ./errorlog.csv        raw context and text of a context miss
