@@ -23,7 +23,9 @@ each match using nearby context words, and resolves overlapping matches.
    character (default `""`, none), e.g. `".!?"` keeps the scan in one sentence.
 5. `resolve_overlaps(...)`: drop below `min_score`; for overlapping spans keep
    both if the label pair is in `coexist`, else apply `overlap_tiebreak` in
-   order (score, length, priority). Identical spans count as overlapping.
+   order (score, length, priority, plus opt-in `context_negative`: fewer negative
+   hits in the passed context wins, only when that context selected the patterns).
+   Empty list or full tie: earlier start, then label. Identical spans count as overlapping.
 6. `extract(text, cfg, source="")` chains 2-5 and returns `(matches, decisions)`; it writes no files. `main()` is an argparse CLI:
    `extract.py --config extraction_config.yaml [--text TEXT | stdin] [--context TEXT] [--report] [--error-log]`
    It scans one text and prints the matches as a JSON list (`label, text, start,
@@ -51,6 +53,7 @@ each match using nearby context words, and resolves overlapping matches.
   rejects digit/accented keywords, duplicate keywords within a pattern and
   wrong-signed weights.
 - Also unit-test: coexist overlap, non-coexist overlap, length tie-break,
+  `context_negative` tie-break (and its context gate), empty `overlap_tiebreak`,
   multi-word keywords, invalid regex.
 - Run `pytest -q` after every change and do not report success until it passes.
 

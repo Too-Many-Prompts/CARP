@@ -11,8 +11,13 @@ settings:
   case_sensitive: false
   overlap_tiebreak:              # applied in order when overlapping spans conflict
     - score                      # higher context score wins
+    # - context_negative         # opt-in: only when the passed context selected the
+    #                            #   patterns; the pattern with fewer/lighter negative
+    #                            #   keyword hits in that context wins
     - length                     # then longer match
     - priority                   # then lower priority number wins
+                                 # Anything still tied (or an empty list) goes to the
+                                 #   earlier start, then the alphabetical label.
 
 normalize:
   collapse_whitespace: true
