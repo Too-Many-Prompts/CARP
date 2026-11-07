@@ -102,7 +102,7 @@ with open_report() as write:           # opens the file once, holds nothing in m
 Then summarize the report:
 
 ```python
-from extract import summarize_overlaps, format_summary
+from extract import summarize_overlaps, format_summary   # defined in summarize.py
 
 rows = summarize_overlaps()            # list of dicts, worst pairs first
 print(format_summary(rows))            # the same table --summarize prints
@@ -134,10 +134,32 @@ print(format_summary(rows))            # the same table --summarize prints
    decide. A pair of labels listed in `coexist` keeps both. Identical spans
    count as overlapping. Every decision records what decided it (`decided_by`).
 
-### Two kinds of keywords: `context` and `nearby`
+### Keywords: `keywords` (the usual way)
 
-Each pattern has keywords for two different inputs, and each kind reads only
-its own input:
+Write each word once, with a signed weight:
+
+```yaml
+- label: phone_number
+  keywords: {phone: 3, call: 2, mobile: 2, acct: -3, order: -1}
+```
+
+`load_config` expands every word by its sign:
+
+| weight | the word... |
+| --- | --- |
+| `> 0` | selects the pattern from the context string (`context.positive`) **and** raises the score near a match in the text (`nearby`, same weight) |
+| `< 0` | lowers the score near a match (`nearby`, same weight) **and** counts against the pattern in the `context_penalty` tie-break (`context.penalize`, same weight) |
+| `0` | load error: give it a sign or remove it |
+
+This covers most patterns. When a word needs different roles (say, it should
+select the pattern but not score), use the explicit keys below for that word.
+A pattern may mix `keywords` and the explicit keys, but a word may not be in
+`keywords` **and** in an explicit key of the same pattern (load error), so
+there are no precedence rules.
+
+### Explicit keys: `context` and `nearby`
+
+`keywords` expands into these. Each kind reads only its own input:
 
 ```yaml
 - label: phone_number
@@ -183,9 +205,11 @@ closer to 0 wins (`context penalty 0 > -3` in the `reason`).
   The context has no match position, so `context_window_words`,
   `context_direction`, `stop_at` and `distance_decay` do not apply: the whole
   string is read and nothing is divided by distance.
-- **Load warning:** if any pattern has `penalize` words but `context_penalty`
-  is not in `overlap_tiebreak`, `load_config` warns (`UserWarning`) naming the
-  patterns, because those words are never used. The config still loads.
+- **Load warning:** if any pattern has explicit `context.penalize` words but
+  `context_penalty` is not in `overlap_tiebreak`, `load_config` warns
+  (`UserWarning`) naming the patterns, because those words are never used.
+  The config still loads. Negative `keywords` words don't count: they also
+  score in `nearby`, so they are used either way.
 - **Skipped note:** if `context_penalty` is listed, a context was given but
   selected no patterns, and that context contains `penalize` words of either
   overlapping candidate, the overlap's `reason` ends with
@@ -203,7 +227,8 @@ and keyword when:
 
 - a keyword has a digit or an accented letter (`w2`, `1099`, `café`) or no letters;
 - the same keyword appears twice under one key of a pattern
-  (`context.positive`, `context.penalize` or `nearby`);
+  (`keywords`, `context.positive`, `context.penalize` or `nearby`);
+- a word is in `keywords` and also in an explicit key, or has weight 0 in `keywords`;
 - a word is in both `context.positive` and `context.penalize` of a pattern;
 - a `penalize` weight is above 0, or a weight is not a number.
 
@@ -214,7 +239,7 @@ YAML ...)") instead of silently turning them into "true" or "false". Write
 `"on": 1`, not `on: 1`. A blank entry (a bare `-` list item, or a `null` /
 `~` key) fails with "has an empty entry; remove it".
 
-Leaving out `context`, `context.positive`, `context.penalize` or `nearby`, or
+Leaving out `keywords`, `context`, `context.positive`, `context.penalize` or `nearby`, or
 leaving them blank (`positive:`, `penalize: {}`), is fine: the pattern simply
 has no keywords of that kind. A word without a weight (`nearby: {tel: }`) is
 an error.
@@ -227,7 +252,7 @@ an error.
 | --- | --- |
 | `settings` | `context_window_words`, `context_direction` (`before`/`after`/`both`, default `both`), `stop_at` (characters that end the window scan, default `""`), `distance_decay`, `min_score`, `case_sensitive`, `overlap_tiebreak` (any of `score`, `context_penalty`, `length`, `priority`, in order; may be empty) |
 | `normalize` | `collapse_whitespace`, `unicode_dashes_to_hyphen`, `smart_quotes_to_ascii` |
-| `patterns` | `label`, `priority`, `regex`, `context.positive` (word list), `context.penalize` (word -> weight <= 0), `nearby` (word -> signed weight) |
+| `patterns` | `label`, `priority`, `regex`, `keywords` (word -> signed weight; the shorthand), and/or the explicit `context.positive` (word list), `context.penalize` (word -> weight <= 0), `nearby` (word -> signed weight) |
 | `coexist` | label pairs that may both be kept when they overlap |
 | `tests` | cases `{text, expect: [{label, text}], context?, name?}` run by pytest |
 
@@ -241,7 +266,9 @@ Old configs do not load; `load_config` says what to change:
 | `context.negative: {word: weight}` | `context.penalize` for the tie-break, and the weights under `nearby` if they should still lower the text score |
 | `context_negative` in `overlap_tiebreak` | `context_penalty` |
 
-To keep the old results exactly, copy both old maps into `nearby`.
+To keep the old results exactly, merge both old maps into one `keywords`
+map: `positive: {phone: 3}` plus `negative: {acct: -3}` becomes
+`keywords: {phone: 3, acct: -3}`. That is exactly what the old format meant.
 
 ## Output files
 
@@ -312,7 +339,9 @@ How to read it:
 `test_extract.py` runs the `tests` section of the config and unit-tests coexist
 and non-coexist overlaps, tie-breaks (including `context_penalty`, its context
 gate and an empty list), `nearby`/`context_penalty` parity, multi-word keywords,
-`context_direction`, keyword validation and old-format errors, the load warning,
+`context_direction`, keyword validation and old-format errors, the `keywords`
+shorthand (expansion, conflicts, and that the example config loads exactly as
+its explicit form did), the load warning,
 the skipped note, `decided_by`, context selection, the error log, the report CSV,
 the overlap summary, the CLI, and the public API as shown in this README.
 
@@ -321,6 +350,7 @@ the overlap summary, the CLI, and the public API as shown in this README.
 | File | Role |
 | --- | --- |
 | `extract.py` | the extractor and CLI |
+| `summarize.py` | `summarize_overlaps()` / `format_summary()`: the overlap summary of a report CSV (re-exported by `extract.py`) |
 | `words.py` | `prev_words()` / `next_words()` word lookups around a match |
 | `extraction_config.yaml` | settings, patterns, coexist pairs, test cases |
 | `test_extract.py` | pytest suite |
