@@ -1157,6 +1157,7 @@ def test_public_api_as_documented(
     import json
 
     import extract as mod
+    import summarize
     from extract import (format_summary, open_report, reset_error_log, reset_report,
                          summarize_overlaps)
 
@@ -1196,9 +1197,9 @@ def test_public_api_as_documented(
 
     # Summary from the library and its table.
     rows = summarize_overlaps()
-    assert rows and all(list(r) == list(mod.SUMMARY_FIELDS) for r in rows)
+    assert rows and all(list(r) == list(summarize.SUMMARY_FIELDS) for r in rows)
     assert rows[0]["pair"] == "account_number/phone_number"
-    assert format_summary(rows).splitlines()[0].split() == list(mod.SUMMARY_FIELDS)
+    assert format_summary(rows).splitlines()[0].split() == list(summarize.SUMMARY_FIELDS)
 
     # CLI, as in the README examples.
     config = str(CONFIG_PATH)
@@ -1276,7 +1277,7 @@ def test_positive_and_penalize_compare_reduced_words(tmp_path: Path) -> None:
 
 # ------------------------------------------------- summary: bounded examples, rounding
 def test_summary_keeps_at_most_three_examples_per_pair(monkeypatch: pytest.MonkeyPatch) -> None:
-    import extract as mod
+    import summarize as mod
 
     peak: list[int] = []
     real = mod._PairStats.add_example
@@ -1357,3 +1358,31 @@ def test_missing_or_blank_keyword_keys_load_as_empty(
     for inp in ("tel 12", ("tel", "12")):
         (m,) = matches_of(inp, cfg)
         assert (m.text, m.score) == ("12", 0)
+
+
+# ------------------------------------------------- summarize.py module
+def test_summary_lives_in_summarize_and_extract_reexports_it() -> None:
+    import extract
+    import summarize
+
+    assert extract.summarize_overlaps is summarize.summarize_overlaps
+    assert extract.format_summary is summarize.format_summary
+    assert extract.REPORT_PATH == summarize.DEFAULT_REPORT_PATH == "extract_report.csv"
+    assert not hasattr(summarize, "extract")              # leaf module: no import of extract
+    assert summarize.summarize_overlaps.__module__ == "summarize"
+
+
+def test_summarize_reads_only_report_columns() -> None:
+    import summarize
+
+    assert set(summarize.COLUMNS_USED) <= set(REPORT_FIELDS)
+    # A report with only those columns summarizes the same as a full one.
+    rows = [_row("a", "b", "priority", file="d"), _row("a", "b", "score")]
+    _report(rows)
+    full = summarize_overlaps()
+    with open("slim.csv", "w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=summarize.COLUMNS_USED, lineterminator="\n",
+                                extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    assert summarize_overlaps("slim.csv") == full
