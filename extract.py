@@ -39,6 +39,7 @@ from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence, Union
 
@@ -175,7 +176,8 @@ def _check_keyword(label: str, key_name: str, key: str, seen: Iterable[str]) -> 
 
     Words are ASCII letters only (see words.py), so a keyword with a digit or
     an accented letter would be silently reduced and match the wrong words.
-    A keyword may not appear twice under the same key of a pattern.
+    A keyword may not appear twice under the same key of a pattern, also
+    not spelled differently ("amount-due" and "amount due" are the same words).
     """
     where = f"pattern '{label}': {key_name} keyword '{key}'"
     if not _keyword_words(key) or any(c.isalnum() and not ("a" <= c <= "z") for c in key):
@@ -183,8 +185,16 @@ def _check_keyword(label: str, key_name: str, key: str, seen: Iterable[str]) -> 
             f"{where} must contain only ASCII letters (digits and accented "
             "letters can never match a word)"
         )
-    if key in seen:
-        raise ValueError(f"{where} is listed more than once in this pattern")
+    other = _same_words(key, seen)
+    if other is not None:
+        same = "" if other == key else f" (same words as '{other}')"
+        raise ValueError(f"{where} is listed more than once in this pattern{same}")
+
+
+def _same_words(key: str, seen: Iterable[str]) -> str | None:
+    """The first keyword in `seen` that reduces to the same words as `key`."""
+    words = _keyword_words(key)
+    return next((k for k in seen if _keyword_words(k) == words), None)
 
 
 def _require_str(label: str, key_name: str, keyword: Any) -> None:
@@ -257,10 +267,12 @@ def _load_keywords(
         positive.append(key)
     penalize = _weight_map(label, "context.penalize", context.get("penalize"), True)
     for key in penalize:
-        if key in positive:
+        other = _same_words(key, positive)
+        if other is not None:
+            same = "" if other == key else f" (same words as '{other}')"
             raise ValueError(
                 f"pattern '{label}': keyword '{key}' is in both context.positive "
-                "and context.penalize"
+                f"and context.penalize{same}"
             )
     nearby = _weight_map(label, "nearby", entry.get("nearby"), False)
     return positive, penalize, nearby
@@ -521,8 +533,25 @@ class _PairStats:
     penalty_skipped: int = 0
     unsettled: int = 0                                  # not decided by score
     partial: int = 0                                    # ...of which spans differ
-    no_evidence_examples: list[str] = field(default_factory=list)
-    other_examples: list[str] = field(default_factory=list)
+    examples: list[str] = field(default_factory=list)   # at most _MAX_EXAMPLES
+    no_evidence_examples: int = 0                       # leading entries of `examples`
+
+    def add_example(self, example: str, no_evidence: bool) -> None:
+        """Keep the first no_evidence examples, then the first others, in
+        report order, never holding more than _MAX_EXAMPLES."""
+        if no_evidence:
+            if self.no_evidence_examples < _MAX_EXAMPLES:
+                self.examples.insert(self.no_evidence_examples, example)
+                self.no_evidence_examples += 1
+                del self.examples[_MAX_EXAMPLES:]
+        elif len(self.examples) < _MAX_EXAMPLES:
+            self.examples.append(example)
+
+
+def _pct(part: int, whole: int) -> float:
+    """part/whole as a percentage, one decimal, halves rounded up (6.25 -> 6.3)."""
+    value = Decimal(100 * part) / Decimal(whole)
+    return float(value.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
 
 
 def _example(row: dict[str, str]) -> str:
@@ -563,9 +592,7 @@ def summarize_overlaps(path: str = REPORT_PATH) -> list[dict[str, Any]]:
             spans_a = (row.get("a_start"), row.get("a_end"))
             if spans_a != (row.get("b_start"), row.get("b_end")):
                 st.partial += 1
-            bucket = st.no_evidence_examples if by in _NO_EVIDENCE else st.other_examples
-            if len(bucket) < _MAX_EXAMPLES:
-                bucket.append(_example(row))
+            st.add_example(_example(row), by in _NO_EVIDENCE)
 
     out: list[dict[str, Any]] = []
     for pair, st in stats.items():
@@ -579,18 +606,17 @@ def summarize_overlaps(path: str = REPORT_PATH) -> list[dict[str, Any]]:
             hints.append(HINT_NO_EVIDENCE)
             if st.partial * 2 > st.unsettled:
                 hints.append(HINT_PARTIAL)
-        examples = (st.no_evidence_examples + st.other_examples)[:_MAX_EXAMPLES]
         wins = sorted(st.wins.items(), key=lambda kv: (-kv[1], kv[0]))
         out.append({
             "pair": pair,
             "overlaps": overlaps,
             **{f"by_{c}": st.by[c] for c in SUMMARY_CRITERIA},
             "not_by_score": not_by_score,
-            "not_by_score_pct": round(100 * not_by_score / overlaps, 1),
+            "not_by_score_pct": _pct(not_by_score, overlaps),
             "no_evidence": no_evidence,
             "penalty_skipped": st.penalty_skipped,
             "wins": "; ".join(f"{label} {n}" for label, n in wins),
-            "examples": " | ".join(examples),
+            "examples": " | ".join(st.examples),
             "hint": "; ".join(hints) or "ok",
         })
     out.sort(key=lambda r: (-r["no_evidence"], -r["not_by_score"], -r["overlaps"], r["pair"]))
@@ -959,7 +985,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error(f"--summarize cannot be combined with {', '.join(clashes)}")
         try:
             rows = summarize_overlaps(args.summarize)
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, csv.Error) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         print(format_summary(rows))

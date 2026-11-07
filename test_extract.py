@@ -1242,3 +1242,74 @@ def test_bare_yaml_on_in_a_file_is_rejected(tmp_path: Path) -> None:
     path.write_text(raw, encoding="utf-8")
     with pytest.raises(ValueError, match="pattern 'date': nearby keyword True must be a string"):
         load_config(path)
+
+
+# ------------------------------------------------- same words, different spelling
+@pytest.mark.parametrize(
+    "keys, where, key, other",
+    [
+        ({"nearby": {"amount due": 2, "amount-due": 2}}, "nearby", "amount-due", "amount due"),
+        ({"context": {"positive": ["don't", "dont"]}}, "context.positive", "dont", "don't"),
+        ({"context": {"penalize": {"e mail": -1, "e-mail": -1}}}, "context.penalize",
+         "e-mail", "e mail"),
+    ],
+)
+def test_duplicate_after_word_reduction_is_rejected(
+    tmp_path: Path, keys: dict[str, Any], where: str, key: str, other: str
+) -> None:
+    with pytest.raises(ValueError) as exc:
+        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+    assert str(exc.value) == (
+        f"pattern 'p': {where} keyword '{key}' is listed more than once in this "
+        f"pattern (same words as '{other}')"
+    )
+
+
+def test_positive_and_penalize_compare_reduced_words(tmp_path: Path) -> None:
+    keys = {"context": {"positive": ["don't"], "penalize": {"dont": -1}}}
+    with pytest.raises(ValueError) as exc:
+        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+    assert str(exc.value) == (
+        "pattern 'p': keyword 'dont' is in both context.positive "
+        "and context.penalize (same words as 'don't')"
+    )
+
+
+# ------------------------------------------------- summary: bounded examples, rounding
+def test_summary_keeps_at_most_three_examples_per_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    import extract as mod
+
+    peak: list[int] = []
+    real = mod._PairStats.add_example
+
+    def spy(self: Any, example: str, no_evidence: bool) -> None:
+        real(self, example, no_evidence)
+        peak.append(len(self.examples))
+
+    monkeypatch.setattr(mod._PairStats, "add_example", spy)
+    _report([_row("a", "b", "length", file=f"l{i}") for i in range(5)]
+            + [_row("a", "b", "priority", file=f"p{i}") for i in range(5)])
+    assert _by_pair()["a/b"]["examples"] == 'p0: "x" vs "y" | p1: "x" vs "y" | p2: "x" vs "y"'
+    assert max(peak) == 3
+
+
+def test_summary_examples_mixed_order_stays_correct() -> None:
+    _report([_row("a", "b", "length", file="l0"), _row("a", "b", "length", file="l1"),
+             _row("a", "b", "priority", file="p0"), _row("a", "b", "length", file="l2"),
+             _row("a", "b", "start_label", file="s0")])
+    assert _by_pair()["a/b"]["examples"] == 'p0: "x" vs "y" | s0: "x" vs "y" | l0: "x" vs "y"'
+
+
+@pytest.mark.parametrize("n, total, pct", [(1, 16, 6.3), (1, 8, 12.5), (2, 3, 66.7), (1, 3, 33.3)])
+def test_summary_pct_rounds_half_up(n: int, total: int, pct: float) -> None:
+    _report([_row("a", "b", "length")] * n + [_row("a", "b", "score")] * (total - n))
+    assert _by_pair()["a/b"]["not_by_score_pct"] == pct
+
+
+def test_cli_summarize_malformed_csv_is_a_clean_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _report([_row("a", "b", "length", a_text="x" * (csv.field_size_limit() + 1))])
+    assert main(["--summarize"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.startswith("error:") and captured.out == ""
