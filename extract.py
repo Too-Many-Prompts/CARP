@@ -11,9 +11,10 @@ extract() writes no files; the caller decides what to do with `decisions`
 open_report(), log_context_miss(), reset_report(), reset_error_log(),
 summarize_overlaps() / format_summary() (overlap summary, defined in summarize.py).
 
-Pattern keywords: `context.positive` selects patterns from the context
-string, `context.penalize` feeds the context_penalty tie-break, `nearby`
-scores the text window. Each reads only its own input.
+Pattern keywords: usually one `keywords` map (word -> signed weight), which
+load_config expands by sign. Underneath, `context.positive` selects patterns
+from the context string, `context.penalize` feeds the context_penalty
+tie-break, `nearby` scores the text window; each reads only its own input.
 
 CLI (one text per run; for many texts use the library):
     extract.py --config extraction_config.yaml [--text TEXT | < stdin]
@@ -190,8 +191,13 @@ def _check_keyword(label: str, key_name: str, key: str, seen: Iterable[str]) -> 
         )
     other = _same_words(key, seen)
     if other is not None:
-        same = "" if other == key else f" (same words as '{other}')"
+        same = _same_suffix(key, other)
         raise ValueError(f"{where} is listed more than once in this pattern{same}")
+
+
+def _same_suffix(key: str, other: str) -> str:
+    """Error-message suffix naming the other spelling, if it differs."""
+    return "" if other == key else f" (same words as '{other}')"
 
 
 def _same_words(key: str, seen: Iterable[str]) -> str | None:
@@ -215,7 +221,7 @@ def _require_str(label: str, key_name: str, keyword: Any) -> None:
 
 
 def _weight_map(label: str, key_name: str, raw: Any, non_positive: bool) -> dict[str, float]:
-    """Validate a `word: weight` map (`nearby` or `context.penalize`)."""
+    """Validate a `word: weight` map (`keywords`, `nearby` or `context.penalize`)."""
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -276,7 +282,7 @@ def _load_keywords(
     for key in penalize:
         other = _same_words(key, positive)
         if other is not None:
-            same = "" if other == key else f" (same words as '{other}')"
+            same = _same_suffix(key, other)
             raise ValueError(
                 f"pattern '{label}': keyword '{key}' is in both context.positive "
                 f"and context.penalize{same}"
@@ -298,9 +304,9 @@ def _load_keywords(
                             ("context.penalize", penalize), ("nearby", nearby)):
             other = _same_words(key, seen)
             if other is not None:
-                same = "" if other == key else f" (same words as '{other}')"
+                same = _same_suffix(key, other)
                 raise ValueError(
-                    f"pattern '{label}': word '{key}' is in both keywords and {where}{same}"
+                    f"pattern '{label}': keyword '{key}' is in both keywords and {where}{same}"
                 )
     for key, weight in shorthand.items():
         nearby[key] = weight

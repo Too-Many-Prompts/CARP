@@ -1369,7 +1369,14 @@ def test_summary_lives_in_summarize_and_extract_reexports_it() -> None:
     assert extract.summarize_overlaps is summarize.summarize_overlaps
     assert extract.format_summary is summarize.format_summary
     assert extract.REPORT_PATH == summarize.DEFAULT_REPORT_PATH == "extract_report.csv"
-    assert not hasattr(summarize, "extract")              # leaf module: no import of extract
+    import ast
+
+    tree = ast.parse(Path(summarize.__file__).read_text(encoding="utf-8"))
+    imported = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import)
+                for a in n.names}
+    imported |= {(n.module or "").split(".")[0] for n in ast.walk(tree)
+                 if isinstance(n, ast.ImportFrom)}
+    assert not imported & {"extract", "words"}            # leaf module: stdlib only
     assert summarize.summarize_overlaps.__module__ == "summarize"
 
 
@@ -1444,6 +1451,10 @@ def test_keywords_merge_with_explicit_keys(tmp_path: Path) -> None:
         ({"keywords": {"tel": 1}, "nearby": {"Tel": 2}}, "nearby", "tel", ""),
         ({"keywords": {"e-mail": 1}, "nearby": {"e mail": 2}}, "nearby", "e-mail",
          " (same words as 'e mail')"),
+        ({"keywords": {"e-mail": 1}, "context": {"positive": ["e mail"]}}, "context.positive",
+         "e-mail", " (same words as 'e mail')"),
+        ({"keywords": {"e-mail": -1}, "context": {"penalize": {"e mail": -2}}},
+         "context.penalize", "e-mail", " (same words as 'e mail')"),
         ({"keywords": {"bad": -1}, "context": {"positive": ["bad"]}}, "context.positive", "bad", ""),
     ],
 )
@@ -1452,7 +1463,7 @@ def test_word_in_keywords_and_explicit_key_is_rejected(
 ) -> None:
     with pytest.raises(ValueError) as exc:
         make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
-    assert str(exc.value) == f"pattern 'p': word '{word}' is in both keywords and {where}{same}"
+    assert str(exc.value) == f"pattern 'p': keyword '{word}' is in both keywords and {where}{same}"
 
 
 @pytest.mark.parametrize(
@@ -1508,7 +1519,9 @@ def test_example_config_patterns_unchanged_by_keywords_rewrite() -> None:
     loaded = {p.label: (p.positive, p.penalize, p.nearby) for p in REAL_CFG.patterns}
     assert loaded == REAL_CFG_PATTERNS
     for p in REAL_CFG.patterns:                      # same order, too
-        assert list(p.nearby) == list(REAL_CFG_PATTERNS[p.label][2])
+        positive, penalize, nearby = REAL_CFG_PATTERNS[p.label]
+        assert list(p.penalize) == list(penalize)
+        assert list(p.nearby) == list(nearby)
 
 
 def test_example_config_uses_keywords_shorthand() -> None:
