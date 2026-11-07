@@ -8,11 +8,17 @@ Library use:
 
 extract() writes no files; the caller decides what to do with `decisions`
 (flat dicts, columns REPORT_FIELDS). Optional helpers: write_report_csv(),
-open_report(), log_context_miss(), reset_report(), reset_error_log().
+open_report(), log_context_miss(), reset_report(), reset_error_log(),
+summarize_overlaps() / format_summary() (per label pair overlap summary).
+
+Pattern keywords: `context.positive` selects patterns from the context
+string, `context.penalize` feeds the context_penalty tie-break, `nearby`
+scores the text window. Each reads only its own input.
 
 CLI (one text per run; for many texts use the library):
     extract.py --config extraction_config.yaml [--text TEXT | < stdin]
                [--context TEXT] [--report] [--error-log]
+    extract.py --summarize [PATH]
 Prints the matches as a JSON list. Nothing is written unless asked:
     --report     ./extract_report.csv  one row per decision (context, min_score, overlaps)
     --error-log  ./errorlog.csv        raw context and text of a context miss
@@ -28,9 +34,12 @@ import csv
 import json
 import re
 import sys
+import warnings
+from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence, Union
 
@@ -38,7 +47,7 @@ import yaml
 
 from words import next_words, prev_words
 
-TIEBREAK_NAMES = ("score", "context_negative", "length", "priority")
+TIEBREAK_NAMES = ("score", "context_penalty", "length", "priority")
 CONTEXT_DIRECTIONS = ("before", "after", "both")
 
 # Written (relative to the working directory) whenever a context selected
@@ -53,7 +62,11 @@ REPORT_FIELDS = (
     ("file", "kind", "outcome", "reason", "patterns")
     + tuple(f"a_{k}" for k in _CAND_COLS)
     + tuple(f"b_{k}" for k in _CAND_COLS)
+    + ("decided_by", "penalty_skipped")
 )
+# decided_by: overlap -> score | context_penalty | length | priority | start_label;
+# coexist -> coexist; below_min_score -> min_score; context / context_miss -> "".
+PENALTY_SKIPPED_NOTE = "; context_penalty skipped: context selected no patterns"
 REQUIRED_SETTINGS = (
     "context_window_words",
     "distance_decay",
@@ -74,7 +87,9 @@ class Pattern:
     label: str
     priority: int
     regex: "re.Pattern[str]"
-    weights: dict[str, float]  # lowercase keyword/phrase -> signed weight
+    positive: list[str] = field(default_factory=list)          # context.positive: selects
+    penalize: dict[str, float] = field(default_factory=dict)   # context.penalize: weight <= 0
+    nearby: dict[str, float] = field(default_factory=dict)     # text window: signed weight
 
 
 @dataclass
@@ -106,7 +121,8 @@ class Candidate:
 
 
 # One entry of the troubleshooting log: a flat dict with the REPORT_FIELDS
-# columns (file, kind, outcome, reason, patterns, a_*, b_*). It is the single
+# columns (file, kind, outcome, reason, patterns, a_*, b_*, decided_by,
+# penalty_skipped). It is the single
 # form used for extract_report.csv, errorlog.csv and the CLI JSON output.
 #
 # kind: "context" | "context_miss" | "below_min_score" | "overlap" | "coexist"
@@ -125,10 +141,13 @@ def _decision(
     a: Candidate | None = None,
     b: Candidate | None = None,
     patterns: Sequence[str] = (),
+    decided_by: str = "",
+    penalty_skipped: bool = False,
 ) -> Decision:
     """Build one log row. a/b are the candidates involved:
     overlap: a = winner, b = dropped. below_min_score: a = dropped.
     coexist: a and b are both kept. The `file` column is filled in later.
+    `decided_by` names the rule that decided (see REPORT_FIELDS).
     """
     return {
         "file": "",
@@ -138,6 +157,8 @@ def _decision(
         "patterns": ";".join(patterns),
         **_cand_columns("a", a),
         **_cand_columns("b", b),
+        "decided_by": decided_by,
+        "penalty_skipped": penalty_skipped,
     }
 
 
@@ -150,29 +171,111 @@ def _require(mapping: Any, key: str, where: str) -> Any:
     return mapping[key]
 
 
-def _check_keyword(
-    label: str, group: str, key: str, weight: float, seen: dict[str, float]
-) -> None:
-    """Fail loudly on keywords the scorer could never match or could mis-score.
+def _check_keyword(label: str, key_name: str, key: str, seen: Iterable[str]) -> None:
+    """Fail loudly on keywords the scorer could never match.
 
-    Context words are ASCII letters only (see words.py), so a keyword with a
-    digit or an accented letter would be silently reduced and match the wrong
-    words. A keyword may not appear twice in a pattern, and the weight's sign
-    must agree with its group (positive > 0, negative < 0).
+    Words are ASCII letters only (see words.py), so a keyword with a digit or
+    an accented letter would be silently reduced and match the wrong words.
+    A keyword may not appear twice under the same key of a pattern, also
+    not spelled differently ("amount-due" and "amount due" are the same words).
     """
-    where = f"pattern '{label}': context.{group} keyword '{key}'"
+    where = f"pattern '{label}': {key_name} keyword '{key}'"
     if not _keyword_words(key) or any(c.isalnum() and not ("a" <= c <= "z") for c in key):
         raise ValueError(
             f"{where} must contain only ASCII letters (digits and accented "
-            "letters can never match a context word)"
+            "letters can never match a word)"
         )
-    if key in seen:
-        raise ValueError(f"{where} is listed more than once in this pattern")
-    if (group == "positive" and weight < 0) or (group == "negative" and weight > 0):
+    other = _same_words(key, seen)
+    if other is not None:
+        same = "" if other == key else f" (same words as '{other}')"
+        raise ValueError(f"{where} is listed more than once in this pattern{same}")
+
+
+def _same_words(key: str, seen: Iterable[str]) -> str | None:
+    """The first keyword in `seen` that reduces to the same words as `key`."""
+    words = _keyword_words(key)
+    return next((k for k in seen if _keyword_words(k) == words), None)
+
+
+def _require_str(label: str, key_name: str, keyword: Any) -> None:
+    """YAML reads some bare words as non-strings (on/yes/true -> True,
+    off/no/false -> False, null/~ -> None); reject them instead of silently
+    turning them into the keywords "true", "false" or "none"."""
+    if not isinstance(keyword, str):
         raise ValueError(
-            f"{where} has weight {weight:g}; positive weights must be >= 0 "
-            "and negative weights <= 0"
+            f"pattern '{label}': {key_name} keyword {keyword!r} must be a string "
+            '(quote it in the YAML, e.g. "on")'
         )
+
+
+def _weight_map(label: str, key_name: str, raw: Any, non_positive: bool) -> dict[str, float]:
+    """Validate a `word: weight` map (`nearby` or `context.penalize`)."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"pattern '{label}': {key_name} must be a map of word: weight, "
+            f"got {type(raw).__name__}"
+        )
+    out: dict[str, float] = {}
+    for keyword, weight in raw.items():
+        _require_str(label, key_name, keyword)
+        key = keyword.lower()
+        _check_keyword(label, key_name, key, out)
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+            raise ValueError(
+                f"pattern '{label}': {key_name} keyword '{key}' needs a numeric "
+                f"weight, got {weight!r}"
+            )
+        if non_positive and weight > 0:
+            raise ValueError(
+                f"pattern '{label}': {key_name} keyword '{key}' has weight "
+                f"{float(weight):g}; penalize weights must be <= 0"
+            )
+        out[key] = float(weight)
+    return out
+
+
+def _load_keywords(
+    label: str, entry: dict[str, Any]
+) -> tuple[list[str], dict[str, float], dict[str, float]]:
+    """Return (context.positive, context.penalize, nearby) for one pattern."""
+    context = entry.get("context") or {}
+    if not isinstance(context, dict):
+        raise ValueError(f"pattern '{label}': `context` must be a map (positive, penalize)")
+    if "negative" in context:
+        raise ValueError(
+            f"pattern '{label}': `context.negative` was renamed to "
+            "`context.penalize`; it no longer affects the text score (use `nearby`)."
+        )
+    raw_pos = context.get("positive")
+    if isinstance(raw_pos, dict):
+        raise ValueError(
+            f"pattern '{label}': `context.positive` is now a list of words; "
+            "move weights for text scoring to `nearby`."
+        )
+    if raw_pos is not None and not isinstance(raw_pos, list):
+        raise ValueError(
+            f"pattern '{label}': `context.positive` must be a list of words, "
+            f"got {type(raw_pos).__name__}"
+        )
+    positive: list[str] = []
+    for keyword in raw_pos or []:
+        _require_str(label, "context.positive", keyword)
+        key = keyword.lower()
+        _check_keyword(label, "context.positive", key, positive)
+        positive.append(key)
+    penalize = _weight_map(label, "context.penalize", context.get("penalize"), True)
+    for key in penalize:
+        other = _same_words(key, positive)
+        if other is not None:
+            same = "" if other == key else f" (same words as '{other}')"
+            raise ValueError(
+                f"pattern '{label}': keyword '{key}' is in both context.positive "
+                f"and context.penalize{same}"
+            )
+    nearby = _weight_map(label, "nearby", entry.get("nearby"), False)
+    return positive, penalize, nearby
 
 
 def load_config(path: str | Path) -> Config:
@@ -186,6 +289,8 @@ def load_config(path: str | Path) -> Config:
     # A blank `overlap_tiebreak:` (None) means "no criteria", same as [].
     settings["overlap_tiebreak"] = settings["overlap_tiebreak"] or []
     for name in settings["overlap_tiebreak"]:
+        if name == "context_negative":
+            raise ValueError("`context_negative` was renamed to `context_penalty`.")
         if name not in TIEBREAK_NAMES:
             raise ValueError(
                 f"settings.overlap_tiebreak: unknown criterion '{name}' "
@@ -221,20 +326,25 @@ def load_config(path: str | Path) -> Config:
         except re.error as exc:
             raise ValueError(f"pattern '{label}': invalid regex: {exc}") from exc
 
-        weights: dict[str, float] = {}
-        context = entry.get("context") or {}
-        for group in ("positive", "negative"):
-            for keyword, weight in (context.get(group) or {}).items():
-                key = str(keyword).lower()
-                _check_keyword(label, group, key, float(weight), weights)
-                weights[key] = float(weight)
+        positive, penalize, nearby = _load_keywords(label, entry)
         patterns.append(
             Pattern(
                 label=label,
                 priority=int(_require(entry, "priority", f"pattern '{label}'")),
                 regex=compiled,
-                weights=weights,
+                positive=positive,
+                penalize=penalize,
+                nearby=nearby,
             )
+        )
+
+    unused = [p.label for p in patterns if p.penalize]
+    if unused and "context_penalty" not in settings["overlap_tiebreak"]:
+        warnings.warn(
+            f"context.penalize is set for {', '.join(unused)} but `context_penalty` "
+            "is not in settings.overlap_tiebreak, so it is never used.",
+            UserWarning,
+            stacklevel=2,
         )
 
     coexist = {frozenset(pair) for pair in (raw.get("coexist") or [])}
@@ -271,9 +381,10 @@ def select_patterns(
 ) -> tuple[list[Pattern], Decision]:
     """Return the patterns to run on the input text.
 
-    A pattern "matches" the context when any of its positive keywords/phrases
-    (weight > 0 under `context.positive` in the YAML) occurs in it as whole
-    words, case-insensitively. The pattern regexes are NOT run on the context.
+    A pattern "matches" the context when any of its `context.positive`
+    words/phrases occurs in it as whole words, case-insensitively (same
+    matcher as `nearby` scoring). The pattern regexes are NOT run on the
+    context, and `nearby` / `context.penalize` never select.
     If at least one pattern matches, only those run on the text. With no
     context, or no matches, all run.
     """
@@ -303,20 +414,15 @@ def select_patterns(
 
 
 def _context_words(context: str) -> list[str]:
-    """Lowercase letter-only words of the context (same reduction as keywords)."""
-    return _keyword_words(context)
+    """All words of the context, reduced exactly like the text window's words
+    (words.next_words). The leading space keeps the first word: next_words
+    skips a word that the start position falls inside."""
+    return next_words(" " + context, 0, len(context) + 1)
 
 
 def _context_hits(words: list[str], pattern: Pattern) -> list[str]:
-    """Positive keywords of `pattern` that occur in `words` as a contiguous phrase."""
-    hits: list[str] = []
-    for keyword, weight in pattern.weights.items():
-        kw = _keyword_words(keyword)
-        size = len(kw)
-        if weight <= 0 or size == 0:
-            continue
-        if any(words[i:i + size] == kw for i in range(len(words) - size + 1)):
-            hits.append(keyword)
+    """`context.positive` keywords of `pattern` that occur in the context words."""
+    _, hits = _sum_keywords(dict.fromkeys(pattern.positive, 1.0), _phrase_finder(words), False)
     return hits
 
 
@@ -403,6 +509,130 @@ def write_report_csv(decisions: Iterable[Decision], path: str = REPORT_PATH) -> 
 
 
 # --------------------------------------------------------------------------
+# Overlap summary: which label pairs are not settled by score
+# --------------------------------------------------------------------------
+SUMMARY_CRITERIA = ("score", "context_penalty", "length", "priority", "start_label")
+SUMMARY_FIELDS = (
+    ("pair", "overlaps")
+    + tuple(f"by_{c}" for c in SUMMARY_CRITERIA)
+    + ("not_by_score", "not_by_score_pct", "no_evidence", "penalty_skipped",
+       "wins", "examples", "hint")
+)
+_NO_EVIDENCE = ("priority", "start_label")   # fallback order, nothing in the input
+_MAX_EXAMPLES = 3
+HINT_SKIPPED = ("contexts mention penalize words but don't select these patterns; "
+                "add context.positive words")
+HINT_NO_EVIDENCE = "add nearby words; if inputs come with a context, add penalize words"
+HINT_PARTIAL = "if both values are valid, add to coexist"
+
+
+@dataclass
+class _PairStats:
+    by: Counter = field(default_factory=Counter)        # decided_by -> count
+    wins: Counter = field(default_factory=Counter)      # winning label -> count
+    penalty_skipped: int = 0
+    unsettled: int = 0                                  # not decided by score
+    partial: int = 0                                    # ...of which spans differ
+    examples: list[str] = field(default_factory=list)   # at most _MAX_EXAMPLES
+    no_evidence_examples: int = 0                       # leading entries of `examples`
+
+    def add_example(self, example: str, no_evidence: bool) -> None:
+        """Keep the first no_evidence examples, then the first others, in
+        report order, never holding more than _MAX_EXAMPLES."""
+        if no_evidence:
+            if self.no_evidence_examples < _MAX_EXAMPLES:
+                self.examples.insert(self.no_evidence_examples, example)
+                self.no_evidence_examples += 1
+                del self.examples[_MAX_EXAMPLES:]
+        elif len(self.examples) < _MAX_EXAMPLES:
+            self.examples.append(example)
+
+
+def _pct(part: int, whole: int) -> float:
+    """part/whole as a percentage, one decimal, halves rounded up (6.25 -> 6.3)."""
+    value = Decimal(100 * part) / Decimal(whole)
+    return float(value.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+
+
+def _example(row: dict[str, str]) -> str:
+    return f'{row.get("file") or "(no id)"}: "{row.get("a_text", "")}" vs "{row.get("b_text", "")}"'
+
+
+def summarize_overlaps(path: str = REPORT_PATH) -> list[dict[str, Any]]:
+    """Summarize a report CSV's `overlap` rows by label pair.
+
+    Shows which pairs overlap most often without being resolved by score:
+    counts per deciding criterion, `no_evidence` (decided by priority or
+    start/label, i.e. nothing in the input), up to three example inputs and
+    a hint. Rows are streamed; memory stays bounded per pair. Sorted by
+    no_evidence, not_by_score, overlaps (highest first), then pair.
+    Raises ValueError if the report has no `decided_by` column.
+    """
+    stats: dict[str, _PairStats] = {}
+    with open(path, encoding="utf-8", errors="replace", newline="") as fh:
+        reader = csv.DictReader(fh)
+        if "decided_by" not in (reader.fieldnames or []):
+            raise ValueError(
+                f"{path}: no decided_by column; the report is from an older "
+                "version, regenerate it with --report"
+            )
+        for row in reader:
+            if row.get("kind") != "overlap":
+                continue
+            a, b = row.get("a_label", ""), row.get("b_label", "")
+            st = stats.setdefault("/".join(sorted((a, b))), _PairStats())
+            by = row.get("decided_by", "")
+            st.by[by] += 1
+            st.wins[a] += 1
+            if str(row.get("penalty_skipped", "")).strip().lower() == "true":
+                st.penalty_skipped += 1
+            if by == "score":
+                continue
+            st.unsettled += 1
+            spans_a = (row.get("a_start"), row.get("a_end"))
+            if spans_a != (row.get("b_start"), row.get("b_end")):
+                st.partial += 1
+            st.add_example(_example(row), by in _NO_EVIDENCE)
+
+    out: list[dict[str, Any]] = []
+    for pair, st in stats.items():
+        overlaps = sum(st.by.values())
+        not_by_score = overlaps - st.by["score"]
+        no_evidence = sum(st.by[c] for c in _NO_EVIDENCE)
+        hints = []
+        if st.penalty_skipped > 0:
+            hints.append(HINT_SKIPPED)
+        if no_evidence > 0:
+            hints.append(HINT_NO_EVIDENCE)
+            if st.partial * 2 > st.unsettled:
+                hints.append(HINT_PARTIAL)
+        wins = sorted(st.wins.items(), key=lambda kv: (-kv[1], kv[0]))
+        out.append({
+            "pair": pair,
+            "overlaps": overlaps,
+            **{f"by_{c}": st.by[c] for c in SUMMARY_CRITERIA},
+            "not_by_score": not_by_score,
+            "not_by_score_pct": _pct(not_by_score, overlaps),
+            "no_evidence": no_evidence,
+            "penalty_skipped": st.penalty_skipped,
+            "wins": "; ".join(f"{label} {n}" for label, n in wins),
+            "examples": " | ".join(st.examples),
+            "hint": "; ".join(hints) or "ok",
+        })
+    out.sort(key=lambda r: (-r["no_evidence"], -r["not_by_score"], -r["overlaps"], r["pair"]))
+    return out
+
+
+def format_summary(rows: list[dict[str, Any]]) -> str:
+    """The summary as an aligned plain-text table (header + one line per pair)."""
+    table = [list(SUMMARY_FIELDS)] + [[str(r[k]) for k in SUMMARY_FIELDS] for r in rows]
+    widths = [max(len(line[i]) for line in table) for i in range(len(SUMMARY_FIELDS))]
+    return "\n".join(
+        "  ".join(cell.ljust(w) for cell, w in zip(line, widths)).rstrip() for line in table
+    )
+
+
+# --------------------------------------------------------------------------
 # 3. find_candidates
 # --------------------------------------------------------------------------
 def find_candidates(text: str, patterns: list[Pattern]) -> list[Candidate]:
@@ -429,21 +659,48 @@ def _keyword_words(keyword: str) -> list[str]:
     return re.findall(r"[a-z]+", keyword.lower().replace("'", "").replace("’", ""))
 
 
-def _context_penalty(words: list[str], pattern: Pattern) -> float:
-    """Sum of the pattern's negative weights whose phrase occurs in `words`.
+DistanceFinder = Callable[[list[str]], Union[int, None]]
 
-    Always <= 0 (0 means no negative hit). Used by the `context_negative`
-    tie-break; `words` come from `_context_words`.
+
+def _sum_keywords(
+    weights: dict[str, float], find: DistanceFinder, decay: bool
+) -> tuple[float, list[str]]:
+    """The one keyword matcher behind `nearby`, `context_penalty` and selection.
+
+    Each keyword/phrase is reduced with _keyword_words and handed to `find`,
+    which returns the word distance of its nearest occurrence (or None).
+    Every keyword counts once. Returns (sum of weights found, keywords found);
+    with `decay`, each weight is divided by its distance.
     """
     total = 0.0
-    for keyword, weight in pattern.weights.items():
+    hits: list[str] = []
+    for keyword, weight in weights.items():
         kw = _keyword_words(keyword)
-        size = len(kw)
-        if weight >= 0 or size == 0:
+        if not kw:
             continue
-        if any(words[i:i + size] == kw for i in range(len(words) - size + 1)):
-            total += weight
-    return total
+        dist = find(kw)
+        if dist is None:
+            continue
+        hits.append(keyword)
+        total += weight / dist if decay else weight
+    return total, hits
+
+
+def _phrase_finder(words: list[str]) -> DistanceFinder:
+    """Finder for a position-less word list (the context): 1 if the phrase
+    occurs anywhere as contiguous whole words, else None."""
+    def find(kw: list[str]) -> int | None:
+        size = len(kw)
+        found = any(words[i:i + size] == kw for i in range(len(words) - size + 1))
+        return 1 if found else None
+    return find
+
+
+def _context_penalty(words: list[str], pattern: Pattern) -> tuple[float, list[str]]:
+    """(sum, hits) of the pattern's `context.penalize` words found in the
+    context words. The sum is <= 0; closer to 0 wins the `context_penalty`
+    tie-break. Same matcher as `nearby`, without window or distance."""
+    return _sum_keywords(pattern.penalize, _phrase_finder(words), False)
 
 
 def _nearest_distance(
@@ -470,8 +727,9 @@ def _nearest_distance(
 def score_candidate(
     text: str, cand: Candidate, pattern: Pattern, settings: dict[str, Any]
 ) -> float:
-    """Sum the weight of each keyword found near the match (nearest occurrence
-    only), divided by word distance when distance_decay is true.
+    """Sum the weight of each `nearby` keyword found near the match (nearest
+    occurrence only), divided by word distance when distance_decay is true.
+    The context string is never read here.
 
     settings["context_direction"] ("before", "after" or "both", default
     "both") chooses which side(s) of the match are searched.
@@ -492,16 +750,9 @@ def score_candidate(
         if direction in ("after", "both") else []
     )
     decay = bool(settings["distance_decay"])
-
-    total = 0.0
-    for keyword, weight in pattern.weights.items():
-        kw = _keyword_words(keyword)
-        if not kw:
-            continue
-        dist = _nearest_distance(before, after, kw)
-        if dist is None:
-            continue
-        total += weight / dist if decay else weight
+    total, _ = _sum_keywords(
+        pattern.nearby, lambda kw: _nearest_distance(before, after, kw), decay
+    )
     return total
 
 
@@ -521,7 +772,7 @@ def _rank_key(
     for name in order:
         if name == "score":
             parts.append(-c.score)
-        elif name == "context_negative":  # penalty <= 0; closer to 0 wins
+        elif name == "context_penalty":  # penalty <= 0; closer to 0 wins
             parts.append(-ctx_penalty.get(c.label, 0.0))
         elif name == "length":
             parts.append(-(c.end - c.start))
@@ -536,18 +787,20 @@ def _why_wins(
     loser: Candidate,
     order: Sequence[str],
     ctx_penalty: dict[str, float],
-) -> str:
-    """Explain which tiebreak criterion decided, naming the ones that tied."""
+) -> tuple[str, str]:
+    """Return (criterion, reason): the tiebreak criterion that decided and a
+    text naming the ones that tied. criterion is "start_label" when every
+    listed criterion tied (or the list is empty)."""
     tied: list[str] = []
     for name in order:
         if name == "score" and winner.score != loser.score:
             detail = f"score {winner.score:.2f} > {loser.score:.2f}"
         elif (
-            name == "context_negative"
+            name == "context_penalty"
             and ctx_penalty.get(winner.label, 0.0) != ctx_penalty.get(loser.label, 0.0)
         ):
             detail = (
-                f"context negatives {ctx_penalty.get(winner.label, 0.0):g} "
+                f"context penalty {ctx_penalty.get(winner.label, 0.0):g} "
                 f"> {ctx_penalty.get(loser.label, 0.0):g}"
             )
         elif (
@@ -564,25 +817,30 @@ def _why_wins(
         else:
             tied.append(name)
             continue
-        return "; ".join([f"{t} tied" for t in tied] + [detail])
-    return "all tiebreak criteria tied; kept earlier start/label"
+        return name, "; ".join([f"{t} tied" for t in tied] + [detail])
+    return "start_label", "all tiebreak criteria tied; kept earlier start/label"
 
 
 def resolve_overlaps(
     cands: list[Candidate],
     cfg: Config,
     ctx_penalty: dict[str, float] | None = None,
+    skipped_hits: set[str] | None = None,
 ) -> tuple[list[Candidate], list[Decision]]:
     """Drop candidates below min_score, then resolve overlaps greedily.
 
     Candidates are ranked by overlap_tiebreak (in config order); if it is
     empty or everything ties, the earlier start, then the label, decides.
-    `ctx_penalty` maps label -> summed negative context weight and feeds the
-    `context_negative` criterion (empty/None: that criterion always ties).
+    `ctx_penalty` maps label -> summed context.penalize weight and feeds the
+    `context_penalty` criterion (empty/None: that criterion always ties).
+    `skipped_hits` names labels whose penalize words occur in a context that
+    selected no patterns; it only adds the "skipped" note to overlap rows and
+    never affects ranking.
     Each candidate is accepted unless it overlaps an already-accepted one
     whose label pair is not in `coexist`. Every decision is logged.
     """
     ctx_penalty = ctx_penalty or {}
+    skipped_hits = skipped_hits or set()
     settings = cfg.settings
     order = settings["overlap_tiebreak"]
     min_score = settings["min_score"]
@@ -593,7 +851,8 @@ def resolve_overlaps(
         if c.score < min_score:
             decisions.append(
                 _decision("below_min_score", "dropped",
-                          f"score {c.score:.2f} < min_score {min_score}", a=c)
+                          f"score {c.score:.2f} < min_score {min_score}", a=c,
+                          decided_by="min_score")
             )
         else:
             survivors.append(c)
@@ -609,12 +868,16 @@ def resolve_overlaps(
                 pending.append(
                     _decision("coexist", "both_kept",
                               f"{a.label}/{c.label} pair is in coexist; both kept",
-                              a=a, b=c)
+                              a=a, b=c, decided_by="coexist")
                 )
             else:
+                criterion, reason = _why_wins(a, c, order, ctx_penalty)
+                skipped = bool({a.label, c.label} & skipped_hits)
+                if skipped:
+                    reason += PENALTY_SKIPPED_NOTE
                 decisions.append(
-                    _decision("overlap", "a_wins_b_dropped",
-                              _why_wins(a, c, order, ctx_penalty), a=a, b=c)
+                    _decision("overlap", "a_wins_b_dropped", reason, a=a, b=c,
+                              decided_by=criterion, penalty_skipped=skipped)
                 )
                 beaten = True
                 break
@@ -664,13 +927,19 @@ def extract(
     for c in cands:
         c.score = score_candidate(text, c, by_label[c.label], cfg.settings)
 
-    # context_negative only applies when the context actually chose the patterns.
+    # context_penalty only applies when the context actually chose the patterns.
     ctx_penalty: dict[str, float] = {}
-    if norm_context and ctx_decision["outcome"] == "patterns_restricted":
+    skipped_hits: set[str] = set()
+    has_context = bool(norm_context and norm_context.strip())
+    if has_context and ctx_decision["outcome"] == "patterns_restricted":
         ctx_words = _context_words(norm_context)
-        ctx_penalty = {p.label: _context_penalty(ctx_words, p) for p in patterns}
+        ctx_penalty = {p.label: _context_penalty(ctx_words, p)[0] for p in patterns}
+    elif has_context and "context_penalty" in cfg.settings["overlap_tiebreak"]:
+        # Gate off: note (only) which labels' penalize words were in the context.
+        ctx_words = _context_words(norm_context)
+        skipped_hits = {p.label for p in patterns if _context_penalty(ctx_words, p)[1]}
 
-    matches, decisions = resolve_overlaps(cands, cfg, ctx_penalty)
+    matches, decisions = resolve_overlaps(cands, cfg, ctx_penalty, skipped_hits)
     decisions = [ctx_decision] + decisions
 
     if ctx_decision["outcome"] == "patterns_restricted" and not matches:
@@ -692,21 +961,47 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Extract regex matches with context scoring from one text. "
                     "Prints the matches as JSON. For many texts, use the library.")
-    parser.add_argument("--config", required=True, help="path to extraction_config.yaml")
+    parser.add_argument("--config", default=None,
+                        help="path to extraction_config.yaml (required unless --summarize)")
     parser.add_argument("--text", default=None, help="the text to scan (default: read stdin)")
     parser.add_argument("--context", default=None,
-                        help="optional context text; patterns whose positive keywords appear in it are the only ones run")
+                        help="optional context text; patterns whose context.positive words appear in it are the only ones run")
     parser.add_argument("--report", action="store_true",
                         help=f"write the decision log to ./{REPORT_PATH} (overwritten)")
     parser.add_argument("--error-log", action="store_true",
                         help=f"write ./{ERROR_LOG_PATH} (overwritten): raw context and text of a context miss")
+    parser.add_argument("--summarize", nargs="?", const=REPORT_PATH, default=None,
+                        metavar="PATH",
+                        help=f"print a per-label-pair overlap summary of a report CSV "
+                             f"(default ./{REPORT_PATH}) and exit")
     args = parser.parse_args(argv)
 
+    if args.summarize is not None:
+        clashes = [flag for flag, used in (
+            ("--text", args.text is not None), ("--context", args.context is not None),
+            ("--report", args.report), ("--error-log", args.error_log),
+        ) if used]
+        if clashes:
+            parser.error(f"--summarize cannot be combined with {', '.join(clashes)}")
+        try:
+            rows = summarize_overlaps(args.summarize)
+        except (ValueError, OSError, csv.Error) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(format_summary(rows))
+        return 0
+    if args.config is None:
+        parser.error("the following arguments are required: --config (unless --summarize)")
+
     try:
-        cfg = load_config(args.config)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            cfg = load_config(args.config)
     except (ValueError, OSError, yaml.YAMLError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    for w in caught:
+        print(f"warning: {w.message}", file=sys.stderr)
 
     text = args.text
     if text is None:
