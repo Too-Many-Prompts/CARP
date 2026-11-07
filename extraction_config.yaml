@@ -125,6 +125,13 @@ tests:
       - {label: date, text: "03/14/2026"}
       - {label: date, text: "2026-03-14"}
 
+  - name: '"on" in the context selects date (YAML used to read bare on as true)'
+    context: "invoice on file"
+    text: "Invoice INV-004521 dated 03/14/2026"
+    expect:
+      - {label: invoice_number, text: "INV-004521"}
+      - {label: date, text: "03/14/2026"}
+
   - name: context hits phone_number keywords but text has no phone number
     context: "call me"
     text: "Invoice INV-004521"

@@ -207,8 +207,11 @@ and keyword when:
 - a word is in both `context.positive` and `context.penalize` of a pattern;
 - a `penalize` weight is above 0, or a weight is not a number.
 
-Quote YAML words that YAML would read as something else, e.g. `"on"`,
-`"yes"`, `"no"` (unquoted, they load as booleans).
+Quote YAML words that YAML would read as something else: unquoted, `on`,
+`yes`, `true` load as `True`, `off`, `no`, `false` as `False`, and `null` /
+`~` as `None`. `load_config` rejects such keywords ("must be a string (quote
+it in the YAML ...)") instead of silently turning them into "true", "false"
+or "none". Write `"on": 1`, not `on: 1`.
 
 ## Config
 

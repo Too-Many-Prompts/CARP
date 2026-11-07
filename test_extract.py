@@ -1212,3 +1212,33 @@ def test_public_api_as_documented(
     assert json.loads(capsys.readouterr().out)[0]["label"] == "phone_number"
     assert main(["--summarize"]) == 0
     assert capsys.readouterr().out.split()[:2] == ["pair", "overlaps"]
+
+
+# ------------------------------------------------- YAML booleans/null as keywords
+@pytest.mark.parametrize(
+    "keys, where, shown",
+    [
+        ({"nearby": {True: 1}}, "nearby", "True"),                     # bare `on:` / `yes:`
+        ({"context": {"penalize": {False: -1}}}, "context.penalize", "False"),  # bare `no:`
+        ({"nearby": {None: 1}}, "nearby", "None"),                      # bare `null:` / `~:`
+        ({"context": {"positive": [True]}}, "context.positive", "True"),
+    ],
+)
+def test_non_string_keyword_is_rejected(
+    tmp_path: Path, keys: dict[str, Any], where: str, shown: str
+) -> None:
+    with pytest.raises(ValueError) as exc:
+        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+    assert str(exc.value) == (
+        f"pattern 'p': {where} keyword {shown} must be a string "
+        '(quote it in the YAML, e.g. "on")'
+    )
+
+
+def test_bare_yaml_on_in_a_file_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "bare.yaml"
+    raw = CONFIG_PATH.read_text(encoding="utf-8").replace('"on": 1', "on: 1")
+    assert raw != CONFIG_PATH.read_text(encoding="utf-8")
+    path.write_text(raw, encoding="utf-8")
+    with pytest.raises(ValueError, match="pattern 'date': nearby keyword True must be a string"):
+        load_config(path)

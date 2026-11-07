@@ -187,6 +187,17 @@ def _check_keyword(label: str, key_name: str, key: str, seen: Iterable[str]) -> 
         raise ValueError(f"{where} is listed more than once in this pattern")
 
 
+def _require_str(label: str, key_name: str, keyword: Any) -> None:
+    """YAML reads some bare words as non-strings (on/yes/true -> True,
+    off/no/false -> False, null/~ -> None); reject them instead of silently
+    turning them into the keywords "true", "false" or "none"."""
+    if not isinstance(keyword, str):
+        raise ValueError(
+            f"pattern '{label}': {key_name} keyword {keyword!r} must be a string "
+            '(quote it in the YAML, e.g. "on")'
+        )
+
+
 def _weight_map(label: str, key_name: str, raw: Any, non_positive: bool) -> dict[str, float]:
     """Validate a `word: weight` map (`nearby` or `context.penalize`)."""
     if raw is None:
@@ -198,7 +209,8 @@ def _weight_map(label: str, key_name: str, raw: Any, non_positive: bool) -> dict
         )
     out: dict[str, float] = {}
     for keyword, weight in raw.items():
-        key = str(keyword).lower()
+        _require_str(label, key_name, keyword)
+        key = keyword.lower()
         _check_keyword(label, key_name, key, out)
         if isinstance(weight, bool) or not isinstance(weight, (int, float)):
             raise ValueError(
@@ -239,10 +251,7 @@ def _load_keywords(
         )
     positive: list[str] = []
     for keyword in raw_pos or []:
-        if not isinstance(keyword, str):
-            raise ValueError(
-                f"pattern '{label}': context.positive keyword {keyword!r} must be a string"
-            )
+        _require_str(label, "context.positive", keyword)
         key = keyword.lower()
         _check_keyword(label, "context.positive", key, positive)
         positive.append(key)
