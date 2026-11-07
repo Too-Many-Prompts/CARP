@@ -90,6 +90,9 @@ class Pattern:
     positive: list[str] = field(default_factory=list)          # context.positive: selects
     penalize: dict[str, float] = field(default_factory=dict)   # context.penalize: weight <= 0
     nearby: dict[str, float] = field(default_factory=dict)     # text window: signed weight
+    # True when context.penalize was written explicitly (not only expanded
+    # from `keywords`); only explicit words trigger the unused-penalize warning.
+    explicit_penalize: bool = False
 
 
 @dataclass
@@ -241,8 +244,9 @@ def _weight_map(label: str, key_name: str, raw: Any, non_positive: bool) -> dict
 
 def _load_keywords(
     label: str, entry: dict[str, Any]
-) -> tuple[list[str], dict[str, float], dict[str, float]]:
-    """Return (context.positive, context.penalize, nearby) for one pattern."""
+) -> tuple[list[str], dict[str, float], dict[str, float], bool]:
+    """Return (context.positive, context.penalize, nearby, explicit_penalize)
+    for one pattern: the explicit keys merged with the `keywords` shorthand."""
     context = entry.get("context") or {}
     if not isinstance(context, dict):
         raise ValueError(f"pattern '{label}': `context` must be a map (positive, penalize)")
@@ -278,7 +282,33 @@ def _load_keywords(
                 f"and context.penalize{same}"
             )
     nearby = _weight_map(label, "nearby", entry.get("nearby"), False)
-    return positive, penalize, nearby
+    explicit_penalize = bool(penalize)
+
+    # `keywords` shorthand: word -> signed weight. Positive words select and
+    # score (context.positive + nearby); negative words score and penalize
+    # (nearby + context.penalize). A word may not also be in an explicit key.
+    shorthand = _weight_map(label, "keywords", entry.get("keywords"), False)
+    for key, weight in shorthand.items():
+        if weight == 0:
+            raise ValueError(
+                f"pattern '{label}': keywords word '{key}' has weight 0; "
+                "give it a sign or remove it"
+            )
+        for where, seen in (("context.positive", positive),
+                            ("context.penalize", penalize), ("nearby", nearby)):
+            other = _same_words(key, seen)
+            if other is not None:
+                same = "" if other == key else f" (same words as '{other}')"
+                raise ValueError(
+                    f"pattern '{label}': word '{key}' is in both keywords and {where}{same}"
+                )
+    for key, weight in shorthand.items():
+        nearby[key] = weight
+        if weight > 0:
+            positive.append(key)
+        else:
+            penalize[key] = weight
+    return positive, penalize, nearby, explicit_penalize
 
 
 def load_config(path: str | Path) -> Config:
@@ -329,7 +359,7 @@ def load_config(path: str | Path) -> Config:
         except re.error as exc:
             raise ValueError(f"pattern '{label}': invalid regex: {exc}") from exc
 
-        positive, penalize, nearby = _load_keywords(label, entry)
+        positive, penalize, nearby, explicit_penalize = _load_keywords(label, entry)
         patterns.append(
             Pattern(
                 label=label,
@@ -338,10 +368,11 @@ def load_config(path: str | Path) -> Config:
                 positive=positive,
                 penalize=penalize,
                 nearby=nearby,
+                explicit_penalize=explicit_penalize,
             )
         )
 
-    unused = [p.label for p in patterns if p.penalize]
+    unused = [p.label for p in patterns if p.explicit_penalize]
     if unused and "context_penalty" not in settings["overlap_tiebreak"]:
         warnings.warn(
             f"context.penalize is set for {', '.join(unused)} but `context_penalty` "

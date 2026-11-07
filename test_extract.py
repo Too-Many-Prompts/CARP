@@ -1386,3 +1386,105 @@ def test_summarize_reads_only_report_columns() -> None:
         writer.writeheader()
         writer.writerows(rows)
     assert summarize_overlaps("slim.csv") == full
+
+
+# ------------------------------------------------- keywords shorthand
+def _pat(cfg: Config) -> Any:
+    (p,) = cfg.patterns
+    return p
+
+
+def test_keywords_expand_by_sign(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, _one(keywords={"phone": 3, "Call": 2, "acct": -3}),
+                   overlap_tiebreak=["context_penalty"])
+    p = _pat(cfg)
+    assert sorted(p.positive) == ["call", "phone"]      # make_cfg's safe_dump sorts keys
+    assert p.nearby == {"phone": 3.0, "call": 2.0, "acct": -3.0}
+    assert p.penalize == {"acct": -3.0}
+
+
+def test_keywords_behave_like_the_explicit_keys(tmp_path: Path) -> None:
+    patterns = [
+        {"label": "A", "priority": 1, "regex": r"\d{4}", "keywords": {"alpha": 2, "bad": -1}},
+        {"label": "B", "priority": 2, "regex": r"\d{4}", "keywords": {"beta": 1}},
+    ]
+    cfg = make_cfg(tmp_path, patterns, overlap_tiebreak=CTX_PEN_ORDER)
+    (m,) = matches_of("alpha 1234", cfg)                         # nearby: alpha scores A
+    assert (m.label, m.score) == ("A", 2.0)
+    assert _sel_in(cfg, "beta") == ["B"]                         # positive: beta selects B
+    (m,) = matches_of(("alpha beta bad", "1234"), cfg)           # penalize: bad hits A
+    assert m.label == "B"
+
+
+def test_keywords_weight_zero_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError) as exc:
+        make_cfg(tmp_path, _one(keywords={"tel": 0}))
+    assert str(exc.value) == (
+        "pattern 'p': keywords word 'tel' has weight 0; give it a sign or remove it"
+    )
+
+
+def test_keywords_merge_with_explicit_keys(tmp_path: Path) -> None:
+    keys = {"keywords": {"phone": 3, "acct": -3},
+            "context": {"positive": ["mobile"], "penalize": {"order": -1}},
+            "nearby": {"cell": 1}}
+    p = _pat(make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"]))
+    assert p.positive == ["mobile", "phone"]            # explicit words first
+    assert p.penalize == {"order": -1.0, "acct": -3.0}
+    assert p.nearby == {"cell": 1.0, "phone": 3.0, "acct": -3.0}
+
+
+@pytest.mark.parametrize(
+    "keys, where, word, same",
+    [
+        ({"keywords": {"tel": 1}, "context": {"positive": ["tel"]}}, "context.positive", "tel", ""),
+        ({"keywords": {"bad": -1}, "context": {"penalize": {"bad": -1}}},
+         "context.penalize", "bad", ""),
+        ({"keywords": {"tel": 1}, "nearby": {"Tel": 2}}, "nearby", "tel", ""),
+        ({"keywords": {"e-mail": 1}, "nearby": {"e mail": 2}}, "nearby", "e-mail",
+         " (same words as 'e mail')"),
+        ({"keywords": {"bad": -1}, "context": {"positive": ["bad"]}}, "context.positive", "bad", ""),
+    ],
+)
+def test_word_in_keywords_and_explicit_key_is_rejected(
+    tmp_path: Path, keys: dict[str, Any], where: str, word: str, same: str
+) -> None:
+    with pytest.raises(ValueError) as exc:
+        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+    assert str(exc.value) == f"pattern 'p': word '{word}' is in both keywords and {where}{same}"
+
+
+@pytest.mark.parametrize(
+    "value, message",
+    [
+        ({"w2": 1}, "pattern 'p': keywords keyword 'w2' must contain only ASCII letters"),
+        ({"tel": 1, "TEL": 2}, "pattern 'p': keywords keyword 'tel' is listed more than once"),
+        ({True: 1}, "pattern 'p': keywords keyword True must be a string"),
+        ({None: 1}, "pattern 'p': keywords has an empty entry; remove it"),
+        ({"tel": "high"}, "pattern 'p': keywords keyword 'tel' needs a numeric weight"),
+        (["tel"], "pattern 'p': keywords must be a map of word: weight"),
+    ],
+)
+def test_keywords_validation_names_keywords(tmp_path: Path, value: Any, message: str) -> None:
+    with pytest.raises(ValueError, match=re.escape(message)):
+        make_cfg(tmp_path, _one(keywords=value))
+
+
+@pytest.mark.parametrize("value", [None, {}])
+def test_keywords_blank_loads_as_empty(tmp_path: Path, value: Any) -> None:
+    p = _pat(make_cfg(tmp_path, _one(keywords=value)))
+    assert (p.positive, p.penalize, p.nearby) == ([], {}, {})
+
+
+def test_shorthand_negatives_do_not_warn(tmp_path: Path) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        p = _pat(make_cfg(tmp_path, _one(keywords={"tel": 2, "acct": -3}),
+                          overlap_tiebreak=["score"]))
+    assert p.penalize == {"acct": -3.0}
+
+
+def test_explicit_penalize_still_warns_alongside_keywords(tmp_path: Path) -> None:
+    keys = {"keywords": {"acct": -3}, "context": {"penalize": {"order": -1}}}
+    with pytest.warns(UserWarning, match="context.penalize is set for p but"):
+        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["score"])
