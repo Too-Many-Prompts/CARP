@@ -25,6 +25,7 @@ from extract import (
     main,
     open_report,
     select_patterns,
+    summarize_overlaps,
     write_report_csv,
 )
 from words import next_words, prev_words
@@ -968,3 +969,181 @@ def test_penalty_skipped_note_changes_no_result(tmp_path: Path) -> None:
                              d["reason"].replace(SKIP_NOTE, "")) for d in ds[1:]]
         assert strip(d1) == strip(d2)
         assert any(d["penalty_skipped"] for d in d1) and not any(d["penalty_skipped"] for d in d2)
+
+
+# ------------------------------------------------- summarize_overlaps
+def _row(a: str, b: str, by: str, file: str = "f", skipped: bool = False,
+         a_span: tuple[int, int] = (0, 4), b_span: tuple[int, int] = (0, 4),
+         a_text: str = "x", b_text: str = "y", kind: str = "overlap") -> dict[str, Any]:
+    row = dict.fromkeys(REPORT_FIELDS, "")
+    row.update(file=file, kind=kind, a_label=a, b_label=b, decided_by=by,
+               penalty_skipped=skipped, a_start=a_span[0], a_end=a_span[1],
+               b_start=b_span[0], b_end=b_span[1], a_text=a_text, b_text=b_text)
+    return row
+
+
+def _report(rows: list[dict[str, Any]], path: str = "extract_report.csv") -> str:
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=REPORT_FIELDS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def _by_pair(path: str = "extract_report.csv") -> dict[str, dict[str, Any]]:
+    return {r["pair"]: r for r in summarize_overlaps(path)}
+
+
+SUMMARY_KEYS = [
+    "pair", "overlaps", "by_score", "by_context_penalty", "by_length", "by_priority",
+    "by_start_label", "not_by_score", "not_by_score_pct", "no_evidence",
+    "penalty_skipped", "wins", "examples", "hint",
+]
+
+
+def test_summary_counts_and_wins() -> None:
+    _report([
+        _row("phone", "acct", "score"), _row("phone", "acct", "score"),
+        _row("acct", "phone", "length"), _row("phone", "acct", "context_penalty"),
+        _row("phone", "acct", "priority", skipped=True), _row("acct", "phone", "start_label"),
+        _row("phone", "acct", "coexist", kind="coexist"),       # not an overlap row
+        _row("n", "", "min_score", kind="below_min_score"),
+    ])
+    (row,) = summarize_overlaps()
+    assert list(row) == SUMMARY_KEYS
+    assert row["pair"] == "acct/phone"                            # sorted, joined by /
+    assert (row["overlaps"], row["by_score"], row["by_context_penalty"], row["by_length"],
+            row["by_priority"], row["by_start_label"]) == (6, 2, 1, 1, 1, 1)
+    assert (row["not_by_score"], row["not_by_score_pct"]) == (4, 66.7)
+    assert (row["no_evidence"], row["penalty_skipped"]) == (2, 1)
+    assert row["wins"] == "phone 4; acct 2"
+
+
+def test_summary_sort_order() -> None:
+    _report(
+        [_row("a", "b", "score")] * 5                                         # a/b: 0, 0, 5
+        + [_row("c", "d", "length")] * 2                                      # c/d: 0, 2, 2
+        + [_row("e", "f", "priority")] + [_row("e", "f", "score")] * 3        # e/f: 1, 1, 4
+        + [_row("g", "h", "start_label")]                                     # g/h: 1, 1, 1
+        + [_row("i", "j", "score")] * 5                                       # i/j ties a/b
+    )
+    assert [r["pair"] for r in summarize_overlaps()] == ["e/f", "g/h", "c/d", "a/b", "i/j"]
+
+
+def test_summary_needs_decided_by_column() -> None:
+    with open("old.csv", "w", encoding="utf-8") as fh:
+        fh.write("file,kind,outcome,reason\n,overlap,a_wins_b_dropped,x\n")
+    with pytest.raises(ValueError, match="regenerate it with --report"):
+        summarize_overlaps("old.csv")
+
+
+def test_summary_of_real_report(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, OVERLAP_PATTERNS)
+    write_report_csv(extract("abc12", cfg, source="doc")[1])
+    (row,) = summarize_overlaps()
+    assert (row["pair"], row["by_length"], row["wins"]) == ("A/B", 1, "A 1")
+
+
+def test_summary_examples_limit_order_and_placeholder() -> None:
+    _report([
+        _row("a", "b", "length", file="len1", a_text="L1"),
+        _row("a", "b", "score", file="s"),
+        _row("a", "b", "priority", file="", a_text="P1", b_text="Q1"),
+        _row("a", "b", "length", file="len2"),
+        _row("a", "b", "start_label", file="sl", a_text="P2"),
+        _row("a", "b", "priority", file="p3", a_text="P3"),
+        _row("a", "b", "priority", file="p4", a_text="P4"),
+    ])
+    assert _by_pair()["a/b"]["examples"] == (
+        '(no id): "P1" vs "Q1" | sl: "P2" vs "y" | p3: "P3" vs "y"'
+    )
+    _report([_row("a", "b", "length", file="len1", a_text="L1"),
+             _row("a", "b", "priority", file="p", a_text="P")])
+    assert _by_pair()["a/b"]["examples"] == 'p: "P" vs "y" | len1: "L1" vs "y"'
+
+
+def test_summary_examples_empty_when_all_by_score() -> None:
+    _report([_row("a", "b", "score")] * 4)
+    row = _by_pair()["a/b"]
+    assert (row["examples"], row["hint"]) == ("", "ok")
+
+
+HINT_1 = "contexts mention penalize words but don't select these patterns; add context.positive words"
+HINT_2 = "add nearby words; if inputs come with a context, add penalize words"
+HINT_3 = "if both values are valid, add to coexist"
+PARTIAL = {"a_span": (0, 4), "b_span": (2, 6)}
+
+
+@pytest.mark.parametrize(
+    "rows, hint",
+    [
+        ([_row("a", "b", "length", skipped=True)], HINT_1),
+        ([_row("a", "b", "priority")], HINT_2),                                    # identical spans
+        ([_row("a", "b", "priority", **PARTIAL)], f"{HINT_2}; {HINT_3}"),
+        ([_row("a", "b", "priority", skipped=True, **PARTIAL)], f"{HINT_1}; {HINT_2}; {HINT_3}"),
+        # unsettled = 3, partial = 1 (not more than half): no rule 3
+        ([_row("a", "b", "priority", **PARTIAL), _row("a", "b", "length"),
+          _row("a", "b", "start_label")], HINT_2),
+        # unsettled = 2, partial = 1: exactly half is not more than half
+        ([_row("a", "b", "priority", **PARTIAL), _row("a", "b", "priority")], HINT_2),
+        # partial rows only among unsettled ones count; score rows are ignored
+        ([_row("a", "b", "priority", **PARTIAL)] + [_row("a", "b", "score")] * 5,
+         f"{HINT_2}; {HINT_3}"),
+        ([_row("a", "b", "length", **PARTIAL), _row("a", "b", "score")], "ok"),
+    ],
+)
+def test_summary_hint(rows: list[dict[str, Any]], hint: str) -> None:
+    _report(rows)
+    assert _by_pair()["a/b"]["hint"] == hint
+
+
+# ------------------------------------------------- --summarize CLI
+def test_cli_summarize_prints_table_without_config(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _report([_row("phone", "acct", "priority", file="d1")] + [_row("x", "y", "score")])
+    assert main(["--summarize"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].split() == SUMMARY_KEYS
+    assert lines[1].startswith("acct/phone ") and lines[2].startswith("x/y ")
+    assert lines[1].index(" 1 ") == lines[2].index(" 1 ")          # aligned columns
+    assert 'd1: "x" vs "y"' in lines[1]
+
+
+def test_cli_summarize_explicit_path(capsys: pytest.CaptureFixture[str]) -> None:
+    _report([_row("a", "b", "length")], path="other.csv")
+    assert main(["--summarize", "other.csv"]) == 0
+    assert "a/b" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "extra", [["--text", "x"], ["--context", "x"], ["--report"], ["--error-log"]]
+)
+def test_cli_summarize_usage_errors(
+    extra: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _report([_row("a", "b", "length")])
+    with pytest.raises(SystemExit) as exc:
+        main(["--summarize", *extra])
+    assert exc.value.code == 2
+    assert "--summarize" in capsys.readouterr().err
+
+
+def test_cli_without_config_or_summarize_is_a_usage_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["--text", "x"])
+    assert exc.value.code == 2
+    assert "--config" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("content", [None, "file,kind\n"])
+def test_cli_summarize_bad_report_is_a_clean_error(
+    content: str | None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    if content is not None:
+        Path("extract_report.csv").write_text(content, encoding="utf-8")
+    assert main(["--summarize"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.startswith("error:") and captured.out == ""
