@@ -28,6 +28,7 @@ import csv
 import json
 import re
 import sys
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -53,7 +54,11 @@ REPORT_FIELDS = (
     ("file", "kind", "outcome", "reason", "patterns")
     + tuple(f"a_{k}" for k in _CAND_COLS)
     + tuple(f"b_{k}" for k in _CAND_COLS)
+    + ("decided_by", "penalty_skipped")
 )
+# decided_by: overlap -> score | context_penalty | length | priority | start_label;
+# coexist -> coexist; below_min_score -> min_score; context / context_miss -> "".
+PENALTY_SKIPPED_NOTE = "; context_penalty skipped: context selected no patterns"
 REQUIRED_SETTINGS = (
     "context_window_words",
     "distance_decay",
@@ -108,7 +113,8 @@ class Candidate:
 
 
 # One entry of the troubleshooting log: a flat dict with the REPORT_FIELDS
-# columns (file, kind, outcome, reason, patterns, a_*, b_*). It is the single
+# columns (file, kind, outcome, reason, patterns, a_*, b_*, decided_by,
+# penalty_skipped). It is the single
 # form used for extract_report.csv, errorlog.csv and the CLI JSON output.
 #
 # kind: "context" | "context_miss" | "below_min_score" | "overlap" | "coexist"
@@ -127,10 +133,13 @@ def _decision(
     a: Candidate | None = None,
     b: Candidate | None = None,
     patterns: Sequence[str] = (),
+    decided_by: str = "",
+    penalty_skipped: bool = False,
 ) -> Decision:
     """Build one log row. a/b are the candidates involved:
     overlap: a = winner, b = dropped. below_min_score: a = dropped.
     coexist: a and b are both kept. The `file` column is filled in later.
+    `decided_by` names the rule that decided (see REPORT_FIELDS).
     """
     return {
         "file": "",
@@ -140,6 +149,8 @@ def _decision(
         "patterns": ";".join(patterns),
         **_cand_columns("a", a),
         **_cand_columns("b", b),
+        "decided_by": decided_by,
+        "penalty_skipped": penalty_skipped,
     }
 
 
@@ -297,6 +308,15 @@ def load_config(path: str | Path) -> Config:
                 penalize=penalize,
                 nearby=nearby,
             )
+        )
+
+    unused = [p.label for p in patterns if p.penalize]
+    if unused and "context_penalty" not in settings["overlap_tiebreak"]:
+        warnings.warn(
+            f"context.penalize is set for {', '.join(unused)} but `context_penalty` "
+            "is not in settings.overlap_tiebreak, so it is never used.",
+            UserWarning,
+            stacklevel=2,
         )
 
     coexist = {frozenset(pair) for pair in (raw.get("coexist") or [])}
@@ -615,8 +635,10 @@ def _why_wins(
     loser: Candidate,
     order: Sequence[str],
     ctx_penalty: dict[str, float],
-) -> str:
-    """Explain which tiebreak criterion decided, naming the ones that tied."""
+) -> tuple[str, str]:
+    """Return (criterion, reason): the tiebreak criterion that decided and a
+    text naming the ones that tied. criterion is "start_label" when every
+    listed criterion tied (or the list is empty)."""
     tied: list[str] = []
     for name in order:
         if name == "score" and winner.score != loser.score:
@@ -643,14 +665,15 @@ def _why_wins(
         else:
             tied.append(name)
             continue
-        return "; ".join([f"{t} tied" for t in tied] + [detail])
-    return "all tiebreak criteria tied; kept earlier start/label"
+        return name, "; ".join([f"{t} tied" for t in tied] + [detail])
+    return "start_label", "all tiebreak criteria tied; kept earlier start/label"
 
 
 def resolve_overlaps(
     cands: list[Candidate],
     cfg: Config,
     ctx_penalty: dict[str, float] | None = None,
+    skipped_hits: set[str] | None = None,
 ) -> tuple[list[Candidate], list[Decision]]:
     """Drop candidates below min_score, then resolve overlaps greedily.
 
@@ -658,10 +681,14 @@ def resolve_overlaps(
     empty or everything ties, the earlier start, then the label, decides.
     `ctx_penalty` maps label -> summed context.penalize weight and feeds the
     `context_penalty` criterion (empty/None: that criterion always ties).
+    `skipped_hits` names labels whose penalize words occur in a context that
+    selected no patterns; it only adds the "skipped" note to overlap rows and
+    never affects ranking.
     Each candidate is accepted unless it overlaps an already-accepted one
     whose label pair is not in `coexist`. Every decision is logged.
     """
     ctx_penalty = ctx_penalty or {}
+    skipped_hits = skipped_hits or set()
     settings = cfg.settings
     order = settings["overlap_tiebreak"]
     min_score = settings["min_score"]
@@ -672,7 +699,8 @@ def resolve_overlaps(
         if c.score < min_score:
             decisions.append(
                 _decision("below_min_score", "dropped",
-                          f"score {c.score:.2f} < min_score {min_score}", a=c)
+                          f"score {c.score:.2f} < min_score {min_score}", a=c,
+                          decided_by="min_score")
             )
         else:
             survivors.append(c)
@@ -688,12 +716,16 @@ def resolve_overlaps(
                 pending.append(
                     _decision("coexist", "both_kept",
                               f"{a.label}/{c.label} pair is in coexist; both kept",
-                              a=a, b=c)
+                              a=a, b=c, decided_by="coexist")
                 )
             else:
+                criterion, reason = _why_wins(a, c, order, ctx_penalty)
+                skipped = bool({a.label, c.label} & skipped_hits)
+                if skipped:
+                    reason += PENALTY_SKIPPED_NOTE
                 decisions.append(
-                    _decision("overlap", "a_wins_b_dropped",
-                              _why_wins(a, c, order, ctx_penalty), a=a, b=c)
+                    _decision("overlap", "a_wins_b_dropped", reason, a=a, b=c,
+                              decided_by=criterion, penalty_skipped=skipped)
                 )
                 beaten = True
                 break
@@ -745,11 +777,17 @@ def extract(
 
     # context_penalty only applies when the context actually chose the patterns.
     ctx_penalty: dict[str, float] = {}
-    if norm_context and ctx_decision["outcome"] == "patterns_restricted":
+    skipped_hits: set[str] = set()
+    has_context = bool(norm_context and norm_context.strip())
+    if has_context and ctx_decision["outcome"] == "patterns_restricted":
         ctx_words = _context_words(norm_context)
         ctx_penalty = {p.label: _context_penalty(ctx_words, p)[0] for p in patterns}
+    elif has_context and "context_penalty" in cfg.settings["overlap_tiebreak"]:
+        # Gate off: note (only) which labels' penalize words were in the context.
+        ctx_words = _context_words(norm_context)
+        skipped_hits = {p.label for p in patterns if _context_penalty(ctx_words, p)[1]}
 
-    matches, decisions = resolve_overlaps(cands, cfg, ctx_penalty)
+    matches, decisions = resolve_overlaps(cands, cfg, ctx_penalty, skipped_hits)
     decisions = [ctx_decision] + decisions
 
     if ctx_decision["outcome"] == "patterns_restricted" and not matches:
@@ -782,10 +820,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        cfg = load_config(args.config)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            cfg = load_config(args.config)
     except (ValueError, OSError, yaml.YAMLError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    for w in caught:
+        print(f"warning: {w.message}", file=sys.stderr)
 
     text = args.text
     if text is None:

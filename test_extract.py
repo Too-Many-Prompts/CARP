@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import re
 import sys
+import warnings
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -714,7 +715,8 @@ def test_context_penalty_phrase(tmp_path: Path) -> None:
 
 
 def test_context_penalty_is_opt_in(tmp_path: Path) -> None:
-    cfg = make_cfg(tmp_path, CTX_PEN_PATTERNS)  # default order, no context_penalty
+    with pytest.warns(UserWarning, match="never used"):
+        cfg = make_cfg(tmp_path, CTX_PEN_PATTERNS)  # default order, no context_penalty
     matches, _ = extract({"text": "abcd", "context": "alpha beta bad"}, cfg)
     assert pairs(matches) == Counter({("A", "abcd"): 1})  # priority decides
 
@@ -807,3 +809,162 @@ def test_empty_tiebreak_uses_start_then_label(tmp_path: Path, empty: Any) -> Non
 def test_unknown_tiebreak_name_still_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unknown criterion 'nope'"):
         make_cfg(tmp_path, CTX_PEN_PATTERNS, overlap_tiebreak=["nope"])
+
+
+# ------------------------------------------------- decided_by / penalty_skipped
+def test_report_fields_end_with_decided_by_and_penalty_skipped() -> None:
+    assert REPORT_FIELDS[-2:] == ("decided_by", "penalty_skipped")
+    assert REPORT_FIELDS[:5] == ("file", "kind", "outcome", "reason", "patterns")
+
+
+def _overlap(decisions: list[dict[str, Any]]) -> dict[str, Any]:
+    (row,) = [d for d in decisions if d["kind"] == "overlap"]
+    return row
+
+
+@pytest.mark.parametrize(
+    "patterns, order, inp, decided_by",
+    [
+        ([{"label": "A", "priority": 1, "regex": "abcd", "nearby": {"go": 1}},
+          {"label": "B", "priority": 2, "regex": "abcd"}],
+         ["score", "length", "priority"], "go abcd", "score"),
+        (CTX_PEN_PATTERNS, CTX_PEN_ORDER, ("alpha beta bad", "abcd"), "context_penalty"),
+        ([{"label": "short", "priority": 1, "regex": "ab"},
+          {"label": "long", "priority": 9, "regex": "abcd"}],
+         ["score", "length", "priority"], "abcd", "length"),
+        ([{"label": "B", "priority": 1, "regex": "abcd"},
+          {"label": "A", "priority": 2, "regex": "abcd"}],
+         ["score", "length", "priority"], "abcd", "priority"),
+        ([{"label": "B", "priority": 1, "regex": "abcd"},
+          {"label": "A", "priority": 2, "regex": "abcd"}],
+         [], "abcd", "start_label"),
+    ],
+)
+def test_overlap_decided_by(
+    tmp_path: Path, patterns: Any, order: list[str], inp: Any, decided_by: str
+) -> None:
+    cfg = make_cfg(tmp_path, patterns, overlap_tiebreak=order)
+    assert _overlap(extract(inp, cfg)[1])["decided_by"] == decided_by
+
+
+def test_other_decided_by_values(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, OVERLAP_PATTERNS, coexist=[["A", "B"]])
+    rows = {d["kind"]: d for d in extract("abc12", cfg)[1]}
+    assert rows["coexist"]["decided_by"] == "coexist"
+    assert rows["context"]["decided_by"] == ""
+    patterns = [{"label": "n", "priority": 1, "regex": r"\d+",
+                 "context": {"positive": ["num"]}, "nearby": {"bad": -1}}]
+    rows = {d["kind"]: d for d in extract(("num", "bad 12"), make_cfg(tmp_path, patterns))[1]}
+    assert rows["below_min_score"]["decided_by"] == "min_score"
+    assert rows["context_miss"]["decided_by"] == ""
+    assert all(d["penalty_skipped"] is False for d in rows.values())
+
+
+def test_decided_by_written_to_csv(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, OVERLAP_PATTERNS)
+    write_report_csv(extract("abc12", cfg)[1])
+    rows = read_report()
+    assert list(rows[0])[-2:] == ["decided_by", "penalty_skipped"]
+    assert [r["decided_by"] for r in rows if r["kind"] == "overlap"] == ["length"]
+
+
+# ------------------------------------------------- load warning
+PENALIZE_ONLY = [
+    {"label": "phone_number", "priority": 1, "regex": "a", "context": {"penalize": {"acct": -1}}},
+    {"label": "account_number", "priority": 2, "regex": "b", "context": {"penalize": {"tel": -1}}},
+    {"label": "plain", "priority": 3, "regex": "c"},
+]
+
+
+def test_load_warning_when_penalize_is_unused(tmp_path: Path) -> None:
+    with pytest.warns(UserWarning) as record:
+        make_cfg(tmp_path, PENALIZE_ONLY, overlap_tiebreak=["score", "length"])
+    assert len(record) == 1
+    assert str(record[0].message) == (
+        "context.penalize is set for phone_number, account_number but "
+        "`context_penalty` is not in settings.overlap_tiebreak, so it is never used."
+    )
+
+
+@pytest.mark.parametrize(
+    "patterns, order",
+    [(PENALIZE_ONLY, ["context_penalty"]), (PENALIZE_ONLY[2:], ["score"])],
+)
+def test_no_load_warning_otherwise(tmp_path: Path, patterns: Any, order: list[str]) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        make_cfg(tmp_path, patterns, overlap_tiebreak=order)
+
+
+def test_real_config_loads_without_warning() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        load_config(CONFIG_PATH)
+
+
+def test_cli_shows_load_warning_on_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    path = tmp_path / "warn.yaml"
+    raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    raw["settings"]["overlap_tiebreak"] = ["score", "length", "priority"]
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    assert main(["--config", str(path), "--text", "call 555-123-4567"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err.startswith("warning: context.penalize is set for invoice_number, ")
+    assert json.loads(captured.out)[0]["label"] == "phone_number"
+
+
+# ------------------------------------------------- skipped context_penalty note
+SKIP_NOTE = "; context_penalty skipped: context selected no patterns"
+
+
+@pytest.mark.parametrize(
+    "order, context, skipped",
+    [
+        (CTX_PEN_ORDER, "bad", True),                            # all three hold
+        (CTX_PEN_ORDER, "very bad", True),                       # phrase hit
+        (["score", "length", "priority"], "bad", False),         # criterion not listed
+        (CTX_PEN_ORDER, "alpha beta bad", False),                # gate on: it applied
+        (CTX_PEN_ORDER, None, False),                            # no context at all
+        (CTX_PEN_ORDER, "nothing relevant", False),              # gate off, no penalize words
+    ],
+)
+def test_penalty_skipped_note(
+    tmp_path: Path, order: list[str], context: str | None, skipped: bool
+) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")   # the "not in overlap_tiebreak" case warns
+        cfg = make_cfg(tmp_path, CTX_PEN_PATTERNS, overlap_tiebreak=order)
+    row = _overlap(extract({"text": "abcd", "context": context}, cfg)[1])
+    assert row["reason"].endswith(SKIP_NOTE) is skipped
+    assert row["penalty_skipped"] is skipped
+    assert SKIP_NOTE[2:] not in row["reason"] or skipped
+
+
+def test_penalty_skipped_note_for_either_candidate(tmp_path: Path) -> None:
+    patterns = [
+        {"label": "A", "priority": 1, "regex": "abcd", "context": {"positive": ["alpha"]}},
+        {"label": "B", "priority": 2, "regex": "abcd", "context": {"penalize": {"bad": -1}}},
+    ]
+    cfg = make_cfg(tmp_path, patterns, overlap_tiebreak=CTX_PEN_ORDER)
+    row = _overlap(extract(("bad", "abcd"), cfg)[1])
+    assert (row["a_label"], row["penalty_skipped"]) == ("A", True)   # B (loser) has the hit
+    assert row["decided_by"] == "priority"
+    assert row["reason"] == "score tied; context_penalty tied; length tied; " \
+        "priority 1 < 2 (lower number wins)" + SKIP_NOTE
+
+
+def test_penalty_skipped_note_changes_no_result(tmp_path: Path) -> None:
+    with_note = make_cfg(tmp_path, CTX_PEN_PATTERNS, overlap_tiebreak=CTX_PEN_ORDER)
+    texts = ["abcd", "abcd abcd", "x abcd y"]
+    for text in texts:
+        m1, d1 = extract(("bad", text), with_note)
+        m2, d2 = extract(("unrelated", text), with_note)   # same gate, no note
+        assert [c.to_dict() for c in m1] == [c.to_dict() for c in m2]
+        strip = lambda ds: [(d["kind"], d["a_label"], d["b_label"], d["decided_by"],
+                             d["reason"].replace(SKIP_NOTE, "")) for d in ds[1:]]
+        assert strip(d1) == strip(d2)
+        assert any(d["penalty_skipped"] for d in d1) and not any(d["penalty_skipped"] for d in d2)
