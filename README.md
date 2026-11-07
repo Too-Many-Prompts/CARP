@@ -125,7 +125,8 @@ pattern's `context.positive` keywords. Only patterns with a hit run on the text.
 The pattern regexes are never run on the context.
 
 - No context, or no keyword hits: all patterns run.
-- Negative keywords never select a pattern.
+- Negative keywords never select a pattern. They only matter as the opt-in
+  `context_negative` tie-break, and only when the context selected patterns.
 - If the context selected patterns but nothing was extracted, the case is not
   dropped silently. `extract()` returns it as a `context_miss` decision.
 
@@ -148,7 +149,7 @@ pattern and keyword when:
 
 | Key | Purpose |
 | --- | --- |
-| `settings` | `context_window_words`, `context_direction` (`before`/`after`/`both`, default `both`), `stop_at` (characters that end the context scan, default `""`), `distance_decay`, `min_score`, `case_sensitive`, `overlap_tiebreak` |
+| `settings` | `context_window_words`, `context_direction` (`before`/`after`/`both`, default `both`), `stop_at` (characters that end the context scan, default `""`), `distance_decay`, `min_score`, `case_sensitive`, `overlap_tiebreak` (any of `score`, `context_negative`, `length`, `priority`, in order; may be empty) |
 | `normalize` | `collapse_whitespace`, `unicode_dashes_to_hyphen`, `smart_quotes_to_ascii` |
 | `patterns` | `label`, `priority`, `regex`, and `context.positive` / `context.negative` keyword weights |
 | `coexist` | label pairs that may both be kept when they overlap |
@@ -184,7 +185,7 @@ helpers below. Both are gitignored.
 ```
 
 `test_extract.py` runs the `tests` section of the config and unit-tests coexist
-and non-coexist overlaps, tie-breaks, multi-word keywords, `context_direction`,
+and non-coexist overlaps, tie-breaks (including `context_negative` and an empty list), multi-word keywords, `context_direction`,
 invalid regexes, context selection, the error log, the report CSV and the CLI.
 
 ## Files

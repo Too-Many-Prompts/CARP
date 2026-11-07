@@ -53,6 +53,7 @@ each match using nearby context words, and resolves overlapping matches.
   rejects digit/accented keywords, duplicate keywords within a pattern and
   wrong-signed weights.
 - Also unit-test: coexist overlap, non-coexist overlap, length tie-break,
+  `context_negative` tie-break (and its context gate), empty `overlap_tiebreak`,
   multi-word keywords, invalid regex.
 - Run `pytest -q` after every change and do not report success until it passes.
 
