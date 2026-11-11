@@ -22,6 +22,7 @@ from extract import (
     load_config,
     main,
     open_report,
+    reset_report,
     summarize_misses,
     summarize_overlaps,
     write_report_csv,
@@ -1350,3 +1351,393 @@ def test_example_config_uses_keywords_shorthand() -> None:
     raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     assert all("keywords" in p and "nearby" not in p and "context" not in p
                for p in raw["patterns"])
+
+
+# ---------------------------------------------------------------- phone validation
+import phone  # noqa: E402  (phonenumbers is a declared dependency)
+import summarize  # noqa: E402
+from summarize import format_validation, summarize_validation  # noqa: E402
+
+PHONE_RE = r"\+?\(?\d[\d\s().-]{6,18}\d"
+
+
+def phone_pattern(label: str = "ph", **validate: Any) -> dict[str, Any]:
+    return {"label": label, "priority": 1, "regex": PHONE_RE,
+            "validate": {"with": "phonenumbers", "default_region": "US", **validate}}
+
+
+def run_phone(
+    tmp_path: Path, inp: Any, region: str | None = None,
+    patterns: list[dict[str, Any]] | None = None, **validate: Any,
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    cfg = make_cfg(tmp_path, patterns or [phone_pattern(**validate)])
+    return extract(inp, cfg, region=region)
+
+
+def vrows(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [d for d in decisions if d["kind"] == "validation"]
+
+
+def extra_of(matches: list[Any], *keys: str) -> list[tuple]:
+    return [tuple(m.extra[k] for k in keys) for m in matches]
+
+
+@pytest.mark.parametrize("validate, message", [
+    ({"with": "phonenumbers"}, "missing required key 'default_region'"),
+    ({"with": "regexlib", "default_region": "US"}, r"validate.with: must be 'phonenumbers'"),
+    ({"default_region": "US"}, r"validate.with: must be 'phonenumbers'"),
+    ({"with": "phonenumbers", "default_region": "US", "colour": 1}, "unknown key 'colour'"),
+    ({"with": "phonenumbers", "default_region": "XQ"}, "validate.default_region: unknown region 'XQ'"),
+    ({"with": "phonenumbers", "default_region": "US", "try_regions": ["GB"]},
+     "must include default_region 'US'"),
+    ({"with": "phonenumbers", "default_region": "US", "try_regions": ["US", "us"]}, "'US' is listed twice"),
+    ({"with": "phonenumbers", "default_region": "US", "try_regions": []}, "non-empty list"),
+    ({"with": "phonenumbers", "default_region": "US", "on_possible": "maybe"},
+     "validate.on_possible: unknown value 'maybe'"),
+    ({"with": "phonenumbers", "default_region": "US", "region_from": "anywhere"},
+     "validate.region_from: unknown value"),
+    ({"with": "phonenumbers", "default_region": "US", "output_format": "e164"},
+     "validate.output_format: unknown value"),
+    ({"with": "phonenumbers", "default_region": "US", "possible_min_score": "high"},
+     "possible_min_score: expected a number"),
+    ({"with": "phonenumbers", "default_region": "US", "regions": {"GB": {"uk2": 1}}},
+     "validate.regions.GB keyword 'uk2' must contain only ASCII letters"),
+    ({"with": "phonenumbers", "default_region": "US", "regions": {"GB": {"uk": -1}}},
+     "validate.regions.GB: keyword 'uk' needs a weight > 0"),
+    ({"with": "phonenumbers", "default_region": "US", "regions": {"ZQ": {"zz": 1}}},
+     "validate.regions: unknown region 'ZQ'"),
+    ({"with": "phonenumbers", "default_region": "US", "possible_label": "ph"},
+     "possible_label: must differ"),
+    ("US", "validate must be a map"),
+])
+def test_validate_load_errors(tmp_path: Path, validate: Any, message: str) -> None:
+    pattern = {"label": "ph", "priority": 1, "regex": PHONE_RE, "validate": validate}
+    with pytest.raises(ValueError, match=rf"pattern 'ph': .*{message}"):
+        make_cfg(tmp_path, [pattern])
+
+
+def test_possible_label_may_not_reuse_a_label(tmp_path: Path) -> None:
+    patterns = [phone_pattern(possible_label="other"),
+                {"label": "other", "priority": 2, "regex": "x"}]
+    with pytest.raises(ValueError, match="possible_label 'other' is already used"):
+        make_cfg(tmp_path, patterns)
+
+
+def test_validate_defaults(tmp_path: Path) -> None:
+    (p,) = make_cfg(tmp_path, [phone_pattern()]).patterns
+    assert p.validate == phone.PhoneSpec(default_region="US", try_regions=["US"])
+    assert p.validate.on_possible == "keep"          # never lose an unknown area code
+
+
+def test_validate_needs_phonenumbers_installed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def missing(name: str) -> Any:
+        raise ImportError(name)
+
+    monkeypatch.setattr(phone, "_pn_module", None)
+    monkeypatch.setattr(phone.importlib, "import_module", missing)
+    with pytest.raises(ValueError, match="pattern 'ph' uses validate but phonenumbers is not installed"):
+        make_cfg(tmp_path, [phone_pattern()])
+    # Configs without validate never touch the library.
+    cfg = make_cfg(tmp_path, [{"label": "n", "priority": 1, "regex": r"\d+"}])
+    matches, decisions = extract("call 212-555-0123", cfg)
+    assert [m.text for m in matches] == ["212", "555", "0123"]
+    assert all(m.extra is None for m in matches) and not vrows(decisions)
+
+
+def test_valid_number_gets_e164_extra(tmp_path: Path) -> None:
+    matches, decisions = run_phone(tmp_path, "call (212) 555-0123 today")
+    (m,) = matches
+    assert (m.label, m.text) == ("ph", "(212) 555-0123")
+    assert m.extra == {"normalized": "+12125550123", "region": "US", "region_source": "trial",
+                       "status": "valid", "number_type": "FIXED_LINE_OR_MOBILE",
+                       "ambiguous": False, "runner_up": None}
+    (row,) = vrows(decisions)
+    assert (row["outcome"], row["status"], row["region"], row["normalized"], row["decided_by"]) == (
+        "kept", "valid", "US", "+12125550123", "trial")
+    assert f"phonenumbers {phone.pn_version()}" in row["reason"]
+
+
+def test_new_area_code_is_possible_and_kept_by_default(tmp_path: Path) -> None:
+    """The critical case: right length, a range the library doesn't know (yet)."""
+    matches, decisions = run_phone(tmp_path, "call 221-234-5678", possible_label="maybe_ph")
+    assert extra_of(matches, "status", "normalized", "region_source") == [
+        ("possible", "+12212345678", "default")]
+    assert matches[0].label == "maybe_ph"
+    assert vrows(decisions)[0]["outcome"] == "kept"
+
+
+@pytest.mark.parametrize("on_possible, text, kept", [
+    ("keep", "221-234-5678", True),
+    ("drop", "call 221-234-5678", False),
+    ("keep_if_score", "call 221-234-5678", True),     # total score 2 >= 1
+    ("keep_if_score", "221-234-5678", False),         # score 0 < 1
+])
+def test_on_possible(tmp_path: Path, on_possible: str, text: str, kept: bool) -> None:
+    pattern = {**phone_pattern(on_possible=on_possible), "keywords": {"call": 2}}
+    matches, decisions = run_phone(tmp_path, text, patterns=[pattern])
+    assert bool(matches) is kept
+    (row,) = vrows(decisions)
+    assert row["outcome"] == ("kept" if kept else "dropped")
+    if on_possible == "keep_if_score":
+        assert "possible_min_score 1" in row["reason"]
+
+
+@pytest.mark.parametrize("on_invalid, outcome", [("drop", "dropped"), ("keep_flagged", "kept_flagged")])
+def test_on_invalid(tmp_path: Path, on_invalid: str, outcome: str) -> None:
+    matches, decisions = run_phone(tmp_path, "zip 94105-1234", on_invalid=on_invalid,
+                                   possible_label="maybe_ph")
+    (row,) = vrows(decisions)
+    assert (row["outcome"], row["status"], row["normalized"]) == (outcome, "impossible", "94105-1234")
+    assert "TOO_SHORT" in row["reason"]
+    if outcome == "dropped":
+        assert matches == []
+    else:
+        assert [(m.label, m.extra["status"]) for m in matches] == [("maybe_ph", "impossible")]
+
+
+def test_local_only_number_keeps_raw_value(tmp_path: Path) -> None:
+    matches, _ = run_phone(tmp_path, "dial 555-1234")
+    assert extra_of(matches, "status", "normalized") == [("possible", "555-1234")]
+
+
+def test_invalid_phone_drops_before_overlap(tmp_path: Path) -> None:
+    """A dropped phone never competes, so the account number wins without an overlap row."""
+    patterns = [phone_pattern(on_possible="drop"),
+                {"label": "account", "priority": 9, "regex": r"\b\d{10}\b"}]
+    matches, decisions = run_phone(tmp_path, "ref 0123456789", patterns=patterns)
+    assert [(m.label, m.text) for m in matches] == [("account", "0123456789")]
+    assert [d["kind"] for d in decisions] == ["validation"]
+
+
+def test_span_refinement_trims_and_splits(tmp_path: Path) -> None:
+    matches, _ = run_phone(tmp_path, "call 212-555-0123 2026 renewal")
+    assert [(m.text, m.start, m.end) for m in matches] == [("212-555-0123", 5, 17)]
+    matches, _ = run_phone(tmp_path, "call 212-555-0123 or 212-555-0199")
+    assert [m.text for m in matches] == ["212-555-0123", "212-555-0199"]
+
+
+def test_span_refinement_scores_the_trimmed_span(tmp_path: Path) -> None:
+    """Refined candidates are scored at their own span (digits are not words,
+    so "renewal" is the first word after the number)."""
+    pattern = {**phone_pattern(), "keywords": {"renewal": 2}}
+    (m,) = run_phone(tmp_path, "212-555-0123 2026 renewal", patterns=[pattern])[0]
+    assert (m.text, m.end) == ("212-555-0123", 12) and m.score == pytest.approx(2.0)
+
+
+def test_matcher_finding_nothing_keeps_the_raw_span(tmp_path: Path) -> None:
+    """PhoneNumberMatcher finds nothing in "94105-1234"; the hit is still
+    checked and logged, never silently lost."""
+    matches, decisions = run_phone(tmp_path, "zip 94105-1234", on_invalid="keep_flagged")
+    assert [m.text for m in matches] == ["94105-1234"]
+    assert vrows(decisions)[0]["a_text"] == "94105-1234"
+
+
+def test_timestamp_is_not_a_phone_in_the_real_config() -> None:
+    matches = matches_of("logged 2026-03-14 10:00", REAL_CFG)
+    assert {m.label for m in matches} == {"timestamp", "date"}
+
+
+def test_source_number(tmp_path: Path) -> None:
+    matches, _ = run_phone(tmp_path, "tel +44 20 7946 0018", regions={"IN": {"tel": 5}})
+    assert extra_of(matches, "region", "region_source", "normalized") == [
+        ("GB", "number", "+442079460018")]
+
+
+def test_source_caller(tmp_path: Path) -> None:
+    matches, _ = run_phone(tmp_path, "office 020 7946 0018", region="gb")
+    assert extra_of(matches, "region", "region_source", "status") == [("GB", "caller", "valid")]
+    # Without the caller region the UK national number is impossible in the US.
+    assert run_phone(tmp_path, "office 020 7946 0018")[0] == []
+
+
+def test_caller_region_that_does_not_fit_falls_through(tmp_path: Path) -> None:
+    """212-555-0123 is only possible in GB; the valid US reading wins.
+    (A caller region where it is valid, e.g. DE, would win: the caller is trusted.)"""
+    matches, decisions = run_phone(tmp_path, "call 212-555-0123", region="GB")
+    assert extra_of(matches, "region", "region_source", "runner_up") == [("US", "trial", "GB")]
+    assert "caller GB only possible" in vrows(decisions)[0]["reason"]
+    matches, _ = run_phone(tmp_path, "call 212-555-0123", region="DE")
+    assert extra_of(matches, "region", "region_source") == [("DE", "caller")]
+
+
+def test_unknown_caller_region_is_an_error(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="region: unknown region 'XQ'"):
+        run_phone(tmp_path, "call 212-555-0123", region="XQ")
+
+
+UK_INDIA = {"GB": {"uk": 3, "london": 2}, "IN": {"india": 3}}
+
+
+def test_source_keyword_validity_decides(tmp_path: Path) -> None:
+    """'our UK office called India at ...': the number is valid only in IN."""
+    matches, decisions = run_phone(tmp_path, "our UK office called India at 98765 43210",
+                                   regions=UK_INDIA)
+    assert extra_of(matches, "region", "region_source", "normalized", "ambiguous") == [
+        ("IN", "keyword", "+919876543210", False)]
+    assert "'india' 2 words away" in vrows(decisions)[0]["reason"]
+
+
+FR_NL = {"FR": {"paris": 2}, "NL": {"amsterdam": 2}}
+
+
+def test_source_proximity_nearer_hint_wins(tmp_path: Path) -> None:
+    """06 12 34 56 78 is valid in both FR and NL: the nearer hint word decides."""
+    text = "amsterdam desk forwarded paris office 06 12 34 56 78"
+    matches, decisions = run_phone(tmp_path, text, regions=FR_NL)
+    assert extra_of(matches, "region", "region_source", "ambiguous", "runner_up", "normalized") == [
+        ("FR", "proximity", True, "NL", "+33612345678")]
+    reason = vrows(decisions)[0]["reason"]
+    assert "valid in FR and NL; FR chosen: 'paris' 2 words away vs 'amsterdam' 5 words away" in reason
+
+
+def test_text_hint_beats_context_hint(tmp_path: Path) -> None:
+    text = "amsterdam desk forwarded it: 06 12 34 56 78"
+    matches, _ = run_phone(tmp_path, ("paris", text), regions=FR_NL)
+    assert extra_of(matches, "region", "region_source") == [("NL", "proximity")]
+
+
+@pytest.mark.parametrize("region_from, region", [("text", "NL"), ("context", "FR"), ("both", "NL")])
+def test_region_from(tmp_path: Path, region_from: str, region: str) -> None:
+    matches, _ = run_phone(tmp_path, ("paris", "amsterdam 06 12 34 56 78"),
+                           regions=FR_NL, region_from=region_from)
+    assert extra_of(matches, "region") == [(region,)]
+
+
+@pytest.mark.parametrize("on_ambiguous, outcome", [
+    ("first", "kept"), ("drop", "dropped"), ("keep_flagged", "kept_flagged")])
+def test_exact_proximity_tie_uses_on_ambiguous(
+    tmp_path: Path, on_ambiguous: str, outcome: str
+) -> None:
+    matches, decisions = run_phone(tmp_path, "paris 06 12 34 56 78 amsterdam",
+                                   regions=FR_NL, on_ambiguous=on_ambiguous)
+    (row,) = vrows(decisions)
+    assert (row["outcome"], row["decided_by"]) == (outcome, "fallback")
+    assert "hint words equally near" in row["reason"]
+    assert len(matches) == (0 if outcome == "dropped" else 1)
+
+
+def test_possible_hint_yields_to_valid_trial(tmp_path: Path) -> None:
+    """A hint word cannot turn a valid home number into a merely possible foreign one."""
+    matches, decisions = run_phone(tmp_path, ("london", "phone 416-555-0123"), regions=UK_INDIA)
+    assert extra_of(matches, "region", "region_source", "status", "runner_up") == [
+        ("CA", "trial", "valid", "GB")]
+    assert "keyword GB only possible" in vrows(decisions)[0]["reason"]
+
+
+def test_nanp_regions_are_not_ambiguous(tmp_path: Path) -> None:
+    matches, _ = run_phone(tmp_path, "call 416-555-0123", try_regions=["US", "CA"])
+    assert extra_of(matches, "region", "region_source", "ambiguous") == [("CA", "trial", False)]
+
+
+def test_trial_collision_is_ambiguous(tmp_path: Path) -> None:
+    matches, decisions = run_phone(tmp_path, "call 0612345678", default_region="FR",
+                                   try_regions=["FR", "NL"])
+    assert extra_of(matches, "region", "region_source", "ambiguous", "runner_up") == [
+        ("FR", "fallback", True, "NL")]
+    assert vrows(decisions)[0]["outcome"] == "kept"         # on_ambiguous: first
+
+
+def test_home_possible_number_is_not_replaced_by_a_foreign_valid_one(tmp_path: Path) -> None:
+    """555-123-4567 is possible in the US and valid in GB. The grouping 3-3-4
+    matches the US format, so the US reading wins (source format), with GB
+    logged as the runner-up."""
+    matches, _ = run_phone(tmp_path, "call 555-123-4567", try_regions=["US", "GB"])
+    assert extra_of(matches, "region", "status", "region_source", "runner_up") == [
+        ("US", "possible", "format", "GB")]
+
+
+def test_trial_finds_a_region_listed_after_the_default(tmp_path: Path) -> None:
+    matches, _ = run_phone(tmp_path, "office 020 7946 0018", try_regions=["US", "GB"])
+    assert extra_of(matches, "region", "region_source", "normalized") == [
+        ("GB", "trial", "+442079460018")]
+
+
+@pytest.mark.parametrize("fmt, value", [
+    ("E164", "+12125550123"), ("INTERNATIONAL", "+1 212-555-0123"), ("NATIONAL", "(212) 555-0123")])
+def test_output_format(tmp_path: Path, fmt: str, value: str) -> None:
+    matches, _ = run_phone(tmp_path, "212.555.0123", output_format=fmt)
+    assert extra_of(matches, "normalized") == [(value,)]
+
+
+def test_coexist_covers_possible_label(tmp_path: Path) -> None:
+    patterns = [phone_pattern(possible_label="maybe_ph"),
+                {"label": "digits", "priority": 2, "regex": r"\d{3}-\d{4}"}]
+    cfg = make_cfg(tmp_path, patterns, coexist=[["ph", "digits"]])
+    assert frozenset({"maybe_ph", "digits"}) in cfg.coexist
+    matches, _ = extract("call 221-234-5678", cfg)
+    assert sorted(m.label for m in matches) == ["digits", "maybe_ph"]
+
+
+def test_possible_label_match_is_not_a_miss(tmp_path: Path) -> None:
+    pattern = {**phone_pattern(possible_label="maybe_ph"), "context": {"call": 1}}
+    matches, decisions = run_phone(tmp_path, ("call", "221-234-5678"), patterns=[pattern])
+    assert [m.label for m in matches] == ["maybe_ph"]
+    assert not [d for d in decisions if d["kind"] == "miss"]
+
+
+def test_validation_drop_counts_as_dropped_in_miss_row(tmp_path: Path) -> None:
+    pattern = {**phone_pattern(on_possible="drop"), "context": {"call": 1}}
+    _, decisions = run_phone(tmp_path, ("call", "221-234-5678"), patterns=[pattern])
+    (miss,) = [d for d in decisions if d["kind"] == "miss"]
+    assert miss["outcome"] == "candidates_dropped"
+
+
+def test_extra_in_cli_json_and_region_flag(capsys: pytest.CaptureFixture[str]) -> None:
+    import json
+
+    assert main(["--config", str(CONFIG_PATH), "--region", "GB",
+                 "--text", "office 020 7946 0018"]) == 0
+    (out,) = json.loads(capsys.readouterr().out)
+    assert (out["label"], out["extra"]["normalized"], out["extra"]["region_source"]) == (
+        "phone_number", "+442079460018", "caller")
+    assert main(["--config", str(CONFIG_PATH), "--region", "XQ", "--text", "x"]) == 2
+    assert "unknown region 'XQ'" in capsys.readouterr().err
+
+
+def test_validation_rows_in_report_and_summary(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, [phone_pattern(possible_label="maybe_ph", regions=FR_NL)])
+    reset_report()
+    with open_report() as write:
+        for i, text in enumerate(["call 221-234-5678", "call 221-234-9999", "call 221-555-0000",
+                                  "zip 94105-1234", "call 212-555-0123",
+                                  "paris 06 12 34 56 78 amsterdam"]):
+            write(extract(text, cfg, source=f"r{i}")[1])
+    rows = {r["label"]: r for r in summarize_validation()}
+    maybe, ph = rows["maybe_ph"], rows["ph"]
+    assert (maybe["checked"], maybe["possible"], maybe["impossible"], maybe["dropped"]) == (4, 3, 1, 1)
+    assert maybe["clusters"] == "+1 221 x3"
+    assert summarize.HINT_STALE in maybe["hint"]
+    assert (ph["valid"], ph["ambiguous"]) == (2, 1)
+    assert summarize.HINT_AMBIGUOUS in ph["hint"]
+    assert 'r5: "06 12 34 56 78"' in ph["examples"]
+    assert format_validation(list(rows.values())).splitlines()[0].split() == list(
+        summarize.VALIDATION_FIELDS)
+
+
+def test_summarize_cli_prints_validation_table(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_report_csv(extract("call 212-555-0123", REAL_CFG)[1])
+    assert main(["--summarize"]) == 0
+    out = capsys.readouterr().out
+    assert "label" in out and "checked" in out and "phone_number" in out
+
+
+def test_report_phone_columns_sit_before_decided_by() -> None:
+    assert REPORT_FIELDS[-4:] == ("status", "region", "normalized", "decided_by")
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("212-555-0123 212-555-0199", ["212-555-0123", "212-555-0199"]),
+    ("2125550123 2125550199", ["2125550123", "2125550199"]),
+    ("(212) 555-0123 (212) 555-0199", ["(212) 555-0123", "(212) 555-0199"]),
+    ("555-1234 555-5678", ["555-1234", "555-5678"]),
+    ("212-555-0123, 212-555-0199", ["212-555-0123", "212-555-0199"]),
+])
+def test_back_to_back_numbers_are_all_found(tmp_path: Path, text: str, expected: list[str]) -> None:
+    """A greedy hit can run into the next number; the scan resumes where the
+    refined number ended, so the next one is still found whole."""
+    matches, _ = run_phone(tmp_path, text)
+    assert [m.text for m in matches] == expected

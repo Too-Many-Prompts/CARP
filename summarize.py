@@ -4,6 +4,8 @@
     print(format_summary(rows))            # the overlap table `extract.py --summarize` prints
     misses = summarize_misses()            # list of dicts, most misses first
     print(format_misses(misses))           # the miss table printed under it
+    checks = summarize_validation()        # phone validation, one row per label
+    print(format_validation(checks))       # printed last, if there are any
 
 The overlap table shows which label pairs overlap most often without being
 resolved by score. The miss table shows which labels the context pointed to
@@ -24,6 +26,7 @@ DEFAULT_REPORT_PATH = "extract_report.csv"
 COLUMNS_USED = (
     "file", "kind", "a_label", "a_text", "a_start", "a_end",
     "b_label", "b_text", "b_start", "b_end", "decided_by", "outcome",
+    "status", "normalized",
 )
 
 SUMMARY_CRITERIA = ("score", "length", "priority", "start_label")
@@ -39,6 +42,16 @@ HINT_PARTIAL = "if both values are valid, add to coexist"
 MISS_FIELDS = ("label", "misses", "no_candidates", "dropped", "examples", "hint")
 HINT_MISS_REGEX = "the regex found nothing; check the regex against these inputs"
 HINT_MISS_TUNING = "candidates lost; raise their nearby/context weights or check min_score"
+VALIDATION_FIELDS = (
+    "label", "checked", "valid", "possible", "impossible", "dropped", "ambiguous",
+    "sources", "clusters", "examples", "hint",
+)
+_AMBIGUOUS_SOURCES = ("proximity", "format", "fallback")
+_CLUSTER_MIN = 3        # possible numbers sharing leading digits before the hint shows
+HINT_STALE = ("many possible numbers share these digits; phonenumbers metadata "
+              "may be stale, upgrade it")
+HINT_AMBIGUOUS = "ambiguous regions; add region hint words or pass region="
+HINT_IMPOSSIBLE = "many impossible; tighten the regex or add try_regions"
 
 
 @dataclass
@@ -195,3 +208,80 @@ def summarize_misses(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]]:
 def format_misses(rows: list[dict[str, Any]]) -> str:
     """The miss summary as an aligned plain-text table (one line per label)."""
     return _format_table(MISS_FIELDS, rows)
+
+
+def _cluster_key(normalized: str) -> str | None:
+    """Leading digits of a full number: the area code for +1, else the first
+    four digits after +. None for raw (local or unparsed) values."""
+    if not normalized.startswith("+"):
+        return None
+    digits = "".join(ch for ch in normalized if ch.isdigit())
+    if digits.startswith("1") and len(digits) > 4:
+        return f"+1 {digits[1:4]}"
+    return f"+{digits[:4]}"
+
+
+def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]]:
+    """Count a report CSV's `validation` rows (phone patterns) per label.
+
+    Per label: counts by status, dropped, ambiguous (region chosen by
+    proximity, format or fallback), counts by region source (`decided_by`),
+    `possible` numbers grouped by leading digits (a cluster of possible
+    numbers sharing an area code suggests the library's metadata is stale),
+    up to three examples of ambiguous or dropped rows, and a hint. Sorted by
+    rows checked (highest first), then label.
+    """
+    stats: dict[str, dict[str, Any]] = {}
+    fh, reader = _open_report(path)
+    with fh:
+        for row in reader:
+            if row.get("kind") != "validation":
+                continue
+            st = stats.setdefault(row.get("a_label", ""), {
+                "status": Counter(), "sources": Counter(), "clusters": Counter(),
+                "dropped": 0, "ambiguous": 0, "examples": [],
+            })
+            status, source = row.get("status", ""), row.get("decided_by", "")
+            st["status"][status] += 1
+            st["sources"][source] += 1
+            dropped = row.get("outcome") == "dropped"
+            ambiguous = source in _AMBIGUOUS_SOURCES
+            st["dropped"] += dropped
+            st["ambiguous"] += ambiguous
+            if status == "possible":
+                key = _cluster_key(row.get("normalized", ""))
+                if key:
+                    st["clusters"][key] += 1
+            if (dropped or ambiguous) and len(st["examples"]) < _MAX_EXAMPLES:
+                st["examples"].append(f'{row.get("file") or "(no id)"}: "{row.get("a_text", "")}"')
+
+    out: list[dict[str, Any]] = []
+    for label, st in stats.items():
+        checked = sum(st["status"].values())
+        clusters = sorted(st["clusters"].items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+        hints = []
+        if clusters and clusters[0][1] >= _CLUSTER_MIN:
+            hints.append(HINT_STALE)
+        if st["ambiguous"]:
+            hints.append(HINT_AMBIGUOUS)
+        if st["status"]["impossible"] * 2 > checked:
+            hints.append(HINT_IMPOSSIBLE)
+        sources = sorted(st["sources"].items(), key=lambda kv: (-kv[1], kv[0]))
+        out.append({
+            "label": label,
+            "checked": checked,
+            **{s: st["status"][s] for s in ("valid", "possible", "impossible")},
+            "dropped": st["dropped"],
+            "ambiguous": st["ambiguous"],
+            "sources": "; ".join(f"{k} {n}" for k, n in sources),
+            "clusters": "; ".join(f"{k} x{n}" for k, n in clusters),
+            "examples": " | ".join(st["examples"]),
+            "hint": "; ".join(hints) or "ok",
+        })
+    out.sort(key=lambda r: (-r["checked"], r["label"]))
+    return out
+
+
+def format_validation(rows: list[dict[str, Any]]) -> str:
+    """The validation summary as an aligned plain-text table (one line per label)."""
+    return _format_table(VALIDATION_FIELDS, rows)

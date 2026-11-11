@@ -323,7 +323,8 @@ def pick_region(
     caller region or keyword never turns a fitting number into a loss.
     1. number: a leading "+" sets the country (00 / 011 prefixes are
        handled by parse() in the regions below, per their own IDD).
-    2. caller: extract(..., region=).
+    2. caller: extract(..., region=). Like a keyword hint (3), a caller
+       region where the number is only possible yields to a valid trial.
     3. keyword: hinted regions (score > 0), valid before possible, then the
        nearest hint word; a valid tie between different numbers is
        `proximity` (decided by distance) or `fallback` (exact tie). A hint
@@ -336,27 +337,30 @@ def pick_region(
         c = check(raw, None)
         return _result(raw, c, "number", spec, detail=c.why)
 
+    # The caller region, else the keyword hints. A hint that is only
+    # "possible" waits: a valid trial result (step 4) beats it.
+    hint: Result | None = None
     if caller:
         c = check(raw, caller)
         if c.status != "impossible":
-            return _result(raw, c, "caller", spec)
+            hint = _result(raw, c, "caller", spec)
+    if hint is None:
+        hinted = [h for h in hints if h.score > 0]
+        hint = _by_keyword(raw, spec, hinted) if hinted else None
+    if hint is not None and hint.status == "valid":
+        return hint
 
-    hinted = [h for h in hints if h.score > 0]
-    by_kw = _by_keyword(raw, spec, hinted) if hinted else None
-    if by_kw is not None and by_kw.status == "valid":
-        return by_kw
-
-    # A hint that only gives "possible" yields to a valid trial result.
     checks = [check(raw, r) for r in spec.try_regions]
     decided = _by_trial(raw, spec, checks)
     if decided is not None:
-        if by_kw is not None:
-            decided.runner_up = decided.runner_up or by_kw.region
+        if hint is not None:
+            decided.runner_up = decided.runner_up or hint.region
+            why = f" ({hint.detail})" if hint.detail else ""
             decided.detail = "; ".join(filter(None, (
-                decided.detail, f"hint {by_kw.region} only possible ({by_kw.detail})")))
+                decided.detail, f"{hint.source} {hint.region} only possible{why}")))
         return decided
-    if by_kw is not None:
-        return by_kw
+    if hint is not None:
+        return hint
 
     default = next(c for c in checks if c.region == spec.default_region)
     if default.status != "impossible":

@@ -9,8 +9,13 @@ Library use:
 
 extract() writes no files; the caller decides what to do with `decisions`
 (flat dicts, columns REPORT_FIELDS). Optional helpers: write_report_csv(),
-open_report(), reset_report(), summarize_overlaps() / format_summary() and
-summarize_misses() / format_misses() (defined in summarize.py).
+open_report(), reset_report(), summarize_overlaps() / format_summary(),
+summarize_misses() / format_misses() and summarize_validation() /
+format_validation() (defined in summarize.py).
+
+Phone numbers: a pattern with a `validate:` block is checked with the
+phonenumbers library (phone.py); its matches carry `extra` (normalized
+number, region, status, ...).
 
 Scoring: every pattern runs on the text. A candidate's score is
     text_score    (its `nearby` + `keywords` words in the text window)
@@ -19,7 +24,7 @@ Scoring: every pattern runs on the text. A candidate's score is
 
 CLI (one text per run; for many texts use the library):
     extract.py --config extraction_config.yaml [--text TEXT | < stdin]
-               [--context TEXT] [--report]
+               [--context TEXT] [--region CODE] [--report]
     extract.py --summarize [PATH]
 Prints the matches as a JSON list. Nothing is written unless asked:
     --report     ./extract_report.csv  one row per decision (overwritten)
@@ -49,8 +54,10 @@ from summarize import (
     DEFAULT_REPORT_PATH,
     format_misses,
     format_summary,
+    format_validation,
     summarize_misses,
     summarize_overlaps,
+    summarize_validation,
 )
 
 TIEBREAK_NAMES = ("score", "length", "priority")
@@ -668,33 +675,43 @@ def _region_hints(
     return hints
 
 
-def _refine(
-    text: str, cands: list[Candidate], by_label: dict[str, Pattern],
-    ctx_hints: dict[str, dict[str, _Side]], settings: dict[str, Any],
-    caller: str | None,
+def _find_validated(
+    text: str, pattern: Pattern, ctx: dict[str, _Side],
+    settings: dict[str, Any], caller: str | None,
 ) -> list[Candidate]:
-    """Trim or split each validated regex hit with PhoneNumberMatcher.
+    """Candidates of a pattern with `validate`: its regex hits, each trimmed
+    or split by PhoneNumberMatcher (POSSIBLE leniency).
 
     The matcher runs in the caller's region, else the top keyword region,
-    else default_region. If it finds nothing, the raw hit is kept as it is,
-    so validation (not this step) decides its fate and logs it."""
+    else default_region. The regex scan resumes where the last refined
+    number ended, not where the regex hit ended: a greedy hit that ran into
+    the next number ("212-555-0123 212-555") would otherwise lose it. If the
+    matcher finds nothing, the raw hit is kept as it is, so validation (not
+    this step) decides its fate and logs it.
+    """
+    spec = pattern.validate
+    assert spec is not None
     out: list[Candidate] = []
-    for c in cands:
-        spec = by_label[c.label].validate
-        if spec is None:
-            out.append(c)
+    pos = 0
+    while pos <= len(text):
+        m = pattern.regex.search(text, pos)
+        if m is None:
+            break
+        if m.end() == m.start():
+            pos = m.end() + 1          # empty matches carry no text to extract
             continue
-        hints = _region_hints(text, c.start, c.end, spec, ctx_hints[c.label], settings)
+        hints = _region_hints(text, m.start(), m.end(), spec, ctx, settings)
         top = max((h for h in hints if h.score > 0), key=lambda h: h.score, default=None)
         region = caller or (top.region if top else spec.default_region)
-        spans = phone.refine_spans(c.text, region)
+        spans = phone.refine_spans(m.group(0), region)
         if not spans:
-            out.append(c)
+            out.append(Candidate(pattern.label, m.start(), m.end(), m.group(0), pattern.priority))
+            pos = m.end()
             continue
         for s, e in spans:
-            start, end = c.start + s, c.start + e
-            out.append(Candidate(c.label, start, end, text[start:end], c.priority))
-    out.sort(key=lambda c: (c.start, c.end, c.label))
+            a, b = m.start() + s, m.start() + e
+            out.append(Candidate(pattern.label, a, b, text[a:b], pattern.priority))
+        pos = m.start() + spans[-1][1]
     return out
 
 
@@ -917,9 +934,11 @@ def extract(
         for p in cfg.patterns if p.validate
     }
 
-    cands = find_candidates(text, cfg.patterns)
-    if ctx_hints:
-        cands = _refine(text, cands, by_label, ctx_hints, cfg.settings, caller)
+    cands = find_candidates(text, [p for p in cfg.patterns if not p.validate])
+    for p in cfg.patterns:
+        if p.validate:
+            cands += _find_validated(text, p, ctx_hints[p.label], cfg.settings, caller)
+    cands.sort(key=lambda c: (c.start, c.end, c.label))
     for c in cands:
         c.text_score = score_candidate(text, c, by_label[c.label], cfg.settings)
         c.context_score = ctx_scores[c.label][0]
@@ -981,6 +1000,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             rows = summarize_overlaps(args.summarize)
             misses = summarize_misses(args.summarize)
+            checks = summarize_validation(args.summarize)
         except (ValueError, OSError, csv.Error) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
@@ -988,6 +1008,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if misses:
             print()
             print(format_misses(misses))
+        if checks:
+            print()
+            print(format_validation(checks))
         return 0
     if args.config is None:
         parser.error("the following arguments are required: --config (unless --summarize)")
