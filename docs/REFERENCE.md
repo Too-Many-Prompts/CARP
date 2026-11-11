@@ -370,8 +370,9 @@ Questions the report answers:
 
 1. **Load**: read the YAML and compile each regex once (IGNORECASE unless
    `case_sensitive`). An invalid regex fails with a message naming its label.
-   Bad keywords and old-format keys fail too (see [Keywords](#keywords) and
-   [Migrating](#migrating-from-the-old-context-rules)).
+   Bad keywords, unknown keys and unknown values fail too, each with a
+   message naming the pattern and key (see [Keywords](#keywords) and
+   [Config options](#config-options)).
 2. **Normalize** the text (and context): collapse whitespace, unicode dashes to
    `-`, smart quotes to ASCII, each only if enabled.
 3. **Find candidates**: every pattern runs on the text, each separately with
@@ -558,28 +559,6 @@ A list of cases that `pytest` runs against the config:
 | `text` | required | The text to scan. |
 | `context` | optional | The context string passed with the text. |
 | `expect` | required | The exact matches, each `{label, text}`, in any order. An empty list means "no matches". |
-
-### Migrating from the old context rules
-
-The context used to select which patterns run (`context.positive`) and break
-ties (`context.penalize`, `context_penalty`). Now every pattern runs and the
-context adds to the score. Old configs do not load; `load_config` says what
-to change:
-
-| Old | New |
-| --- | --- |
-| `context.positive: [word, ...]` | `context: {word: weight}` (pick a weight) |
-| `context.penalize: {word: -w}` | `context: {word: -w}` (now lowers the score) |
-| `context.negative`, `context.positive: {...}` | same as above |
-| `context_penalty` / `context_negative` in `overlap_tiebreak` | remove it |
-
-A `keywords` map keeps working unchanged; its words now also score in the
-context, with the same weights.
-
-Results change in one visible way: a context no longer excludes patterns,
-so matches that do not overlap anything are kept whatever the context says.
-To drop a label from a context, give it a negative weight large enough to push
-its candidates below `min_score`.
 
 ## Phone numbers
 
@@ -859,10 +838,10 @@ regions, clusters, examples, hint`.
 and non-coexist overlaps, tie-breaks (including an empty list), text and
 context scoring (decay, phrases, no window on the context, text/context
 parity), `keywords` reaching both sources, `context_direction`, `stop_at`,
-keyword validation and old-format errors, `decided_by`, `miss` rows, the
+keyword validation, `decided_by`, `miss` rows, the
 report CSV and its score breakdown, the summaries, the CLI, and the public API
 as shown in the README and this reference. Phone tests cover the `validate`
-load and migration errors, each status, every `keep`, `hint_conflict`
+load errors, each status, every `keep`, `hint_conflict`
 and `hint_fallback` mode, hints (including a hint that does not fit), `+`, `00` and
 `011`, span refinement and back-to-back numbers, readings competing with
 other patterns, `coexist` and misses through `pattern`, every `output_format`, the report

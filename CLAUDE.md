@@ -87,9 +87,9 @@ string, and resolves overlapping matches.
 - Keywords are ASCII letters only (matching `words.py`); `load_config` rejects
   digit/accented keywords, duplicate keywords within a key (also spelled
   differently, e.g. "amount-due" / "amount due") and non-numeric weights.
-- Old formats fail to load with a message naming the migration: `context`
-  with `positive`/`penalize`/`negative` sub-keys, and `context_penalty` or
-  `context_negative` in `overlap_tiebreak`.
+- Only the current config format is supported (single user): no checks or
+  messages for earlier formats. Unknown keys and values fail with the list of
+  allowed ones.
 
 ## Phone validation (`validate:` block)
 - Keys:
@@ -102,11 +102,7 @@ string, and resolves overlapping matches.
   - `hint_fallback` (if_not_valid | if_nothing | always | never);
   - `output_format` (E164 | INTERNATIONAL | NATIONAL | RAW): the match `text`.
 
-  The earlier keys (`default_region`, `try_regions`, `possible_label`,
-  `on_*`, `possible_min_score`, `region_from`, `readings` (now `keep`),
-  `regions` as a map) fail with a migration message, and so do the renamed
-  values (`valid_and_home`, hint_fallback `not_valid` / `impossible`;
-  `phone.RENAMED_VALUES`).
+  An unknown key or value fails, naming the allowed ones.
 - Never lose a hit silently: every validated regex hit ends up as matches or
   a `dropped` row with a reason (which includes the phonenumbers version).
 - `coexist`, miss rows and `summarize_validation` use
@@ -136,12 +132,12 @@ string, and resolves overlapping matches.
   A test case may include an optional `context` string (and `name`), which is
   passed to `extract()` along with `text`. Tests unpack `matches, _ = extract(...)`.
 - Also unit-test: coexist overlap, non-coexist overlap, length tie-break,
-  empty `overlap_tiebreak`, multi-word keywords, invalid regex, old-format
-  errors, context scoring (decay from the right, no window, phrases),
+  empty `overlap_tiebreak`, multi-word keywords, invalid regex,
+  context scoring (decay from the right, no window, phrases),
   `keywords` reaching both sources, `nearby`-only and `context`-only words,
   `miss` rows, the score breakdown, every `decided_by` value,
   `summarize_overlaps`, `summarize_misses` and `--summarize`, and the public
-  API as the README shows it. Phone: `validate` load and migration errors,
+  API as the README shows it. Phone: `validate` load errors,
   each status, every `keep`, `hint_conflict` and `hint_fallback` mode, hints
   (including misfits), `+`/`00`/`011`, span refinement and back-to-back
   numbers, readings vs other patterns, coexist/misses via `pattern`, every `output_format`,

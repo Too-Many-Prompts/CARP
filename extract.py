@@ -88,7 +88,6 @@ REQUIRED_SETTINGS = (
     "case_sensitive",
     "overlap_tiebreak",
 )
-OLD_CONTEXT_KEYS = ("positive", "penalize", "negative")
 
 # extract() accepts: plain text, {"text": ..., "context": ...}, or (context, text).
 ExtractInput = Union[str, dict, tuple]
@@ -283,31 +282,11 @@ def _weight_map(label: str, key_name: str, raw: Any) -> dict[str, float]:
     return out
 
 
-def _check_old_context(label: str, raw: Any) -> None:
-    """Fail on the old `context: {positive, penalize, negative}` shape.
-
-    Decided by the value, not just the key: `negative: -2` is a valid new
-    keyword ("negative balance"); a list, map or blank value is the old shape."""
-    if not isinstance(raw, dict):
-        return
-    old = [k for k in OLD_CONTEXT_KEYS
-           if k in raw and (raw[k] is None or isinstance(raw[k], (list, dict)))]
-    if old:
-        raise ValueError(
-            f"pattern '{label}': `context.{old[0]}` is the old format. Patterns no "
-            "longer select or penalize; `context` is now a map of word: signed "
-            "weight added to the score when the word is in the context string "
-            "(e.g. context: {acct: 3, phone: -2}). Use `keywords` for words that "
-            "should count in both the text and the context."
-        )
-
-
 def _load_keywords(
     label: str, entry: dict[str, Any]
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Return (nearby, context) weight maps for one pattern: the explicit
     keys merged with the `keywords` shorthand, which goes into both."""
-    _check_old_context(label, entry.get("context"))
     nearby = _weight_map(label, "nearby", entry.get("nearby"))
     context = _weight_map(label, "context", entry.get("context"))
     shorthand = _weight_map(label, "keywords", entry.get("keywords"))
@@ -336,11 +315,6 @@ def load_config(path: str | Path) -> Config:
     # A blank `overlap_tiebreak:` (None) means "no criteria", same as [].
     settings["overlap_tiebreak"] = settings["overlap_tiebreak"] or []
     for name in settings["overlap_tiebreak"]:
-        if name in ("context_penalty", "context_negative"):
-            raise ValueError(
-                f"settings.overlap_tiebreak: `{name}` was removed; the context now "
-                "adds to `score` (pattern `context` / `keywords` weights). Remove it."
-            )
         if name not in TIEBREAK_NAMES:
             raise ValueError(
                 f"settings.overlap_tiebreak: unknown criterion '{name}' "

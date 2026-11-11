@@ -69,9 +69,9 @@ to the report format.
 
 ## context-scoring (merged, `9e841c1`)
 
-1. **Old configs fail to load** with a `ValueError` naming the fix:
-   `context: {positive|penalize|negative: <list or map>}`, and `context_penalty`
-   or `context_negative` in `overlap_tiebreak`. Now `context: {word: weight}`
+1. **Old configs fail to load** (`ValueError`): `context` with
+   `positive` / `penalize` / `negative` lists, and `context_penalty` or
+   `context_negative` in `overlap_tiebreak`. Now `context: {word: weight}`
    adds to the score; `overlap_tiebreak` takes `score`, `length`, `priority`.
 2. **A context no longer excludes patterns** (every pattern always runs;
    `score = text_score + context_score`). Matches that overlap nothing are kept

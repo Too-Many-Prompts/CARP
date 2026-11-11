@@ -40,23 +40,6 @@ CHOICES = {
 }
 DEFAULTS = {"keep": "valid_plus_home", "hint_conflict": "all", "hint_fallback": "if_not_valid",
             "output_format": "E164"}
-# Keys of the earlier validate design, with what replaces them.
-OLD_KEYS = {
-    "default_region": "list the regions in `regions: [US, ...]` (the first is the home region)",
-    "try_regions": "list the regions in `regions: [US, ...]` (the first is the home region)",
-    "possible_label": "labels are generated: valid_US_number, possible_US_number, ...",
-    "on_invalid": "impossible numbers are always dropped and logged in the report",
-    "on_possible": "use `keep` (valid_plus_home | all | valid_else_possible | valid)",
-    "readings": "renamed to `keep` (valid_plus_home | all | valid_else_possible | valid)",
-    "on_ambiguous": "every reading is returned; use `hint_conflict: nearest` for hints",
-    "possible_min_score": "use settings.min_score",
-    "region_from": "hint words are read in the text window and the context, like keywords",
-}
-# Values renamed on this branch: the old spelling fails with the new one.
-RENAMED_VALUES = {
-    "keep": {"valid_and_home": "valid_plus_home"},
-    "hint_fallback": {"not_valid": "if_not_valid", "impossible": "if_nothing"},
-}
 STATUSES = ("valid", "possible", "impossible")
 SOURCES = ("number", "hint", "regions")   # decided_by of a validation row
 
@@ -115,14 +98,6 @@ def load_validate(label: str, raw: Any, weight_map: WeightMap) -> PhoneSpec:
     where = f"pattern '{label}': validate"
     if not isinstance(raw, dict):
         raise ValueError(f"{where} must be a map, got {type(raw).__name__}")
-    for key, instead in OLD_KEYS.items():
-        if key in raw:
-            raise ValueError(f"{where}.{key} was removed: {instead}")
-    if isinstance(raw.get("regions"), dict):
-        raise ValueError(
-            f"{where}.regions is now the list of regions to parse in; "
-            "move the region hint words to `hints: {GB: {uk: 3}}`"
-        )
     unknown = [k for k in raw if k not in VALIDATE_KEYS]
     if unknown:
         raise ValueError(f"{where}: unknown key '{unknown[0]}' (expected one of {', '.join(VALIDATE_KEYS)})")
@@ -149,9 +124,6 @@ def load_validate(label: str, raw: Any, weight_map: WeightMap) -> PhoneSpec:
     opts: dict[str, Any] = {}
     for key, choices in CHOICES.items():
         value = raw.get(key, DEFAULTS[key])
-        new = RENAMED_VALUES.get(key, {}).get(value) if isinstance(value, str) else None
-        if new:
-            raise ValueError(f"{where}.{key}: {value!r} was renamed to {new!r}")
         if value not in choices:
             raise ValueError(f"{where}.{key}: unknown value {value!r} (expected one of {', '.join(choices)})")
         opts[key] = value

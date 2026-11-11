@@ -583,57 +583,6 @@ def test_malformed_keyword_keys_are_rejected(
         make_cfg(tmp_path, _one(**{where: value}))
 
 
-# Old-format configs fail with a message that says what to change.
-OLD_CONTEXT_MSG = (
-    "Patterns no longer select or penalize; `context` is now a map of word: signed "
-    "weight added to the score when the word is in the context string "
-    "(e.g. context: {acct: 3, phone: -2}). Use `keywords` for words that "
-    "should count in both the text and the context."
-)
-
-
-@pytest.mark.parametrize(
-    "context, key",
-    [
-        ({"positive": ["phone"]}, "positive"),
-        ({"positive": {"phone": 3}}, "positive"),
-        ({"penalize": {"acct": -3}}, "penalize"),
-        ({"negative": {"acct": -3}}, "negative"),
-        ({"positive": None, "penalize": None}, "positive"),
-    ],
-)
-def test_old_context_shape_is_rejected(tmp_path: Path, context: Any, key: str) -> None:
-    with pytest.raises(ValueError) as exc:
-        make_cfg(tmp_path, _one(context=context))
-    assert str(exc.value) == f"pattern 'p': `context.{key}` is the old format. {OLD_CONTEXT_MSG}"
-
-
-def test_old_key_names_are_fine_as_new_keywords(tmp_path: Path) -> None:
-    p = _pat(make_cfg(tmp_path, _one(context={"negative": -2, "positive": 1, "penalize": -1})))
-    assert p.context == {"negative": -2.0, "positive": 1.0, "penalize": -1.0}
-
-
-@pytest.mark.parametrize("name", ["context_penalty", "context_negative"])
-def test_old_tiebreak_names_are_rejected(tmp_path: Path, name: str) -> None:
-    with pytest.raises(ValueError) as exc:
-        make_cfg(tmp_path, _one(), overlap_tiebreak=["score", name])
-    assert str(exc.value) == (
-        f"settings.overlap_tiebreak: `{name}` was removed; the context now adds to "
-        "`score` (pattern `context` / `keywords` weights). Remove it."
-    )
-
-
-def test_old_config_file_is_rejected(tmp_path: Path) -> None:
-    path = tmp_path / "old.yaml"
-    raw = CONFIG_PATH.read_text(encoding="utf-8").replace(
-        "keywords: {phone: 3, tel: 3, call: 2, mobile: 2, fax: 1, invoice: -2, account: -2, order: -1}",
-        "context:\n      positive: [phone]\n      penalize: {acct: -3}")
-    assert raw != CONFIG_PATH.read_text(encoding="utf-8")
-    path.write_text(raw, encoding="utf-8")
-    with pytest.raises(ValueError, match=r"pattern 'phone_number': `context.positive` is the old format"):
-        load_config(path)
-
-
 def test_hyphenated_keyword_matches_like_context_words(tmp_path: Path) -> None:
     # words.py splits on hyphens, so "e-mail" must be the two words e + mail.
     patterns = [{"label": "p", "priority": 1, "regex": r"\d+", "keywords": {"e-mail": 2}}]
@@ -1408,39 +1357,6 @@ def got(matches: list[Any]) -> list[tuple[str, str]]:
 def test_validate_load_errors(tmp_path: Path, validate: Any, message: str) -> None:
     pattern = {"label": "ph", "priority": 1, "regex": PHONE_RE, "validate": validate}
     with pytest.raises(ValueError, match=rf"pattern 'ph': .*{message}"):
-        make_cfg(tmp_path, [pattern])
-
-
-@pytest.mark.parametrize("key, value, hint", [
-    ("default_region", "US", "regions: \\[US, ...\\]"),
-    ("try_regions", ["US"], "regions: \\[US, ...\\]"),
-    ("possible_label", "x", "labels are generated"),
-    ("on_invalid", "drop", "always dropped and logged"),
-    ("on_possible", "keep", "use `keep`"),
-    ("readings", "all", "renamed to `keep`"),
-    ("on_ambiguous", "first", "hint_conflict: nearest"),
-    ("possible_min_score", 1, "settings.min_score"),
-    ("region_from", "both", "text window and the context"),
-])
-def test_old_validate_keys_name_the_migration(tmp_path: Path, key: str, value: Any, hint: str) -> None:
-    with pytest.raises(ValueError, match=rf"validate.{key} was removed: .*{hint}"):
-        make_cfg(tmp_path, [phone_pattern(**{key: value})])
-
-
-@pytest.mark.parametrize("key, old, new", [
-    ("keep", "valid_and_home", "valid_plus_home"),
-    ("hint_fallback", "not_valid", "if_not_valid"),
-    ("hint_fallback", "impossible", "if_nothing"),
-])
-def test_renamed_values_name_the_new_value(tmp_path: Path, key: str, old: str, new: str) -> None:
-    with pytest.raises(ValueError, match=rf"validate.{key}: '{old}' was renamed to '{new}'"):
-        make_cfg(tmp_path, [phone_pattern(**{key: old})])
-
-
-def test_old_regions_map_points_to_hints(tmp_path: Path) -> None:
-    pattern = {"label": "ph", "priority": 1, "regex": PHONE_RE,
-               "validate": {"with": "phonenumbers", "regions": {"GB": {"uk": 3}}}}
-    with pytest.raises(ValueError, match="move the region hint words to `hints"):
         make_cfg(tmp_path, [pattern])
 
 
