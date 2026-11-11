@@ -40,12 +40,20 @@ patterns:
 
   - label: phone_number
     priority: 2
-    regex: |
-      (?x)                       # verbose mode: comments allowed
-      (?:\+?1[-.\s]?)?           # optional country code
-      \(?\d{3}\)?[-.\s]?         # area code
-      \d{3}[-.\s]?\d{4}\b
+    # Broad on purpose: the regex finds anything phone-shaped, `validate`
+    # checks it. Tighten it here if the summary shows many impossible rows.
+    regex: '\+?\(?\d[\d\s().-]{6,18}\d'
     keywords: {phone: 3, tel: 3, call: 2, mobile: 2, fax: 1, invoice: -2, account: -2, order: -1}
+    validate:                    # optional: check matches with the phonenumbers library
+      with: phonenumbers
+      default_region: US         # region for numbers without +country code
+      possible_label: possible_phone_number  # right length, not a known range (e.g. a new area code)
+      # try_regions: [US, GB]    # also try these when no hint word decides
+      # regions:                 # hint words, read like keywords (text window + context)
+      #   GB: {uk: 3, britain: 3, british: 2, england: 2, london: 2}
+      #   IN: {india: 3, indian: 2, mumbai: 2, delhi: 2}
+      # Defaults: on_invalid: drop, on_possible: keep, on_ambiguous: first,
+      # output_format: E164, region_from: both. See docs/REFERENCE.md.
 
   - label: account_number
     priority: 3
@@ -75,13 +83,13 @@ coexist:
 
 # Test cases the program must pass (run with: pytest)
 tests:
-  - text: "Please call 555-123-4567 about the order."
+  - text: "Please call 212-555-0123 about the order."
     expect:
-      - {label: phone_number, text: "555-123-4567"}
+      - {label: phone_number, text: "212-555-0123"}
 
-  - text: "Acct 5551234567 is overdue."
+  - text: "Acct 2125550123 is overdue."
     expect:
-      - {label: account_number, text: "5551234567"}
+      - {label: account_number, text: "2125550123"}
 
   - text: "Invoice INV-004521 dated 03/14/2026, amount due $1,250.00"
     expect:
@@ -97,31 +105,31 @@ tests:
   # Optional `context` per case: its words add to the score of every pattern
   # that lists them. All patterns still run on the text.
   - name: without context the 10-digit number reads as a phone (call is next to it)
-    text: "5551234567 call"
+    text: "2125550123 call"
     expect:
-      - {label: phone_number, text: "5551234567"}
+      - {label: phone_number, text: "2125550123"}
 
   - name: context "account" flips the same overlap (account +3, phone -2)
     context: "account"
-    text: "5551234567 call"
+    text: "2125550123 call"
     expect:
-      - {label: account_number, text: "5551234567"}
+      - {label: account_number, text: "2125550123"}
 
   - name: context wins the overlap; the separate phone number is still found
     context: "Acct"
-    text: "Acct 5551234567 call 555-123-4567"
+    text: "Acct 2125550123 call 212-555-0123"
     expect:
-      - {label: account_number, text: "5551234567"}
-      - {label: phone_number, text: "555-123-4567"}
+      - {label: account_number, text: "2125550123"}
+      - {label: phone_number, text: "212-555-0123"}
 
   - name: context phrase adds to every pattern listing it; nothing is excluded
     context: "amount due"
-    text: "Invoice INV-004521 dated 03/14/2026, amount due $1,250.00 call 555-123-4567"
+    text: "Invoice INV-004521 dated 03/14/2026, amount due $1,250.00 call 212-555-0123"
     expect:
       - {label: invoice_number, text: "INV-004521"}
       - {label: date, text: "03/14/2026"}
       - {label: amount, text: "$1,250.00"}
-      - {label: phone_number, text: "555-123-4567"}
+      - {label: phone_number, text: "212-555-0123"}
 
   - name: context with no keyword hits changes nothing
     context: "nothing relevant here"

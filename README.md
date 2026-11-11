@@ -66,17 +66,17 @@ See [Scoring](docs/REFERENCE.md#scoring) and [Keywords](docs/REFERENCE.md#keywor
 
 ### Example: an overlap
 
-`5551234567` matches both `phone_number` and `account_number`:
+`2125550123` matches both `phone_number` and `account_number`:
 
 ```text
-text:     "acct 5551234567"
+text:     "acct 2125550123"
                 ^^^^^^^^^^
 candidates: account_number  score 3.0   ("acct" is next to it, weight 3)
             phone_number    score 0.0   (no phone words nearby)
 result:     account_number wins, decided_by = score
 ```
 
-The context can tip the same overlap. With the text `"5551234567 call"`,
+The context can tip the same overlap. With the text `"2125550123 call"`,
 phone wins on its own; add the context `"account"` and account_number wins.
 
 ## Setup
@@ -122,7 +122,7 @@ from extract import load_config, extract, open_report, reset_report
 
 cfg = load_config("extraction_config.yaml")
 reset_report()
-items = [("id-1", "call", "Call 555-123-4567"), ("id-2", "", "Invoice INV-004521")]
+items = [("id-1", "call", "Call 212-555-0123"), ("id-2", "", "Invoice INV-004521")]
 
 with open_report() as write:           # opens the file once, holds nothing in memory
     for id, context, text in items:

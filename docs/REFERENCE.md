@@ -33,7 +33,7 @@ Example:
 ```bash
 .venv/bin/python extract.py --config extraction_config.yaml --report \
     --text 'Invoice INV-004521 dated 03/14/2026, amount due $1,250.00'
-echo 'call 555-123-4567' | .venv/bin/python extract.py --config extraction_config.yaml --context phone
+echo 'call 212-555-0123' | .venv/bin/python extract.py --config extraction_config.yaml --context phone
 .venv/bin/python extract.py --summarize
 ```
 
@@ -64,7 +64,7 @@ from extract import load_config, extract, open_report, reset_report
 
 cfg = load_config("extraction_config.yaml")
 reset_report()
-items = [("id-1", "call", "Call 555-123-4567"), ("id-2", "", "Invoice INV-004521")]
+items = [("id-1", "call", "Call 212-555-0123"), ("id-2", "", "Invoice INV-004521")]
 
 with open_report() as write:           # opens the file once, holds nothing in memory
     for id, context, text in items:
@@ -126,7 +126,7 @@ keyword's weight is divided by its word distance (nearest word = 1).
   word sets its distance. `context_window_words`, `context_direction` and
   `stop_at` do not apply.
 - A `keywords` word found in both places counts in both: with
-  `keywords: {phone: 3}`, context `phone` and text `phone 555-123-4567`, the
+  `keywords: {phone: 3}`, context `phone` and text `phone 212-555-0123`, the
   score is 3 + 3 = 6.
 - The context has no position relative to any one match, so it adds the same
   amount to every candidate of a pattern.
@@ -137,11 +137,11 @@ Example (from `extraction_config.yaml`, decay on):
 
 ```text
 context:  "Acct"
-text:     "Acct 5551234567 call 555-123-4567"
-account_number 5551234567:  text acct +3, call -2  -> 1;  context acct +3  -> 4.0
-phone_number   5551234567:  text call +2           -> 2;  context          -> 2.0
+text:     "Acct 2125550123 call 212-555-0123"
+account_number 2125550123:  text acct +3, call -2  -> 1;  context acct +3  -> 4.0
+phone_number   2125550123:  text call +2           -> 2;  context          -> 2.0
   -> overlap, account_number wins by score
-phone_number   555-123-4567: text call +2          -> 2.0, no overlap, kept
+phone_number   212-555-0123: text call +2          -> 2.0, no overlap, kept
 ```
 
 ## Keywords

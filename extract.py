@@ -42,6 +42,7 @@ from typing import Any, Callable, Iterable, Iterator, Sequence, Union
 
 import yaml
 
+import phone
 from words import next_words, prev_words
 # The report summaries live in summarize.py (a leaf module); re-exported here.
 from summarize import (
@@ -58,15 +59,21 @@ CONTEXT_DIRECTIONS = ("before", "after", "both")
 # The decision report (extract's log) as CSV; main() resets it once per run.
 REPORT_PATH = DEFAULT_REPORT_PATH       # "extract_report.csv", defined in summarize.py
 _CAND_COLS = ("label", "text", "start", "end", "score", "text_score", "context_score")
+# Phone validation columns; blank on every other row kind.
+_PHONE_COLS = ("status", "region", "normalized")
 REPORT_FIELDS = (
     ("file", "kind", "outcome", "reason")
     + tuple(f"a_{k}" for k in _CAND_COLS)
     + tuple(f"b_{k}" for k in _CAND_COLS)
+    + _PHONE_COLS
     + ("decided_by",)
 )
 # decided_by: overlap -> score | length | priority | start_label;
-# coexist -> coexist; below_min_score -> min_score; miss -> "".
+# coexist -> coexist; below_min_score -> min_score; miss -> "";
+# validation -> the region source (phone.SOURCES: number | caller | keyword |
+# proximity | trial | format | fallback | default).
 # miss outcome: no_candidates (regex gap) | candidates_dropped (tuning).
+# validation outcome: kept | kept_flagged | dropped.
 REQUIRED_SETTINGS = (
     "context_window_words",
     "distance_decay",
@@ -90,6 +97,7 @@ class Pattern:
     regex: "re.Pattern[str]"
     nearby: dict[str, float] = field(default_factory=dict)    # text window: signed weight
     context: dict[str, float] = field(default_factory=dict)   # context string: signed weight
+    validate: phone.PhoneSpec | None = None                   # the `validate:` block, if any
 
 
 @dataclass
@@ -111,21 +119,27 @@ class Candidate:
     score: float = 0            # text_score + context_score
     text_score: float = 0
     context_score: float = 0
+    # Set only on matches from a pattern with `validate`: normalized, region,
+    # region_source, status, number_type, ambiguous, runner_up.
+    extra: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """The CLI JSON form: label, text, start, end, score."""
-        return {
+        """The CLI JSON form: label, text, start, end, score (+ extra if set)."""
+        out: dict[str, Any] = {
             "label": self.label,
             "text": self.text,
             "start": self.start,
             "end": self.end,
             "score": round(float(self.score), 4),
         }
+        if self.extra is not None:
+            out["extra"] = dict(self.extra)
+        return out
 
     def report_dict(self) -> dict[str, Any]:
         """to_dict() plus the score breakdown, for the report columns."""
         return {
-            **self.to_dict(),
+            **{k: v for k, v in self.to_dict().items() if k != "extra"},
             "text_score": round(float(self.text_score), 4),
             "context_score": round(float(self.context_score), 4),
         }
@@ -135,7 +149,7 @@ class Candidate:
 # columns (file, kind, outcome, reason, a_*, b_*, decided_by). It is the
 # single form used for extract_report.csv.
 #
-# kind: "below_min_score" | "overlap" | "coexist" | "miss"
+# kind: "below_min_score" | "overlap" | "coexist" | "miss" | "validation"
 Decision = dict[str, Any]
 
 
@@ -151,11 +165,13 @@ def _decision(
     a: Candidate | None = None,
     b: Candidate | None = None,
     decided_by: str = "",
+    **phone_cols: Any,
 ) -> Decision:
     """Build one log row. a/b are the candidates involved:
     overlap: a = winner, b = dropped. below_min_score: a = dropped.
-    coexist: a and b are both kept. The `file` column is filled in later.
-    `decided_by` names the rule that decided (see REPORT_FIELDS).
+    coexist: a and b are both kept. validation: a = the checked candidate,
+    with phone_cols status / region / normalized. The `file` column is
+    filled in later. `decided_by` names the rule that decided (see REPORT_FIELDS).
     """
     return {
         "file": "",
@@ -164,6 +180,7 @@ def _decision(
         "reason": reason,
         **_cand_columns("a", a),
         **_cand_columns("b", b),
+        **{k: phone_cols.get(k, "") or "" for k in _PHONE_COLS},
         "decided_by": decided_by,
     }
 
@@ -344,6 +361,10 @@ def load_config(path: str | Path) -> Config:
             raise ValueError(f"pattern '{label}': invalid regex: {exc}") from exc
 
         nearby, context = _load_keywords(label, entry)
+        spec = (
+            phone.load_validate(label, entry["validate"], _weight_map)
+            if entry.get("validate") is not None else None
+        )
         patterns.append(
             Pattern(
                 label=label,
@@ -351,10 +372,24 @@ def load_config(path: str | Path) -> Config:
                 regex=compiled,
                 nearby=nearby,
                 context=context,
+                validate=spec,
             )
         )
 
-    coexist = {frozenset(pair) for pair in (raw.get("coexist") or [])}
+    for p in patterns:
+        extra_label = p.validate.possible_label if p.validate else None
+        if extra_label is None:
+            continue
+        if extra_label in seen:
+            raise ValueError(
+                f"pattern '{p.label}': validate.possible_label '{extra_label}' "
+                "is already used by another pattern"
+            )
+        seen.add(extra_label)
+
+    coexist = _expand_coexist(
+        {frozenset(pair) for pair in (raw.get("coexist") or [])}, patterns
+    )
     return Config(
         settings=settings,
         normalize=raw.get("normalize") or {},
@@ -362,6 +397,25 @@ def load_config(path: str | Path) -> Config:
         coexist=coexist,
         tests=raw.get("tests") or [],
     )
+
+
+def _expand_coexist(
+    coexist: set[frozenset[str]], patterns: list[Pattern]
+) -> set[frozenset[str]]:
+    """A coexist pair naming a validated pattern's label also covers its
+    possible_label, so relabeled matches keep the same overlap rules."""
+    out = set(coexist)
+    for p in patterns:
+        alt = p.validate.possible_label if p.validate else None
+        if alt is None:
+            continue
+        for pair in list(out):
+            if p.label in pair:
+                rest = set(pair) - {p.label}
+                out.add(frozenset(rest | {alt}))
+                if not rest:            # [x, x]: also x with its own possible label
+                    out.add(frozenset({p.label, alt}))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -496,6 +550,25 @@ def _nearest_distance(
     return best
 
 
+def _window(
+    text: str, start: int, end: int, settings: dict[str, Any]
+) -> tuple[list[str], list[str]]:
+    """The text window around a span: (words before, words after), per
+    context_window_words, context_direction and stop_at."""
+    n = int(settings["context_window_words"])
+    direction = settings.get("context_direction", "both")
+    stop_at = settings.get("stop_at", "")
+    before = (
+        prev_words(text, start, n, stop_at=stop_at)
+        if direction in ("before", "both") else []
+    )
+    after = (
+        next_words(text, end, n, stop_at=stop_at)
+        if direction in ("after", "both") else []
+    )
+    return before, after
+
+
 def score_candidate(
     text: str, cand: Candidate, pattern: Pattern, settings: dict[str, Any]
 ) -> float:
@@ -511,17 +584,7 @@ def score_candidate(
 
     Keyword matching is always lowercase; case_sensitive only affects regex.
     """
-    n = int(settings["context_window_words"])
-    direction = settings.get("context_direction", "both")
-    stop_at = settings.get("stop_at", "")
-    before = (
-        prev_words(text, cand.start, n, stop_at=stop_at)
-        if direction in ("before", "both") else []
-    )
-    after = (
-        next_words(text, cand.end, n, stop_at=stop_at)
-        if direction in ("after", "both") else []
-    )
+    before, after = _window(text, cand.start, cand.end, settings)
     decay = bool(settings["distance_decay"])
     total, _ = _sum_keywords(
         pattern.nearby, lambda kw: _nearest_distance(before, after, kw), decay
@@ -553,6 +616,124 @@ def context_score(
     return _sum_keywords(
         pattern.context, lambda kw: _nearest_distance(words, [], kw), decay
     )
+
+
+# --------------------------------------------------------------------------
+# 4b. phone validation (patterns with a `validate:` block; see phone.py)
+# --------------------------------------------------------------------------
+# One side's region evidence: (score, nearest distance, hit words nearest first).
+_Side = tuple[float, Union[int, None], list[str]]
+
+
+def _hint_side(weights: dict[str, float], find: DistanceFinder, decay: bool) -> _Side:
+    """Score a region's keywords with the shared matcher, plus the nearest hit."""
+    total, hits = _sum_keywords(weights, find, decay)
+    dists = sorted((find(_keyword_words(k)) or 0, k) for k in hits)
+    return total, (dists[0][0] if dists else None), [k for _, k in dists]
+
+
+def _context_hints(
+    spec: phone.PhoneSpec, words: list[str], settings: dict[str, Any]
+) -> dict[str, _Side]:
+    """The context part of every region's hints; once per pattern."""
+    if spec.region_from == "text":
+        return {}
+    decay = bool(settings["distance_decay"])
+    return {
+        region: _hint_side(weights, lambda kw: _nearest_distance(words, [], kw), decay)
+        for region, weights in spec.regions.items()
+    }
+
+
+def _region_hints(
+    text: str, start: int, end: int, spec: phone.PhoneSpec,
+    ctx: dict[str, _Side], settings: dict[str, Any],
+) -> list[phone.RegionHint]:
+    """Every region's keyword evidence for the span: the text window (same
+    rules as the text score) plus the precomputed context part, per region_from."""
+    use_text = spec.region_from in ("both", "text")
+    before, after = _window(text, start, end, settings) if use_text else ([], [])
+    decay = bool(settings["distance_decay"])
+    hints: list[phone.RegionHint] = []
+    for region, weights in spec.regions.items():
+        t_score, t_dist, t_words = (
+            _hint_side(weights, lambda kw: _nearest_distance(before, after, kw), decay)
+            if use_text else (0.0, None, [])
+        )
+        c_score, c_dist, c_words = ctx.get(region, (0.0, None, []))
+        hints.append(phone.RegionHint(
+            region, t_score + c_score, t_dist, c_dist,
+            t_words + [w for w in c_words if w not in t_words],
+        ))
+    return hints
+
+
+def _refine(
+    text: str, cands: list[Candidate], by_label: dict[str, Pattern],
+    ctx_hints: dict[str, dict[str, _Side]], settings: dict[str, Any],
+    caller: str | None,
+) -> list[Candidate]:
+    """Trim or split each validated regex hit with PhoneNumberMatcher.
+
+    The matcher runs in the caller's region, else the top keyword region,
+    else default_region. If it finds nothing, the raw hit is kept as it is,
+    so validation (not this step) decides its fate and logs it."""
+    out: list[Candidate] = []
+    for c in cands:
+        spec = by_label[c.label].validate
+        if spec is None:
+            out.append(c)
+            continue
+        hints = _region_hints(text, c.start, c.end, spec, ctx_hints[c.label], settings)
+        top = max((h for h in hints if h.score > 0), key=lambda h: h.score, default=None)
+        region = caller or (top.region if top else spec.default_region)
+        spans = phone.refine_spans(c.text, region)
+        if not spans:
+            out.append(c)
+            continue
+        for s, e in spans:
+            start, end = c.start + s, c.start + e
+            out.append(Candidate(c.label, start, end, text[start:end], c.priority))
+    out.sort(key=lambda c: (c.start, c.end, c.label))
+    return out
+
+
+def validate_candidates(
+    text: str, cands: list[Candidate], cfg: Config,
+    ctx_hints: dict[str, dict[str, _Side]], caller: str | None = None,
+) -> tuple[list[Candidate], list[Decision]]:
+    """Grade every candidate of a validated pattern (valid / possible /
+    impossible), pick its region, apply the on_* settings and log one
+    `validation` row each. Runs after scoring and before min_score/overlaps,
+    so an invalid phone number never competes. Other candidates pass through."""
+    by_label = {p.label: p for p in cfg.patterns}
+    kept: list[Candidate] = []
+    decisions: list[Decision] = []
+    version = None
+    for c in cands:
+        spec = by_label[c.label].validate
+        if spec is None:
+            kept.append(c)
+            continue
+        version = version or phone.pn_version()
+        hints = _region_hints(text, c.start, c.end, spec, ctx_hints[c.label], cfg.settings)
+        result = phone.pick_region(c.text, spec, caller, hints)
+        verdict, why = phone.outcome(result, spec, c.score)
+        if result.status != "valid" and spec.possible_label:
+            c.label = spec.possible_label
+        c.extra = result.extra()
+        parts = [f"{result.status} in {result.region or '?'}"]
+        if result.detail:
+            parts.append(result.detail)
+        parts.append(f"{verdict}: {why}")
+        parts.append(f"phonenumbers {version}")
+        decisions.append(_decision(
+            "validation", verdict, "; ".join(parts), a=c, decided_by=result.source,
+            status=result.status, region=result.region, normalized=result.normalized,
+        ))
+        if verdict != "dropped":
+            kept.append(c)
+    return kept, decisions
 
 
 # --------------------------------------------------------------------------
@@ -683,11 +864,15 @@ def _miss_decisions(
     cands: list[Candidate],
     matches: list[Candidate],
 ) -> list[Decision]:
-    """One `miss` row per label the context scored above 0 that has no match."""
-    kept = {m.label for m in matches}
+    """One `miss` row per label the context scored above 0 that has no match.
+    A validated pattern's match relabeled to its possible_label counts as found."""
+    alias = {p.validate.possible_label: p.label for p in cfg.patterns
+             if p.validate and p.validate.possible_label}
+    kept = {alias.get(m.label, m.label) for m in matches}
     found: dict[str, int] = {}
     for c in cands:
-        found[c.label] = found.get(c.label, 0) + 1
+        label = alias.get(c.label, c.label)
+        found[label] = found.get(label, 0) + 1
     rows: list[Decision] = []
     for p in cfg.patterns:
         score, hits = ctx_scores[p.label]
@@ -695,7 +880,7 @@ def _miss_decisions(
             continue
         n = found.get(p.label, 0)
         outcome, why = (
-            ("candidates_dropped", f"{n} candidate(s) dropped (min_score/overlap)") if n
+            ("candidates_dropped", f"{n} candidate(s) dropped (min_score/overlap/validation)") if n
             else ("no_candidates", "no candidates in text")
         )
         reason = f"context scored {p.label} {score:+.2f} ({', '.join(hits)}); {why}"
@@ -707,7 +892,7 @@ def _miss_decisions(
 
 
 def extract(
-    inp: ExtractInput, cfg: Config, source: str = ""
+    inp: ExtractInput, cfg: Config, source: str = "", region: str | None = None
 ) -> tuple[list[Candidate], list[Decision]]:
     """Run steps 2-5 and return (matches, decisions). Writes no files.
 
@@ -717,22 +902,50 @@ def extract(
     the context scored above 0 that ended with no match. Ignore the log with
     `matches, _ = extract(...)`, or write it with write_report_csv() /
     open_report().
+
+    `region` (e.g. "GB") is the caller's region for patterns with a
+    `validate:` block; other patterns ignore it.
     """
     raw_text, context = _split_input(inp)
+    caller = _caller_region(region)
     text = normalize(raw_text, cfg)
     words = context_words(normalize(context, cfg) if context else None)
     ctx_scores = {p.label: context_score(words, p, cfg.settings) for p in cfg.patterns}
     by_label = {p.label: p for p in cfg.patterns}
+    ctx_hints = {
+        p.label: _context_hints(p.validate, words, cfg.settings)
+        for p in cfg.patterns if p.validate
+    }
 
     cands = find_candidates(text, cfg.patterns)
+    if ctx_hints:
+        cands = _refine(text, cands, by_label, ctx_hints, cfg.settings, caller)
     for c in cands:
         c.text_score = score_candidate(text, c, by_label[c.label], cfg.settings)
         c.context_score = ctx_scores[c.label][0]
         c.score = c.text_score + c.context_score
 
+    found = list(cands)              # before validation drops any, for the miss rows
+    checked: list[Decision] = []
+    if ctx_hints:
+        cands, checked = validate_candidates(text, cands, cfg, ctx_hints, caller)
     matches, decisions = resolve_overlaps(cands, cfg)
-    decisions += _miss_decisions(cfg, ctx_scores, cands, matches)
+    decisions = checked + decisions + _miss_decisions(cfg, ctx_scores, found, matches)
     return matches, [{**d, "file": source} for d in decisions]
+
+
+def _caller_region(region: str | None) -> str | None:
+    """Check extract(region=...): None, or a region code phonenumbers knows."""
+    if region is None or region == "":
+        return None
+    code = str(region).upper()
+    try:
+        known = phone.pn().SUPPORTED_REGIONS
+    except ImportError as exc:
+        raise ValueError("region= needs phonenumbers, which is not installed") from exc
+    if code not in known:
+        raise ValueError(f"region: unknown region '{region}'")
+    return code
 
 
 # --------------------------------------------------------------------------
@@ -748,6 +961,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--context", default=None,
                         help="optional context text; its words add each pattern's "
                              "context/keywords weights to that pattern's score")
+    parser.add_argument("--region", default=None,
+                        help="caller region (e.g. GB) for patterns with a validate block")
     parser.add_argument("--report", action="store_true",
                         help=f"write the decision log to ./{REPORT_PATH} (overwritten)")
     parser.add_argument("--summarize", nargs="?", const=REPORT_PATH, default=None,
@@ -759,7 +974,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.summarize is not None:
         clashes = [flag for flag, used in (
             ("--text", args.text is not None), ("--context", args.context is not None),
-            ("--report", args.report),
+            ("--report", args.report), ("--region", args.region is not None),
         ) if used]
         if clashes:
             parser.error(f"--summarize cannot be combined with {', '.join(clashes)}")
@@ -793,7 +1008,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("no text: pass --text TEXT or pipe the text on stdin")
         text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
 
-    matches, decisions = extract((args.context, text), cfg)
+    try:
+        matches, decisions = extract((args.context, text), cfg, region=args.region)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     if args.report:
         reset_report()

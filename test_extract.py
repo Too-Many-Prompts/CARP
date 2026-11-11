@@ -252,7 +252,7 @@ def test_context_none_or_empty_matches_plain() -> None:
 
 
 def test_every_pattern_runs_whatever_the_context() -> None:
-    text = "Acct 5551234567 call 555-123-4567"
+    text = "Acct 2125550123 call 212-555-0123"
     for context in (None, "acct", "phone", "nothing relevant"):
         assert "phone_number" in {m.label for m in matches_of((context, text), REAL_CFG)}
 
@@ -321,13 +321,13 @@ def test_negative_context_drops_below_min_score(tmp_path: Path) -> None:
 
 
 def test_context_flips_an_overlap() -> None:
-    assert [m.label for m in matches_of("5551234567 call", REAL_CFG)] == ["phone_number"]
-    assert [m.label for m in matches_of(("account", "5551234567 call"), REAL_CFG)] == [
+    assert [m.label for m in matches_of("2125550123 call", REAL_CFG)] == ["phone_number"]
+    assert [m.label for m in matches_of(("account", "2125550123 call"), REAL_CFG)] == [
         "account_number"]
 
 
 def test_context_match_ignores_case_and_punctuation() -> None:
-    (m,) = matches_of(("ACCOUNT:", "5551234567 call"), REAL_CFG)
+    (m,) = matches_of(("ACCOUNT:", "2125550123 call"), REAL_CFG)
     assert m.label == "account_number"
 
 
@@ -337,7 +337,7 @@ def test_context_whole_words_only(tmp_path: Path) -> None:
 
 
 def test_regex_never_runs_on_context() -> None:
-    assert matches_of(("555-123-4567", "no numbers"), REAL_CFG) == []
+    assert matches_of(("212-555-0123", "no numbers"), REAL_CFG) == []
 
 
 def test_bad_input_type() -> None:
@@ -369,14 +369,14 @@ def test_miss_when_candidates_all_dropped(tmp_path: Path) -> None:
     assert matches == []
     (miss,) = _misses(decisions)
     assert miss["outcome"] == "candidates_dropped"
-    assert miss["reason"].endswith("; 2 candidate(s) dropped (min_score/overlap)")
+    assert miss["reason"].endswith("; 2 candidate(s) dropped (min_score/overlap/validation)")
 
 
 def test_no_miss_otherwise(tmp_path: Path) -> None:
     for inp in (
         (None, "no matches at all"),                     # no context
         ("nothing relevant here", "no matches at all"),  # context, no hits
-        ("tel", "call 555-123-4567"),                    # context hit, matched
+        ("tel", "call 212-555-0123"),                    # context hit, matched
         ("order", "no numbers"),                         # only phone scored, and < 0
     ):
         assert _misses(extract(inp, REAL_CFG)[1]) == []
@@ -411,10 +411,11 @@ def test_cli_text_prints_matches_and_writes_nothing(
     import json
 
     assert main(["--config", str(CONFIG_PATH),
-                 "--text", "Please call 555-123-4567 about the order."]) == 0
+                 "--text", "Please call 212-555-0123 about the order."]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out[0]["text"] == "555-123-4567"
-    assert set(out[0]) == {"label", "text", "start", "end", "score"}
+    assert out[0]["text"] == "212-555-0123"
+    assert set(out[0]) == {"label", "text", "start", "end", "score", "extra"}
+    assert out[0]["extra"]["normalized"] == "+12125550123"
     assert not Path("extract_report.csv").exists()
 
 
@@ -423,7 +424,7 @@ def test_cli_reads_text_from_stdin(
 ) -> None:
     import io, json
 
-    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"call 555-123-4567")))
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"call 212-555-0123")))
     assert main(["--config", str(CONFIG_PATH), "--context", "phone"]) == 0
     assert json.loads(capsys.readouterr().out)[0]["label"] == "phone_number"
 
@@ -499,7 +500,7 @@ def test_open_report_streams_many_calls_with_one_header(tmp_path: Path) -> None:
 
 
 def test_cli_report_flag_writes_and_overwrites_report() -> None:
-    args = ["--config", str(CONFIG_PATH), "--text", "Acct 5551234567 is overdue.", "--report"]
+    args = ["--config", str(CONFIG_PATH), "--text", "Acct 2125550123 is overdue.", "--report"]
 
     assert main(args) == 0
     rows = read_report()
@@ -664,16 +665,16 @@ def test_stop_at_period_changes_overlap_winner(stop_at: str, expected_label: str
     """'Acct' sits before a period. Without stop_at it boosts account_number
     (+3) so it beats phone_number. With stop_at='.' the scan ends at the period,
     both scores are 0, and the priority tie-break picks phone_number."""
-    matches = matches_of("Acct. 5551234567", _real_cfg_with_stop_at(stop_at))
-    assert [(m.label, m.text) for m in matches] == [(expected_label, "5551234567")]
+    matches = matches_of("Acct. 2125550123", _real_cfg_with_stop_at(stop_at))
+    assert [(m.label, m.text) for m in matches] == [(expected_label, "2125550123")]
 
 
 @pytest.mark.parametrize("stop_at", ["", ".!?"])
 def test_stop_at_keeps_context_after_period(stop_at: str) -> None:
     """'phone' is after the period and before the number, so it still counts
     whether or not stop_at is set: phone/2 words away = 1.5."""
-    matches = matches_of("acct. phone is 123-456-2342", _real_cfg_with_stop_at(stop_at))
-    assert [(m.label, m.text) for m in matches] == [("phone_number", "123-456-2342")]
+    matches = matches_of("acct. phone is 212-456-2342", _real_cfg_with_stop_at(stop_at))
+    assert [(m.label, m.text) for m in matches] == [("phone_number", "212-456-2342")]
     assert matches[0].score == pytest.approx(1.5)
 
 
@@ -1083,22 +1084,26 @@ def test_public_api_as_documented(
     assert isinstance(cfg, Config)
 
     # Library: the three input forms, (matches, decisions) shape.
-    for inp in ("Call 555-123-4567 acct 5551234567",
-                {"text": "Call 555-123-4567 acct 5551234567", "context": "call"},
-                ("call", "Call 555-123-4567 acct 5551234567")):
+    for inp in ("Call 212-555-0123 acct 2125550123",
+                {"text": "Call 212-555-0123 acct 2125550123", "context": "call"},
+                ("call", "Call 212-555-0123 acct 2125550123")):
         matches, decisions = extract(inp, cfg, source="id-1")
-        assert [set(m.to_dict()) for m in matches] == [{"label", "text", "start", "end", "score"}] * 2
+        base = {"label", "text", "start", "end", "score"}
+        # Matches of a pattern with `validate` also carry `extra`.
+        assert len(matches) == 2
+        for m in matches:
+            assert set(m.to_dict()) == (base | {"extra"} if "phone" in m.label else base)
         assert decisions and all(list(d) == list(REPORT_FIELDS) for d in decisions)
         assert {d["file"] for d in decisions} == {"id-1"}
     matches, _ = extract({"text": "some text", "context": "call"}, cfg)
     assert isinstance(matches, list)
-    m = matches_of(("call", "Call 555-123-4567"), cfg)[0]
+    m = matches_of(("call", "Call 212-555-0123"), cfg)[0]
     assert m.score == m.text_score + m.context_score
 
     # The README loop: reset, then stream with open_report.
     reset_report()
-    items = [("id-1", "call", "Call 555-123-4567"), ("id-2", "tel", "Invoice INV-004521"),
-             ("id-3", "", "Acct 5551234567 is overdue.")]
+    items = [("id-1", "call", "Call 212-555-0123"), ("id-2", "tel", "Invoice INV-004521"),
+             ("id-3", "", "Acct 2125550123 is overdue.")]
     with open_report() as write:
         for id, context, text in items:
             matches, decisions = extract((context, text), cfg, source=id)
@@ -1107,7 +1112,10 @@ def test_public_api_as_documented(
         reader = csv.DictReader(fh)
         assert tuple(reader.fieldnames or ()) == REPORT_FIELDS
         rows = list(reader)
-    assert {r["file"] for r in rows} == {"id-2", "id-3"}       # id-1 had no decisions
+    # id-1 only has its phone's validation row; id-3's phone is checked too.
+    assert {r["file"] for r in rows if r["kind"] != "validation"} == {"id-2", "id-3"}
+    assert [(r["file"], r["status"], r["normalized"]) for r in rows if r["kind"] == "validation"] == [
+        ("id-1", "valid", "+12125550123"), ("id-3", "valid", "+12125550123")]
     assert [(r["file"], r["a_label"]) for r in rows if r["kind"] == "miss"] == [
         ("id-2", "phone_number")]
     write_report_csv(extract("abc", cfg)[1])            # appends, no second header
@@ -1129,11 +1137,11 @@ def test_public_api_as_documented(
     assert {m["label"] for m in out} == {"invoice_number", "date", "amount"}
     assert all(set(m) == {"label", "text", "start", "end", "score"} for m in out)
     assert main(["--config", config, "--context", "Acct", "--text",
-                 "Acct 5551234567 call 555-123-4567"]) == 0
+                 "Acct 2125550123 call 212-555-0123"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert [(m["label"], m["score"]) for m in out] == [
         ("account_number", 4.0), ("phone_number", 2.0)]
-    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"call 555-123-4567")))
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"call 212-555-0123")))
     assert main(["--config", config, "--context", "phone"]) == 0
     assert json.loads(capsys.readouterr().out)[0]["label"] == "phone_number"
     assert main(["--summarize"]) == 0
