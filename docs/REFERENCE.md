@@ -186,14 +186,14 @@ zero or more readings, and each reading becomes a match.
      to step 5.
    - **some** → go to step 4.
 4. **What does `hint_fallback` say?**
-   - **`never`, `if_nothing`** → return the hinted readings only, source
+   - **`never`, `if_nothing`** → keep the hinted readings only, source
      `hint`. **Done.**
-   - **`if_not_valid`** → is any hinted reading valid? Yes: return the hinted
+   - **`if_not_valid`** → is any hinted reading valid? Yes: keep the hinted
      readings only (**done**). No: go to step 5.
    - **`always`** → go to step 5. The hinted readings stay.
-5. **Parse in each region of `regions`.** Return what `keep` allows, and add
+5. **Parse in each region of `regions`.** Keep what `keep` allows, and add
    the readings you already have from the hints, if any.
-   - **some readings** → return them, sources `hint` and `regions`. **Done.**
+   - **some readings** → keep them, sources `hint` and `regions`. **Done.**
    - **none** → go to step 6.
 6. **Does it start with `00`?**
    - **yes, and possible when `00` is read as `+`** → one reading, source
@@ -234,7 +234,7 @@ flowchart TD
 </details>
 
 - **Never a guess about the country.** Every reading that survives is
-  returned, labeled with its status and region (`valid_US_number`,
+  kept, labeled with its status and region (`valid_US_number`,
   `possible_GB_number`).
 - **Hints narrow the search first.** A hint word is a reason to look at a
   region, not a verdict. `hint_fallback` says when the `regions` list gets a
@@ -309,7 +309,7 @@ shape in GB, and the context points to a phone.
 | --- | --- |
 | Find | `account_number` and `phone_number` both hit `2125550123` (5-15). The phone library confirms the span, so nothing is trimmed. |
 | Score | `account_number`: text `acct` +3 (1 word away); context `phone` -3 (the context's last word, distance 1); total **0.0**. Phone hit: no phone words in the text; context `phone` +3; total **3.0**. |
-| Validate | No `+`, no hint words, so it is parsed in each region of `regions`. US: `+12125550123` **valid**. GB: `+442125550123` only **possible**. `keep: valid_plus_home` returns the valid reading and the home region's possible one; the home region (US) is already valid, so GB is not returned. |
+| Validate | No `+`, no hint words, so it is parsed in each region of `regions`. US: `+12125550123` **valid**. GB: `+442125550123` only **possible**. `keep: valid_plus_home` keeps the valid reading and the home region's possible one; the home region (US) is already valid, so GB is not kept. |
 | `min_score` | 0.0 and 3.0 are both at or above 0. |
 | Overlap | `valid_US_number` and `account_number` share a span and are not a coexist pair. Score 3.00 > 0.00: the phone reading wins. |
 | Result | `valid_US_number`, `text` `+12125550123`, `start` 5, `end` 15, score 3.0. |
@@ -363,7 +363,7 @@ Questions the report answers:
 | Why did `A` beat `B`? | the `overlap` row: `a_*` is the winner, `b_*` the loser; `reason` shows the numbers |
 | Why is my match missing? | `b_` side of an `overlap` row; a `below_min_score` row; a `validation` row with `dropped`; or a `miss` row |
 | Why `possible_US_number` and not `valid_US_number`? | the `validation` row: `status`, `region`, and `reason` |
-| Why was a phone reading not returned? | a `validation` row with `not_kept`; `reason` names the `keep` or `hint_conflict` setting |
+| Why was a phone reading not kept? | a `validation` row with `not_kept`; `reason` names the `keep` or `hint_conflict` setting |
 | What do I tune first? | `extract.py --summarize` (see [Summaries](#summaries)) |
 
 ## How it works
@@ -479,17 +479,85 @@ empty entry; remove it".
 Leaving out `keywords`, `nearby` or `context`, or leaving them blank, is fine:
 the pattern simply has no keywords of that kind and scores 0 there.
 
-## Config
+## Config options
 
-`extraction_config.yaml` is the source of truth. Keys:
+Everything lives in `extraction_config.yaml`, in five sections: `settings`,
+`normalize`, `patterns`, `coexist` and `tests`. Every option is listed below.
+"Required" means `load_config` fails without it; an unknown value fails with a
+message naming the section and key.
 
-| Key | Purpose |
+### `settings`
+
+| Option | Required / default | Values | What it does |
+| --- | --- | --- | --- |
+| `context_window_words` | required | a whole number, e.g. `8` | How many words on each side of a match are searched for keywords. |
+| `context_direction` | default `both` | `before`, `after`, `both` | Which side(s) of the match the text window covers. The context string is always read whole. |
+| `stop_at` | default `""` (none) | a string of characters, e.g. `".!?"` | The text window scan stops at the first of these characters, so words in the next sentence don't count. Does not apply to the context string. |
+| `distance_decay` | required | `true`, `false` | `true`: a keyword's weight is divided by its distance in words (1 = next to the match; in the context, the last word is 1). `false`: full weight at any distance. |
+| `min_score` | required | a number, e.g. `0` | A candidate scoring below this is dropped (`below_min_score` row). |
+| `case_sensitive` | required | `true`, `false` | Whether the regexes are case-sensitive. Keywords always match regardless of case. |
+| `overlap_tiebreak` | required (may be empty) | a list of `score`, `length`, `priority`, in the order to try | How an overlap between two candidates is decided: higher score, then longer match, then lower priority number. Anything still tied (or an empty list) goes to the earlier start, then the label. |
+
+### `normalize`
+
+Each option is off unless set to `true`. Offsets (`start`, `end`) refer to the
+normalized text.
+
+| Option | What it does |
 | --- | --- |
-| `settings` | `context_window_words`, `context_direction` (`before`/`after`/`both`, default `both`), `stop_at` (characters that end the text window scan, default `""`), `distance_decay`, `min_score`, `case_sensitive`, `overlap_tiebreak` (any of `score`, `length`, `priority`, in order; may be empty) |
-| `normalize` | `collapse_whitespace`, `unicode_dashes_to_hyphen`, `smart_quotes_to_ascii` |
-| `patterns` | `label`, `priority`, `regex`, `keywords`, `nearby`, `context` (each word -> signed weight), optional `validate` ([Phone numbers](#phone-numbers)) |
-| `coexist` | label pairs that may both be kept when they overlap |
-| `tests` | cases `{text, expect: [{label, text}], context?, name?}` run by pytest |
+| `collapse_whitespace` | Turns every run of spaces, tabs and newlines into one space. |
+| `unicode_dashes_to_hyphen` | Turns en and em dashes (`–` `—`) into `-`. |
+| `smart_quotes_to_ascii` | Turns curly quotes (`‘ ’ “ ”`) into straight ones (`' "`). |
+
+### `patterns`
+
+A list; each entry is one thing to find.
+
+| Option | Required / default | Values | What it does |
+| --- | --- | --- | --- |
+| `label` | required, unique | text, e.g. `phone_number` | The name a match is reported under. For a pattern with `validate`, matches get generated labels (`valid_US_number`) and this name is their `pattern`. |
+| `priority` | required | a whole number | Breaks ties in `overlap_tiebreak`: the lower number wins. |
+| `regex` | required | a regular expression (quote it in single quotes) | What to find. Each pattern's regex runs on its own, so overlaps stay visible. |
+| `keywords` | optional | `{word: weight}` | Words that raise (positive weight) or lower (negative weight) the score, looked for in the text window **and** the context string. |
+| `nearby` | optional | `{word: weight}` | Like `keywords`, but looked for in the text window only. |
+| `context` | optional | `{word: weight}` | Like `keywords`, but looked for in the context string only. |
+| `validate` | optional | a block, below | Checks matches as phone numbers. |
+
+Keywords are whole words matched exactly (see [Keywords](#keywords)). A weight
+of 0 is an error, and a word in `keywords` may not also be in `nearby` or
+`context`.
+
+### `validate` (inside a pattern)
+
+| Option | Required / default | Values | What it does |
+| --- | --- | --- | --- |
+| `with` | required | `phonenumbers` | The checking library. It is the only value. |
+| `regions` | required | a list of country codes, e.g. `[US, GB]` | The countries a number is checked in, in order. The first is the home country. |
+| `hints` | optional | `{COUNTRY: {word: weight}}`, weights above 0 | Words that point to a country (`GB: {uk: 3, london: 2}`). When one appears near the number or in the context, that country is checked first. The country need not be in `regions`. |
+| `keep` | default `valid_plus_home` | `valid_plus_home`, `all`, `valid_else_possible`, `valid` | Which readings from `regions` are kept. `valid_plus_home`: every valid one, plus the home country's even if only possible. `all`: every valid and possible one. `valid_else_possible`: the valid ones, or every possible one if none is valid. `valid`: valid ones only. |
+| `hint_conflict` | default `all` | `all`, `nearest` | When a number is valid in several hinted countries: `all` keeps every one; `nearest` keeps only the country whose hint word is nearest. |
+| `hint_fallback` | default `if_not_valid` | `if_not_valid`, `if_nothing`, `always`, `never` | After a hint, whether `regions` is checked too. `if_not_valid`: when no hinted reading is valid. `if_nothing`: only when the hinted countries gave no reading at all. `always`: every time. `never`: never, so a number that fits no hinted country is dropped. |
+| `output_format` | default `E164` | `E164`, `INTERNATIONAL`, `NATIONAL`, `RAW` | How a match's `text` is written: `+12125550123`, `+1 212-555-0123`, `(212) 555-0123`, or `RAW`, the number exactly as written in the input. |
+
+The full rule and examples are in [Phone numbers](#phone-numbers).
+
+### `coexist`
+
+A list of label pairs, e.g. `- [timestamp, date]`. When two overlapping
+matches form a listed pair, both are kept instead of tie-breaking (a
+`coexist` row). Order within a pair doesn't matter. A pattern label such as
+`phone_number` covers all of its generated labels.
+
+### `tests`
+
+A list of cases that `pytest` runs against the config:
+
+| Option | Required | What it does |
+| --- | --- | --- |
+| `name` | optional | A description shown when the case fails. |
+| `text` | required | The text to scan. |
+| `context` | optional | The context string passed with the text. |
+| `expect` | required | The exact matches, each `{label, text}`, in any order. An empty list means "no matches". |
 
 ### Migrating from the old context rules
 
@@ -535,9 +603,9 @@ library.
     hints:                      # optional; words that point to a region, weight > 0
       GB: {uk: 3, london: 2}
       IN: {india: 3}
-    keep: valid_plus_home        # what the list returns: valid_plus_home | all | valid_else_possible | valid
+    keep: valid_plus_home       # which `regions` readings to keep: valid_plus_home | all | valid_else_possible | valid
     hint_conflict: all          # valid in several hinted regions: all | nearest
-    hint_fallback: if_not_valid    # after a hint, also parse `regions`: if_not_valid | if_nothing | always | never
+    hint_fallback: if_not_valid # after a hint, also parse `regions`: if_not_valid | if_nothing | always | never
     output_format: E164         # the match text: E164 | INTERNATIONAL | NATIONAL | RAW
 ```
 
@@ -567,8 +635,8 @@ Readings that give the same number count as one. US and CA share +1, so
 1. **A `+` number** uses its country code: one reading. Source `number`.
 2. **Hint words.** If hint words for any region appear, the number is parsed
    in those regions first.
-   - Valid readings are returned. If there are none, the possible ones are
-     returned.
+   - Valid readings are kept. If there are none, the possible ones are
+     kept.
    - `hint_conflict: nearest` keeps only the region of the nearest hint
      word. A hint word in the text window is nearer than any word in the
      context; then the higher hint score wins; an exact tie keeps both.
@@ -576,7 +644,7 @@ Readings that give the same number count as one. US and CA share +1, so
    - `hint_fallback` decides whether step 3 also runs. Its readings are
      added, with source `regions`, and the hinted readings stay:
 
-     | `hint_fallback` | The list is also parsed when |
+     | `hint_fallback` | `regions` is also parsed when |
      | --- | --- |
      | `if_not_valid` (default) | no hinted reading is valid |
      | `if_nothing` | the number fits no hinted region at all |
@@ -586,12 +654,12 @@ Readings that give the same number count as one. US and CA share +1, so
      Example: "london" plus `212-555-0123` is only possible in GB but valid
      in the US. The default gives `possible_GB_number` + `valid_US_number`;
      `if_nothing` and `never` give only `possible_GB_number`.
-   - The report notes why the list ran, e.g. `hint FR did not fit` or
+   - The report notes why `regions` was parsed too, e.g. `hint FR did not fit` or
      `hint GB not valid; hint_fallback: if_not_valid parsed the regions too`.
-3. **The list:** parse in every `regions` entry. Source `regions`.
-   `keep` decides what is returned:
+3. **`regions`:** parse in every `regions` entry. Source `regions`.
+   `keep` decides which of these readings are kept:
 
-   | `keep` | Returned |
+   | `keep` | Kept |
    | --- | --- |
    | `valid_plus_home` (default) | every valid reading, plus the home (first) region's reading when it is only possible |
    | `all` | every valid and possible reading |
@@ -763,8 +831,8 @@ pattern (`pattern`):
 regions, clusters, examples, hint`.
 
 - `hits` counts numbers in the text. `kept`, `valid` and `possible` count
-  returned readings, and `not_kept` counts the filtered ones.
-- `multi` counts hits with more than one returned reading.
+  kept readings, and `not_kept` counts the filtered ones.
+- `multi` counts hits with more than one kept reading.
 - `clusters` groups `possible` readings by leading digits (the area code for +1).
 - `examples` gives up to three multi or dropped hits.
 - Hints:

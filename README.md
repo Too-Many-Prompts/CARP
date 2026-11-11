@@ -70,7 +70,8 @@ patterns:
 ```
 
 The shipped `extraction_config.yaml` has these two patterns and several more.
-Run it on a text:
+**Every YAML option, with its values and what it does, is listed in
+[Config options](docs/REFERENCE.md#config-options).** Run it on a text:
 
 ```bash
 .venv/bin/python extract.py --config extraction_config.yaml \
@@ -187,7 +188,9 @@ Every setting except `regions` has a default you can leave alone.
 | A number is real in two hinted countries: keep both? | `hint_conflict` | both |
 | How should `text` be written? | `output_format` | `+12125550123` (`INTERNATIONAL`, `NATIONAL`, `RAW` = as written) |
 
-The exact rule, with every branch, is the
+Each option's values are listed in
+[Config options](docs/REFERENCE.md#validate-inside-a-pattern). The exact rule,
+with every branch, is the
 [phone decision flow](docs/REFERENCE.md#phone-decision-flow).
 
 ### Example: account number or phone number?
@@ -201,7 +204,7 @@ With `regions: [US, GB]`, context `"customer phone"`, text
 | Text score | `acct` next to it: **+3** | none of its words nearby: **0** |
 | Context score | `phone` (the context's last word): **-3** | `phone`: **+3** |
 | Total | **0.0** | **3.0** |
-| Check | | real in the US (`valid_US_number`); only the right shape in GB, so not returned, but logged |
+| Check | | real in the US (`valid_US_number`); only the right shape in GB, so not kept (`keep`), but logged |
 | Overlap | loses, 0.0 < 3.0 | **wins** |
 
 ```json
@@ -217,7 +220,7 @@ With `regions: [US, GB]`, context `"customer phone"`, text
   lists `account`, not `acct`. Keywords are exact words.
 
 The report has a row for each of these decisions, including the GB reading
-that wasn't returned. The full walk-through, row by row, is in
+that wasn't kept. The full walk-through, row by row, is in
 [the reference](docs/REFERENCE.md#worked-example-account-or-phone-two-regions).
 
 Results can change when you upgrade phonenumbers, because its data changes;
@@ -309,6 +312,6 @@ See [CLI](docs/REFERENCE.md#cli), [Library](docs/REFERENCE.md#library),
 | `words.py` | `prev_words()` / `next_words()` word lookups around a match |
 | `extraction_config.yaml` | settings, patterns, coexist pairs, test cases |
 | `test_extract.py` | pytest suite |
-| `docs/REFERENCE.md` | the full rules: CLI flags, decision flow, scoring, keywords, tie-breaks, output files, migration |
+| `docs/REFERENCE.md` | the full rules: CLI flags, decision flow, every config option, scoring, keywords, tie-breaks, output files, migration |
 | `releasenotes.md` | breaking changes per release, written so a downstream system (or Claude) can adjust its calling code |
 | `CLAUDE.md` | project instructions for Claude Code |
