@@ -83,35 +83,47 @@ phone wins on its own; add the context `"account"` and account_number wins.
 
 A pattern can hand its matches to the
 [phonenumbers](https://github.com/daviddrysdale/python-phonenumbers) library
-with a `validate:` block:
+with a `validate:` block. CARP doesn't guess the country: each plausible
+reading of a number comes back as its own match.
 
 ```yaml
 - label: phone_number
   priority: 2
   regex: '\+?\(?\d[\d\s().-]{6,18}\d'   # broad: catches anything phone-shaped
   keywords: {phone: 3, call: 2}
-  validate: {with: phonenumbers, default_region: US, possible_label: possible_phone_number}
+  validate:
+    with: phonenumbers
+    regions: [US]                        # parsed in order; the first is home
+    hints: {GB: {uk: 3}, IN: {india: 3}} # optional: words that point to a region
 ```
 
-- A **valid** number keeps its label, and `extra.normalized` holds its E.164
-  form (`+12125550123`).
-- A number of the right length in an unknown range (a new area code, say) is
-  **possible**. It is kept by default, as `possible_phone_number`.
-- A **wrong-length** hit is dropped, but it is logged in the report.
-- The region comes from a leading `+`, a caller `region=` / `--region`, hint
-  words (`regions: {GB: {uk: 3}}`), or `try_regions`. When a number is valid
-  in two hinted regions, the nearer hint word wins and the other region is
-  logged.
+- **Labels** are `{status}_{REGION}_number`. A **valid** number in a known
+  range becomes `valid_US_number`, and `extra.normalized` holds its E.164
+  form (`+12125550123`). The right length in an unknown range (a new area
+  code, say) becomes `possible_US_number`. Nothing is lost.
+- **Impossible hits** (wrong length everywhere) are dropped and logged in the
+  report.
+- **Where a number is parsed**, in order:
+  1. A leading `+`: the country code decides.
+  2. A caller `region=` / `--region`, or the regions whose hint words appear:
+     only those regions are parsed. If the number fits none of them, CARP
+     falls back to the list.
+  3. Every region in `regions`. `readings` chooses what comes back; by
+     default, every valid reading plus the home region's possible one.
+- **Several valid readings.** When a number is valid in several hinted
+  regions, all of them are returned. Set `hint_conflict: nearest` to keep
+  only the one whose hint word is nearest.
+- `coexist` and the summaries use the pattern label (`phone_number`), so a
+  rule written for it covers every reading.
 
 ```text
-regions: {GB: {uk: 3}, IN: {india: 3}}
 text:    "our UK office called India at 98765 43210"
-match:   phone_number  extra.normalized +919876543210  region IN  (valid only in IN)
+match:   valid_IN_number  extra.normalized +919876543210  (fits IN, not GB)
 ```
 
-Without hint words, the same text gives `possible_phone_number` in the US
-(10 digits fit the US length). Add `regions` or `try_regions` for the
-countries in your data.
+Without `hints`, the same text gives `possible_US_number`, since 10 digits
+fit the US length. Add `hints` or `regions` for the countries in your data;
+every listed region also adds readings, though, junk included.
 
 Results can change when you upgrade phonenumbers, because its data changes;
 every report row records the version. See
@@ -176,8 +188,8 @@ To see why a match won, add `--report`. That writes every decision to
 `extract_report.csv`, with each score split into its text and context parts.
 Then run `extract.py --summarize` for a table of the overlaps worth tuning,
 of the labels the context pointed to that produced no match (likely
-misses), and of the phone checks (statuses, regions, and possible numbers
-sharing an area code, a sign that phonenumbers' data is stale). See [CLI](docs/REFERENCE.md#cli),
+misses), and of the phone checks (statuses, regions, numbers with several readings,
+and possible numbers sharing an area code, a sign that phonenumbers' data is stale). See [CLI](docs/REFERENCE.md#cli),
 [Library](docs/REFERENCE.md#library) and
 [Summaries](docs/REFERENCE.md#summaries).
 
