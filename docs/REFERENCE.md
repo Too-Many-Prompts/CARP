@@ -298,6 +298,11 @@ installed.
    | `fallback` | an exact tie: equally near hint words, or readings the format cue can't split. `on_ambiguous` applies; `first` keeps the first by rank or `try_regions` order |
    | `default` | none of the above: `default_region` (or the first try region where it is possible) |
 
+   If the number is impossible everywhere and starts with `00` (the
+   international prefix in most countries, but not in NANP), it is read as
+   `+` as a last resort (source `number`). `011` is handled by `parse()` in
+   NANP regions, so it reports `trial`.
+
    - **Hint words** (`regions`) are scored with the same matcher as
      keywords: the text window (window, direction, `stop_at`, decay) and the
      whole context (last word = distance 1), per `region_from`.
@@ -310,7 +315,9 @@ installed.
      only `possible` yields to a valid `trial` reading. The hint is then
      logged as the runner-up.
    - **Home numbers are protected.** The `default_region`'s `possible`
-     reading competes in `trial`. So a new home area code is not silently
+     reading competes in `trial`, if it fits the region's general number
+     pattern (US: `[2-9]\d{9}`, which a new area code fits but `0612345678`
+     does not). So a new home area code is not silently
      replaced by a coincidental valid number abroad: `555-123-4567` is
      possible in US and valid in GB, and the 3-3-4 grouping keeps it US.
 5. **Outcome:**

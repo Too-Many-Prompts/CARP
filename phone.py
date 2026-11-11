@@ -231,6 +231,19 @@ def _reason_name(reason: int) -> str:
     return names.get(reason, f"not possible ({reason})")
 
 
+def _fits_region(c: Check) -> bool:
+    """True if the number fits its region's general number pattern (from the
+    library's metadata): e.g. US "[2-9]\\d{9}", which a new area code fits but
+    "0612345678" does not. Unknown metadata counts as a fit."""
+    lib = pn()
+    from phonenumbers.phonemetadata import PhoneMetadata
+    meta = PhoneMetadata.metadata_for_region(c.region or "")
+    pattern = getattr(getattr(meta, "general_desc", None), "national_number_pattern", None)
+    if not pattern:
+        return True
+    return re.fullmatch(pattern, lib.national_significant_number(c.number)) is not None
+
+
 def _group_lengths(s: str) -> list[int]:
     """Digit-group lengths: "(555) 123-4567" -> [3, 3, 4]."""
     return [len(g) for g in re.findall(r"\d+", s)]
@@ -368,6 +381,13 @@ def pick_region(
     other = next((c for c in checks if c.status != "impossible"), None)
     if other is not None:
         return _result(raw, other, "trial", spec)
+    # Last resort: "00" is the international prefix in most of the world but
+    # not in NANP regions, so "00 44 20 ..." is impossible there. Read it as "+".
+    stripped = raw.lstrip(" (")
+    if stripped.startswith("00"):
+        c = check("+" + stripped[2:], None)
+        if c.status != "impossible":
+            return _result(raw, c, "number", spec, detail="read the leading 00 as +")
     return _result(raw, default, "default", spec, detail=default.why)
 
 
@@ -403,14 +423,15 @@ def _by_keyword(raw: str, spec: PhoneSpec, hinted: list[RegionHint]) -> Result |
 
 def _by_trial(raw: str, spec: PhoneSpec, checks: list[Check]) -> Result | None:
     """Group the valid results by E.164. The default region's `possible`
-    reading also competes, so a new area code at home is never silently
-    replaced by a coincidental valid number abroad."""
+    reading also competes (if it fits the region's general number pattern),
+    so a new area code at home is never silently replaced by a coincidental
+    valid number abroad."""
     valid = [c for c in checks if c.status == "valid"]
     if not valid:
         return None
     pool = list(valid)
     default = next(c for c in checks if c.region == spec.default_region)
-    if default.status == "possible" and default.full:
+    if default.status == "possible" and default.full and _fits_region(default):
         pool.append(default)
     pool.sort(key=lambda c: spec.try_regions.index(c.region))
     distinct: dict[str, Check] = {}

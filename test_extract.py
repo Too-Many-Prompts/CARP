@@ -1741,3 +1741,37 @@ def test_back_to_back_numbers_are_all_found(tmp_path: Path, text: str, expected:
     refined number ended, so the next one is still found whole."""
     matches, _ = run_phone(tmp_path, text)
     assert [m.text for m in matches] == expected
+
+
+@pytest.mark.parametrize("text", ["call 00 44 20 7946 0018", "call 0044 20 7946 0018"])
+def test_double_zero_prefix_reads_as_plus(tmp_path: Path, text: str) -> None:
+    """00 is not an international prefix in the US; as a last resort it is read as +."""
+    matches, decisions = run_phone(tmp_path, text)
+    assert extra_of(matches, "normalized", "region", "region_source") == [
+        ("+442079460018", "GB", "number")]
+    assert "read the leading 00 as +" in vrows(decisions)[0]["reason"]
+
+
+def test_011_prefix_from_the_us(tmp_path: Path) -> None:
+    matches, _ = run_phone(tmp_path, "call 011 44 20 7946 0018")
+    assert extra_of(matches, "normalized", "region") == [("+442079460018", "GB")]
+
+
+@pytest.mark.parametrize("text, normalized, region", [
+    ("mobile 07400 123456", "+447400123456", "GB"),
+    ("tel 06 12 34 56 78", "+33612345678", "FR"),
+    ("tel 0612345678", "+33612345678", "FR"),        # no US number starts with 0
+])
+def test_foreign_national_numbers_with_try_regions(
+    tmp_path: Path, text: str, normalized: str, region: str
+) -> None:
+    matches, _ = run_phone(tmp_path, text, try_regions=["US", "GB", "FR"])
+    assert extra_of(matches, "normalized", "region", "status") == [(normalized, region, "valid")]
+    assert matches[0].text == text.split(" ", 1)[1]     # refinement kept the whole number
+
+
+def test_new_home_area_code_still_competes_with_foreign_valid(tmp_path: Path) -> None:
+    """2212345678 fits the US pattern [2-9]\\d{9}, so its possible US reading stays
+    in the running and the tie is logged (first in try_regions wins)."""
+    matches, _ = run_phone(tmp_path, "call 2212345678", try_regions=["US", "GB"])
+    assert extra_of(matches, "region", "status") == [("US", "possible")]
