@@ -495,7 +495,7 @@ message naming the section and key.
 | `context_direction` | default `both` | `before`, `after`, `both` | Which side(s) of the match the text window covers. The context string is always read whole. |
 | `stop_at` | default `""` (none) | a string of characters, e.g. `".!?"` | The text window scan stops at the first of these characters, so words in the next sentence don't count. Does not apply to the context string. |
 | `distance_decay` | required | `true`, `false` | `true`: a keyword's weight is divided by its distance in words (1 = next to the match; in the context, the last word is 1). `false`: full weight at any distance. |
-| `min_score` | required | a number, e.g. `0` | A candidate scoring below this is dropped (`below_min_score` row). |
+| `min_score` | required | a number, e.g. `0` | A candidate scoring below this is dropped (`below_min_score` row). Valid phone readings are exempt by default (`valid_ignores_min_score`). |
 | `case_sensitive` | required | `true`, `false` | Whether the regexes are case-sensitive. Keywords always match regardless of case. |
 | `overlap_tiebreak` | required (may be empty) | a list of `score`, `length`, `priority`, in the order to try | How an overlap between two candidates is decided: higher score, then longer match, then lower priority number. Anything still tied (or an empty list) goes to the earlier start, then the label. |
 
@@ -539,6 +539,7 @@ of 0 is an error, and a word in `keywords` may not also be in `nearby` or
 | `hint_conflict` | default `all` | `all`, `nearest` | When a number is valid in several hinted countries: `all` keeps every one; `nearest` keeps only the country whose hint word is nearest. |
 | `hint_fallback` | default `if_not_valid` | `if_not_valid`, `if_nothing`, `always`, `never` | After a hint, whether `regions` is checked too. `if_not_valid`: when no hinted reading is valid. `if_nothing`: only when the hinted countries gave no reading at all. `always`: every time. `never`: never, so a number that fits no hinted country is dropped. |
 | `output_format` | default `E164` | `E164`, `INTERNATIONAL`, `NATIONAL`, `RAW` | How a match's `text` is written: `+12125550123`, `+1 212-555-0123`, `(212) 555-0123`, or `RAW`, the number exactly as written in the input. |
+| `valid_ignores_min_score` | default `true` | `true`, `false` | `true`: a reading the library confirms is valid is never dropped for scoring below `settings.min_score`, so a stray negative word can't erase a real number. It still competes in overlaps, so `Acct 2125550123` can still go to `account_number`. Possible readings always need `min_score`. `false`: valid readings need `min_score` too. |
 
 The full rule and examples are in [Phone numbers](#phone-numbers).
 
@@ -667,8 +668,13 @@ top hinted region, else the first of `regions`.
 - It splits two numbers found in one hit.
 - The regex scan resumes after the last number found, so back-to-back
   numbers are all kept.
-- If the matcher finds nothing (`94105-1234`), the raw hit goes through the
-  rule as it is.
+- If the matcher finds nothing, trailing digit groups are dropped until what
+  is left is a valid number (else one possible as a full number), and the
+  scan resumes after it. The matcher rejects space-grouped runs as one
+  over-long number, so this is what keeps `212 555 0123` from
+  `call 212 555 0123 2026`, and both numbers from `212 555 0123 212 555 0124`.
+- If nothing is left either (`94105-1234`), the raw hit goes through the rule
+  as it is.
 
 The refined numbers are then scored like any other candidate.
 
@@ -721,6 +727,11 @@ The refined numbers are then scored like any other candidate.
 - **Hint words are plain words.** No grammar: "our UK team called a client
   in India" counts both words. They are ASCII only (no `£`, `€` or accents).
 - **Extensions** (`x204`) are not captured.
+- **Two space-grouped national numbers in one run, with a hint.** With a GB
+  hint, `0161 496 0001 0161 496 0002` gives 4-digit fragments (`0161`,
+  `0001`) as `possible_GB_number`: the matcher splits the run badly instead of
+  finding nothing. Separate the numbers (a comma or `and`) or tighten the
+  regex.
 
 ## Output files
 

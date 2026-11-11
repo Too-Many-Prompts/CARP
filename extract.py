@@ -134,6 +134,9 @@ class Candidate:
     # The written form of a validated match whose `text` is the formatted
     # number; "" otherwise. Report only (a_text): never in to_dict() / the JSON.
     raw: str = ""
+    # A validated reading's status (valid | possible); "" otherwise. Internal:
+    # resolve_overlaps uses it for validate.valid_ignores_min_score.
+    status: str = ""
 
     def __post_init__(self) -> None:
         if not self.pattern:
@@ -628,11 +631,14 @@ def _find_validated(
     """Candidates of a pattern with `validate`: its regex hits, each trimmed
     or split by PhoneNumberMatcher (POSSIBLE leniency).
 
-    The matcher runs in the top hinted region, else the first of `regions`. The regex scan resumes where the last refined
-    number ended, not where the regex hit ended: a greedy hit that ran into
-    the next number ("212-555-0123 212-555") would otherwise lose it. If the
-    matcher finds nothing, the raw hit is kept as it is, so validation (not
-    this step) decides its fate and logs it.
+    The matcher runs in the top hinted region, else the first of `regions`.
+    If it finds nothing, phone.trim_to_number() drops trailing digit groups
+    until a number is left ("212 555 0123 2026" -> "212 555 0123"). The regex
+    scan resumes where the last refined number ended, not where the regex hit
+    ended: a greedy hit that ran into the next number ("212-555-0123
+    212-555") would otherwise lose it. If neither finds a number, the raw hit
+    is kept as it is, so validation (not this step) decides its fate and
+    logs it.
     """
     spec = pattern.validate
     assert spec is not None
@@ -649,6 +655,13 @@ def _find_validated(
         top = max((h for h in hints if h.score > 0), key=lambda h: h.score, default=None)
         region = top.region if top else spec.regions[0]
         spans = phone.refine_spans(m.group(0), region)
+        if not spans:
+            # The matcher rejects space-grouped runs ("212 555 0123 2026") as
+            # one over-long number: trim trailing groups instead.
+            order = [region] + [r for r in spec.regions if r != region]
+            end = phone.trim_to_number(m.group(0), order)
+            if end is not None and end < len(m.group(0)):
+                spans = [(0, end)]
         if not spans:
             out.append(Candidate(pattern.label, m.start(), m.end(), m.group(0), pattern.priority))
             pos = m.end()
@@ -692,7 +705,7 @@ def validate_candidates(
             continue
         for r in out.readings:
             m = replace(c, label=r.label, text=r.normalized, raw=c.text,
-                        hit=hit_id)
+                        hit=hit_id, status=r.status)
             verdict = "kept" if r.returned else "not_kept"
             head = f"{r.status} in {r.region}" + (f"; {r.why}" if r.why else "")
             decisions.append(_decision(
@@ -760,6 +773,10 @@ def resolve_overlaps(
 ) -> tuple[list[Candidate], list[Decision]]:
     """Drop candidates below min_score, then resolve overlaps greedily.
 
+    A valid phone reading is exempt from min_score when its pattern's
+    validate.valid_ignores_min_score is on (the default); it still competes
+    in overlaps.
+
     Candidates are ranked by overlap_tiebreak (in config order); if it is
     empty or everything ties, the earlier start, then the label, decides.
     Each candidate is accepted unless it overlaps an already-accepted one
@@ -769,10 +786,13 @@ def resolve_overlaps(
     order = settings["overlap_tiebreak"]
     min_score = settings["min_score"]
     decisions: list[Decision] = []
+    # Patterns whose valid phone readings are never dropped for a low score.
+    trusted = {p.label for p in cfg.patterns
+               if p.validate is not None and p.validate.valid_ignores_min_score}
 
     survivors: list[Candidate] = []
     for c in cands:
-        if c.score < min_score:
+        if c.score < min_score and not (c.status == "valid" and c.pattern in trusted):
             decisions.append(
                 _decision("below_min_score", "dropped",
                           f"score {c.score:.2f} < min_score {min_score}", a=c,

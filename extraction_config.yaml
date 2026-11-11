@@ -57,6 +57,7 @@ patterns:
       # hint_conflict: all       # valid in several hinted regions: all | nearest
       # hint_fallback: if_not_valid  # after a hint, also parse `regions`: if_not_valid | if_nothing | always | never
       # output_format: E164      # match text: E164 | INTERNATIONAL | NATIONAL | RAW (as written)
+      # valid_ignores_min_score: true  # a valid number is never dropped for a low score
 
   - label: account_number
     priority: 3

@@ -1347,6 +1347,8 @@ def got(matches: list[Any]) -> list[tuple[str, str]]:
     ({"with": "phonenumbers", "regions": ["US"], "keep": "some"}, "validate.keep: unknown value 'some'"),
     ({"with": "phonenumbers", "regions": ["US"], "hint_conflict": "first"}, "validate.hint_conflict: unknown value"),
     ({"with": "phonenumbers", "regions": ["US"], "output_format": "e164"}, "validate.output_format: unknown value"),
+    ({"with": "phonenumbers", "regions": ["US"], "valid_ignores_min_score": "yes"},
+     "validate.valid_ignores_min_score: expected true or false"),
     ({"with": "phonenumbers", "regions": ["US"], "hints": {"GB": {"uk2": 1}}},
      "validate.hints.GB keyword 'uk2' must contain only ASCII letters"),
     ({"with": "phonenumbers", "regions": ["US"], "hints": {"GB": {"uk": -1}}},
@@ -1656,12 +1658,57 @@ def test_span_refinement_scores_the_trimmed_span(tmp_path: Path) -> None:
     ("(212) 555-0123 (212) 555-0199", ["(212) 555-0123", "(212) 555-0199"]),
     ("555-1234 555-5678", ["555-1234", "555-5678"]),
     ("212-555-0123, 212-555-0199", ["212-555-0123", "212-555-0199"]),
+    # Space-grouped: the matcher rejects the run, so trailing groups are trimmed.
+    ("212 555 0123 212 555 0124", ["212 555 0123", "212 555 0124"]),
+    ("212 555 0123  212 555 0124", ["212 555 0123", "212 555 0124"]),
+    ("Tel 212 555 0123 12 units", ["212 555 0123"]),
+    ("call 212 555 0123 2026", ["212 555 0123"]),
 ])
 def test_back_to_back_numbers_are_all_found(tmp_path: Path, text: str, expected: list[str]) -> None:
     """A greedy hit can run into the next number; the scan resumes where the
     refined number ended, so the next one is still found whole."""
     matches, _ = run_phone(tmp_path, text)
     assert [text[m.start:m.end] for m in matches] == expected
+
+
+def test_trim_keeps_a_valid_prefix_over_a_longer_possible_one() -> None:
+    assert phone.trim_to_number("212 555 0123 2026", ["US"]) == len("212 555 0123")
+    assert phone.trim_to_number("94105-1234", ["US"]) is None       # nothing: raw hit kept
+
+
+# ---- validate.valid_ignores_min_score
+MIN_SCORE_PHONE = {**phone_pattern(), "keywords": {"account": -2, "call": 1}}
+
+
+@pytest.mark.parametrize("ignores, expected", [
+    (True, [("valid_US_number", "+12125550145")]),
+    (False, []),
+])
+def test_valid_reading_survives_a_low_score(tmp_path: Path, ignores: bool, expected: list) -> None:
+    """'account' in the context pushes the phone below min_score 0."""
+    pattern = {**MIN_SCORE_PHONE, "validate": {**MIN_SCORE_PHONE["validate"],
+                                               "valid_ignores_min_score": ignores}}
+    matches, decisions = run_phone(tmp_path, ("Account", "call me at 212-555-0145"), [pattern])
+    assert got(matches) == expected
+    assert any(d["kind"] == "below_min_score" for d in decisions) == (not ignores)
+    if ignores:
+        assert matches[0].score < 0
+
+
+def test_possible_reading_still_needs_min_score(tmp_path: Path) -> None:
+    """555 is no real area code: possible, so min_score still applies."""
+    matches, decisions = run_phone(tmp_path, ("Account", "call me at 555-123-4567"), [MIN_SCORE_PHONE])
+    assert matches == []
+    assert [d["a_label"] for d in decisions if d["kind"] == "below_min_score"] == ["possible_US_number"]
+
+
+def test_valid_reading_below_min_score_still_loses_overlaps(tmp_path: Path) -> None:
+    acct = {"label": "account_number", "priority": 3, "regex": r"\b\d{10}\b",
+            "keywords": {"account": 3}}
+    matches, decisions = run_phone(tmp_path, ("Account", "2125550145"), [MIN_SCORE_PHONE, acct])
+    assert [m.label for m in matches] == ["account_number"]
+    (row,) = [d for d in decisions if d["kind"] == "overlap"]
+    assert (row["b_label"], row["decided_by"]) == ("valid_US_number", "score")
 
 
 def test_matcher_finding_nothing_keeps_the_raw_span(tmp_path: Path) -> None:

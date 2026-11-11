@@ -21,16 +21,18 @@ It never guesses a country. Every plausible reading of a number comes back
 
     spec = load_validate(label, raw_block, weight_map)     # at load time
     spans = refine_spans(span_text, region)                # trim / split a regex hit
+    end = trim_to_number(span_text, regions)               # ...when the matcher finds nothing
     out = readings_for(raw, spec, hints)                   # every reading + why
 """
 from __future__ import annotations
 
 import importlib
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 VALIDATE_KEYS = ("with", "regions", "hints", "keep", "hint_conflict", "hint_fallback",
-                 "output_format")
+                 "output_format", "valid_ignores_min_score")
 CHOICES = {
     "keep": ("valid_plus_home", "all", "valid_else_possible", "valid"),
     "hint_conflict": ("all", "nearest"),
@@ -74,6 +76,9 @@ class PhoneSpec:
     hint_conflict: str = "all"
     hint_fallback: str = "if_not_valid"
     output_format: str = "E164"
+    # A valid reading is never dropped for scoring below settings.min_score
+    # (it still competes in overlaps).
+    valid_ignores_min_score: bool = True
 
 
 WeightMap = Callable[[str, str, Any], dict[str, float]]
@@ -127,6 +132,10 @@ def load_validate(label: str, raw: Any, weight_map: WeightMap) -> PhoneSpec:
         if value not in choices:
             raise ValueError(f"{where}.{key}: unknown value {value!r} (expected one of {', '.join(choices)})")
         opts[key] = value
+    ignores = raw.get("valid_ignores_min_score", True)
+    if not isinstance(ignores, bool):
+        raise ValueError(f"{where}.valid_ignores_min_score: expected true or false, got {ignores!r}")
+    opts["valid_ignores_min_score"] = ignores
 
     hints_raw = raw.get("hints") or {}
     if not isinstance(hints_raw, dict):
@@ -157,6 +166,34 @@ def refine_spans(span_text: str, region: str) -> list[tuple[int, int]]:
     lib = pn()
     matcher = lib.PhoneNumberMatcher(span_text, region, leniency=lib.Leniency.POSSIBLE)
     return [(m.start, m.end) for m in matcher]
+
+
+_GROUP = re.compile(r"\+?\(?\d+\)?")
+
+
+def trim_to_number(span_text: str, regions: list[str]) -> int | None:
+    """For a hit the matcher found nothing in: drop digit groups from the end
+    until what is left is a number, and return where it ends.
+
+    The matcher reads space-separated groups ("212 555 0123 2026") as one
+    over-long candidate and rejects it. Here the longest prefix of whole
+    groups that is valid in some region wins; failing that, the longest one
+    that is possible as a full number (never a local-only one). None: no
+    prefix is a number, so the caller keeps the raw hit."""
+    ends = [m.end() for m in _GROUP.finditer(span_text)]
+    possible: int | None = None
+    for end in reversed(ends):          # longest first; the whole hit counts too
+        prefix = span_text[:end]
+        stripped = prefix.lstrip(" (")
+        tries: list[str | None] = [None] if stripped.startswith("+") else list(regions)
+        found = [check(prefix, r) for r in tries]
+        if stripped.startswith("00"):
+            found.append(check("+" + stripped[2:], None))
+        if any(c.status == "valid" for c in found):
+            return end
+        if possible is None and any(c.status == "possible" and c.full for c in found):
+            possible = end
+    return possible
 
 
 # --------------------------------------------------------------------------

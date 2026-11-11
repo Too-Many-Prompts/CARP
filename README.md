@@ -187,6 +187,7 @@ Every setting except `regions` has a default you can leave alone.
 | Should a country word replace my list? | `hint_fallback` | only if the hinted country gives a real number |
 | A number is real in two hinted countries: keep both? | `hint_conflict` | both |
 | How should `text` be written? | `output_format` | `+12125550123` (`INTERNATIONAL`, `NATIONAL`, `RAW` = as written) |
+| Should a real number survive a low score? | `valid_ignores_min_score` | yes: a valid number is never dropped by `min_score` (it can still lose an overlap) |
 
 Each option's values are listed in
 [Config options](docs/REFERENCE.md#validate-inside-a-pattern). The exact rule,

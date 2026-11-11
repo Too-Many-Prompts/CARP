@@ -26,9 +26,11 @@ string, and resolves overlapping matches.
    `score = text_score + context_score`; `pattern` is filled from `label`
    when blank (`__post_init__`), and differs only for phone readings.
    A pattern with `validate` is scanned by `_find_validated()`: each regex hit
-   is refined by `phone.refine_spans()` (PhoneNumberMatcher, POSSIBLE), the
-   raw hit is kept if it finds nothing, and the scan resumes after the last
-   refined number.
+   is refined by `phone.refine_spans()` (PhoneNumberMatcher, POSSIBLE); if
+   that finds nothing, `phone.trim_to_number()` drops trailing digit groups
+   until a valid (else full possible) number is left (the matcher rejects
+   space-grouped runs); failing both, the raw hit is kept. The scan resumes
+   after the last refined number.
 4. Scoring. One score per candidate, from two independent sums that are added:
    - `score_candidate(...)` (text score): take words before/after the match (per
      `settings.context_direction`: `before`, `after` or `both`, default `both`),
@@ -59,7 +61,9 @@ string, and resolves overlapping matches.
    in `to_dict()`). The report's `normalized` column is always E.164.
    Validation rows: one per reading (kept / not_kept), or one `dropped`
    row when the hit is impossible everywhere.
-5. `resolve_overlaps(...)`: drop below `min_score`; for overlapping spans keep
+5. `resolve_overlaps(...)`: drop below `min_score` (valid phone readings are
+   exempt when `validate.valid_ignores_min_score`, the default; internal
+   `Candidate.status`); for overlapping spans keep
    both if the label pair or the `pattern` pair is in `coexist` (readings of
    one hit never conflict), else apply `overlap_tiebreak` in
    order (`score`, `length`, `priority`). Empty list or full tie: earlier
@@ -100,7 +104,8 @@ string, and resolves overlapping matches.
     readings of the `regions` list come back;
   - `hint_conflict` (all | nearest);
   - `hint_fallback` (if_not_valid | if_nothing | always | never);
-  - `output_format` (E164 | INTERNATIONAL | NATIONAL | RAW): the match `text`.
+  - `output_format` (E164 | INTERNATIONAL | NATIONAL | RAW): the match `text`;
+  - `valid_ignores_min_score` (bool, default true).
 
   An unknown key or value fails, naming the allowed ones.
 - Never lose a hit silently: every validated regex hit ends up as matches or
@@ -139,7 +144,8 @@ string, and resolves overlapping matches.
   `summarize_overlaps`, `summarize_misses` and `--summarize`, and the public
   API as the README shows it. Phone: `validate` load errors,
   each status, every `keep`, `hint_conflict` and `hint_fallback` mode, hints
-  (including misfits), `+`/`00`/`011`, span refinement and back-to-back
+  (including misfits), `+`/`00`/`011`, span refinement (incl. space-grouped trimming),
+  `valid_ignores_min_score`, and back-to-back
   numbers, readings vs other patterns, coexist/misses via `pattern`, every `output_format`,
   report rows, `summarize_validation`.
 - Run `pytest -q` after every change and do not report success until it passes.

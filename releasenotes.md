@@ -55,8 +55,13 @@ every caller.
 8. **(all) `--summarize` output** has a third table when the report has
    `validation` rows. New importable functions: `summarize_validation`,
    `format_validation`.
+9. **Valid phone numbers are not dropped by `min_score`.** A number the
+   library confirms as valid is kept even with a score below
+   `settings.min_score` (it can still lose an overlap), so `m.score` can be
+   negative on a `valid_*` match. Set `validate.valid_ignores_min_score: false`
+   for the old behaviour.
 
-No effect on callers: `Candidate` gained `pattern`, `hit`, `raw` after its
+No effect on callers: `Candidate` gained `pattern`, `hit`, `raw`, `status` after its
 existing fields (all defaulted), so existing construction still works;
 `phonenumbers` is imported only when a config uses `validate` (install
 `phonenumbers>=9.0` only then); there is deliberately no per-call region argument.
