@@ -66,7 +66,7 @@ CONTEXT_DIRECTIONS = ("before", "after", "both")
 
 # The decision report (extract's log) as CSV; main() resets it once per run.
 REPORT_PATH = DEFAULT_REPORT_PATH       # "extract_report.csv", defined in summarize.py
-_CAND_COLS = ("label", "text", "start", "end", "score", "text_score", "context_score", "family")
+_CAND_COLS = ("label", "text", "start", "end", "score", "text_score", "context_score", "pattern")
 # Phone validation columns; blank on every other row kind.
 _PHONE_COLS = ("status", "region", "normalized")
 REPORT_FIELDS = (
@@ -80,7 +80,7 @@ REPORT_FIELDS = (
 # coexist -> coexist; below_min_score -> min_score; miss -> "";
 # validation -> the region source (phone.SOURCES: number | hint | list).
 # miss outcome: no_candidates (regex gap) | candidates_dropped (tuning).
-# validation outcome: kept | not_returned (a reading filtered out) | dropped (impossible).
+# validation outcome: kept | not_kept (a reading filtered out) | dropped (impossible).
 REQUIRED_SETTINGS = (
     "context_window_words",
     "distance_decay",
@@ -126,19 +126,19 @@ class Candidate:
     score: float = 0            # text_score + context_score
     text_score: float = 0
     context_score: float = 0
-    # The pattern label when `label` is generated (valid_US_number ->
-    # phone_number); "" means the same as label. coexist and misses use it.
-    family: str = ""
+    # The label of the pattern this match came from: the same as `label`,
+    # except for validated matches (valid_US_number -> phone_number).
+    # Filled in from `label` when left blank. coexist and misses use it.
+    pattern: str = ""
     # Readings of one phone hit share a hit id and never conflict (-1: none).
     hit: int = -1
     # The written form of a validated match whose `text` is the formatted
     # number; "" otherwise. Report only (a_text): never in to_dict() / the JSON.
     raw: str = ""
 
-    @property
-    def group(self) -> str:
-        """The pattern label this match belongs to."""
-        return self.family or self.label
+    def __post_init__(self) -> None:
+        if not self.pattern:
+            self.pattern = self.label
 
     def to_dict(self) -> dict[str, Any]:
         """The CLI JSON form: label, text, start, end, score."""
@@ -157,7 +157,7 @@ class Candidate:
             "text": self.raw or self.text,      # the report shows the written form
             "text_score": round(float(self.text_score), 4),
             "context_score": round(float(self.context_score), 4),
-            "family": self.group,
+            "pattern": self.pattern,
         }
 
 
@@ -694,7 +694,7 @@ def validate_candidates(
     match per returned reading, labeled valid_US_number, possible_GB_number...
     (phone.readings_for). The readings share the hit's span and score and
     never conflict with each other. Logs one `validation` row per reading
-    (kept / not_returned), or one `dropped` row when the hit is impossible
+    (kept / not_kept), or one `dropped` row when the hit is impossible
     everywhere. Runs after scoring and before min_score/overlaps; other
     candidates pass through."""
     by_label = {p.label: p for p in cfg.patterns}
@@ -711,7 +711,6 @@ def validate_candidates(
         out = phone.readings_for(c.text, spec, hints)
         tail = out.notes + [f"phonenumbers {version}"]
         if not out.readings:
-            c.family = c.label
             decisions.append(_decision(
                 "validation", "dropped", "; ".join([out.why] + tail), a=c,
                 decided_by=out.source, status="impossible", normalized=c.text,
@@ -719,8 +718,8 @@ def validate_candidates(
             continue
         for r in out.readings:
             m = replace(c, label=r.label, text=r.normalized, raw=c.text,
-                        family=c.label, hit=hit_id)
-            verdict = "kept" if r.returned else "not_returned"
+                        hit=hit_id)
+            verdict = "kept" if r.returned else "not_kept"
             head = f"{r.status} in {r.region}" + (f"; {r.why}" if r.why else "")
             decisions.append(_decision(
                 "validation", verdict, "; ".join([head] + tail), a=m,
@@ -816,7 +815,7 @@ def resolve_overlaps(
             if not _overlaps(a, c) or (a.hit >= 0 and a.hit == c.hit):
                 continue                # readings of one phone hit never conflict
             if (frozenset((a.label, c.label)) in cfg.coexist
-                    or frozenset((a.group, c.group)) in cfg.coexist):
+                    or frozenset((a.pattern, c.pattern)) in cfg.coexist):
                 pending.append(
                     _decision("coexist", "both_kept",
                               f"{a.label}/{c.label} pair is in coexist; both kept",
@@ -862,12 +861,12 @@ def _miss_decisions(
     matches: list[Candidate],
 ) -> list[Decision]:
     """One `miss` row per label the context scored above 0 that has no match.
-    Labels are compared by pattern (Candidate.group), so a valid_US_number
+    Labels are compared by pattern (Candidate.pattern), so a valid_US_number
     match counts for its phone pattern."""
-    kept = {m.group for m in matches}
+    kept = {m.pattern for m in matches}
     found: dict[str, int] = {}
     for c in cands:
-        found[c.group] = found.get(c.group, 0) + 1
+        found[c.pattern] = found.get(c.pattern, 0) + 1
     rows: list[Decision] = []
     for p in cfg.patterns:
         score, hits = ctx_scores[p.label]

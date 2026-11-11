@@ -22,8 +22,9 @@ string, and resolves overlapping matches.
    `finditer`. Never combine patterns into one alternation (it hides overlaps).
    Every pattern always runs on the text; the context never selects patterns.
    Candidate = dataclass(label, start, end, text, priority, score=0,
-   text_score=0, context_score=0, family="", hit=-1, raw="");
-   `score = text_score + context_score`; `group` = family or label.
+   text_score=0, context_score=0, pattern="", hit=-1, raw="");
+   `score = text_score + context_score`; `pattern` is filled from `label`
+   when blank (`__post_init__`), and differs only for phone readings.
    A pattern with `validate` is scanned by `_find_validated()`: each regex hit
    is refined by `phone.refine_spans()` (PhoneNumberMatcher, POSSIBLE), the
    raw hit is kept if it finds nothing, and the scan resumes after the last
@@ -48,18 +49,18 @@ string, and resolves overlapping matches.
    - the hinted regions (valid readings, else possible ones;
      `hint_conflict` all | nearest);
    - the `regions` list, filtered by `keep`. After a hint, it runs per
-     `hint_fallback`: not_valid (default; no valid hinted reading),
-     impossible (no hinted reading), always, never. Its readings are added
-     (source `list`); each reading keeps its own source.
+     `hint_fallback`: if_not_valid (default; no valid hinted reading),
+     if_nothing (no hinted reading), always, never. Its readings are added
+     (source `regions`); each reading keeps its own source.
    Each returned reading becomes a match labeled `{status}_{REGION}_number`,
-   with `family` = the pattern label, a shared `hit` id, `text` = the
+   with `pattern` = the pattern label, a shared `hit` id, `text` = the
    number in `output_format` (E164 | INTERNATIONAL | NATIONAL | RAW; RAW keeps
    the input slice) and `raw` = the written form (report `a_text` only; never
    in `to_dict()`). The report's `normalized` column is always E.164.
-   Validation rows: one per reading (kept / not_returned), or one `dropped`
+   Validation rows: one per reading (kept / not_kept), or one `dropped`
    row when the hit is impossible everywhere.
 5. `resolve_overlaps(...)`: drop below `min_score`; for overlapping spans keep
-   both if the label pair or the `group` pair is in `coexist` (readings of
+   both if the label pair or the `pattern` pair is in `coexist` (readings of
    one hit never conflict), else apply `overlap_tiebreak` in
    order (`score`, `length`, `priority`). Empty list or full tie: earlier
    start, then label. Identical spans count as overlapping.
@@ -70,10 +71,10 @@ string, and resolves overlapping matches.
    Load warnings go to stderr as `warning: ...` (exit code unchanged).
 7. `summarize_overlaps(path=REPORT_PATH)` (in `summarize.py`, a leaf module
    that imports nothing from `extract.py`; `extract.py` re-exports it) reads a report CSV's `overlap` rows
-   and summarizes them per label pair (counts by `decided_by`, `no_evidence`,
+   and summarizes them per pattern pair (`a_pattern`) (counts by `decided_by`, `no_evidence`,
    examples, hint); `summarize_misses(path)` counts `miss` rows per label
    (no candidates / dropped); `summarize_validation(path)` counts `validation`
-   rows per pattern family (statuses, sources, not_returned, multi-reading
+   rows per pattern (statuses, sources, not_kept, multi-reading
    hits, possible-number area-code clusters). CLI: `extract.py --summarize [PATH]` prints all three
    (no `--config`; not combinable with the scan flags).
 
@@ -95,29 +96,30 @@ string, and resolves overlapping matches.
   - `with: phonenumbers` and `regions: [US, ...]` (required; the first is
     the home region);
   - `hints` ({REGION: {word: weight > 0}}, read like `keywords`);
-  - `keep` (valid_and_home | all | valid_else_possible | valid): which
+  - `keep` (valid_plus_home | all | valid_else_possible | valid): which
     readings of the `regions` list come back;
   - `hint_conflict` (all | nearest);
-  - `hint_fallback` (not_valid | impossible | always | never);
+  - `hint_fallback` (if_not_valid | if_nothing | always | never);
   - `output_format` (E164 | INTERNATIONAL | NATIONAL | RAW): the match `text`.
 
   The earlier keys (`default_region`, `try_regions`, `possible_label`,
   `on_*`, `possible_min_score`, `region_from`, `readings` (now `keep`),
-  `regions` as a map) fail with
-  a migration message.
+  `regions` as a map) fail with a migration message, and so do the renamed
+  values (`valid_and_home`, hint_fallback `not_valid` / `impossible`;
+  `phone.RENAMED_VALUES`).
 - Never lose a hit silently: every validated regex hit ends up as matches or
   a `dropped` row with a reason (which includes the phonenumbers version).
-- `coexist`, miss rows and `summarize_validation` use `family`
-  (`Candidate.group`), so rules naming the pattern label cover every reading.
+- `coexist`, miss rows and `summarize_validation` use
+  `Candidate.pattern`, so rules naming the pattern label cover every reading.
 - Regions come only from the YAML (`regions`, `hints`, a `+` in the number);
   there is no per-call region argument or CLI flag.
 
 ## Decisions and report
 - The decisions from `extract()` are flat dicts (`REPORT_FIELDS`, ending in
   `decided_by`). Kinds: `below_min_score`, `overlap`, `coexist`, `miss`,
-  `validation` (`decided_by` = source: number | hint | list; columns
+  `validation` (`decided_by` = source: number | hint | regions; columns
   `status`, `region`, `normalized` sit just before `decided_by`, blank on other
-  kinds; candidate columns end in `family`).
+  kinds; candidate columns end in `pattern`).
   `decided_by` is set from the deciding criterion (`_why_wins` returns
   `(criterion, reason)`), never parsed from `reason`. Candidate columns
   include the `text_score` / `context_score` breakdown.
@@ -142,7 +144,7 @@ string, and resolves overlapping matches.
   API as the README shows it. Phone: `validate` load and migration errors,
   each status, every `keep`, `hint_conflict` and `hint_fallback` mode, hints
   (including misfits), `+`/`00`/`011`, span refinement and back-to-back
-  numbers, readings vs other patterns, coexist/misses via `family`, every `output_format`,
+  numbers, readings vs other patterns, coexist/misses via `pattern`, every `output_format`,
   report rows, `summarize_validation`.
 - Run `pytest -q` after every change and do not report success until it passes.
 

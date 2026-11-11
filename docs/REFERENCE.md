@@ -186,14 +186,14 @@ zero or more readings, and each reading becomes a match.
      to step 5.
    - **some** → go to step 4.
 4. **What does `hint_fallback` say?**
-   - **`never`, `impossible`** → return the hinted readings only, source
+   - **`never`, `if_nothing`** → return the hinted readings only, source
      `hint`. **Done.**
-   - **`not_valid`** → is any hinted reading valid? Yes: return the hinted
+   - **`if_not_valid`** → is any hinted reading valid? Yes: return the hinted
      readings only (**done**). No: go to step 5.
    - **`always`** → go to step 5. The hinted readings stay.
 5. **Parse in each region of `regions`.** Return what `keep` allows, and add
    the readings you already have from the hints, if any.
-   - **some readings** → return them, sources `hint` and `list`. **Done.**
+   - **some readings** → return them, sources `hint` and `regions`. **Done.**
    - **none** → go to step 6.
 6. **Does it start with `00`?**
    - **yes, and possible when `00` is read as `+`** → one reading, source
@@ -219,13 +219,13 @@ flowchart TD
     H -- "yes" --> X
     H -- "no" --> L
     G -- "some" --> I{"hint_fallback"}
-    I -- "never or impossible" --> R2["hinted readings only<br/>source: hint"]
-    I -- "not_valid" --> J{"any hinted reading valid?"}
+    I -- "never or if_nothing" --> R2["hinted readings only<br/>source: hint"]
+    I -- "if_not_valid" --> J{"any hinted reading valid?"}
     J -- "yes" --> R2
     J -- "no" --> L
     I -- "always" --> L
-    L["parse in each region of regions<br/>keep what readings allows"] --> M{"any reading in total?"}
-    M -- "yes" --> R3["hinted + list readings<br/>sources: hint and list"]
+    L["parse in each region of regions<br/>return what keep allows"] --> M{"any reading in total?"}
+    M -- "yes" --> R3["hinted + regions readings<br/>sources: hint and regions"]
     M -- "no" --> N{"starts with 00, and possible<br/>when 00 is read as +?"}
     N -- "yes" --> R1
     N -- "no" --> X
@@ -290,7 +290,7 @@ config (decay on, `min_score` 0, `phone_number` validated for the US):
 | --- | --- |
 | Find | `account_number` hits `2125550123`. `phone_number` hits `2125550123` and `212-555-0123`. |
 | Score | `account_number`: text `acct` +3, `call` -2 = 1.0; context `acct` +3; total **4.0**. Phone hit 1: `call` +2 = **2.0**. Phone hit 2: `call` +2 = **2.0**. |
-| Validate | Both phone hits are valid in the US: two `validation` rows, `kept`, source `list`. Labels become `valid_US_number`. |
+| Validate | Both phone hits are valid in the US: two `validation` rows, `kept`, source `regions`. Labels become `valid_US_number`. |
 | `min_score` | All three are at or above 0. No `below_min_score` rows. |
 | Overlap | `account_number` and the first phone reading share a span. Not a coexist pair, so the chain runs: score 4.00 > 2.00. The `overlap` row says `decided_by: score`, and the phone reading is dropped. |
 | Result | `account_number` `2125550123` (4.0) and `valid_US_number` `+12125550123` (2.0, written `212-555-0123`). The second phone hit overlapped nothing, so it has no row beyond its validation row. |
@@ -309,7 +309,7 @@ shape in GB, and the context points to a phone.
 | --- | --- |
 | Find | `account_number` and `phone_number` both hit `2125550123` (5-15). The phone library confirms the span, so nothing is trimmed. |
 | Score | `account_number`: text `acct` +3 (1 word away); context `phone` -3 (the context's last word, distance 1); total **0.0**. Phone hit: no phone words in the text; context `phone` +3; total **3.0**. |
-| Validate | No `+`, no hint words, so it is parsed in each region of `regions`. US: `+12125550123` **valid**. GB: `+442125550123` only **possible**. `keep: valid_and_home` returns the valid reading and the home region's possible one; the home region (US) is already valid, so GB is not returned. |
+| Validate | No `+`, no hint words, so it is parsed in each region of `regions`. US: `+12125550123` **valid**. GB: `+442125550123` only **possible**. `keep: valid_plus_home` returns the valid reading and the home region's possible one; the home region (US) is already valid, so GB is not returned. |
 | `min_score` | 0.0 and 3.0 are both at or above 0. |
 | Overlap | `valid_US_number` and `account_number` share a span and are not a coexist pair. Score 3.00 > 0.00: the phone reading wins. |
 | Result | `valid_US_number`, `text` `+12125550123`, `start` 5, `end` 15, score 3.0. |
@@ -318,8 +318,8 @@ The report has three rows:
 
 | kind | outcome | a_label | a_text | normalized | decided_by | reason |
 | --- | --- | --- | --- | --- | --- | --- |
-| validation | kept | valid_US_number | 2125550123 | +12125550123 | list | valid in US |
-| validation | not_returned | possible_GB_number | 2125550123 | +442125550123 | list | possible in GB; keep: valid_and_home |
+| validation | kept | valid_US_number | 2125550123 | +12125550123 | regions | valid in US |
+| validation | not_kept | possible_GB_number | 2125550123 | +442125550123 | regions | possible in GB; keep: valid_plus_home |
 | overlap | a_wins_b_dropped | valid_US_number (b: account_number) | 2125550123 | | score | score 3.00 > 0.00 |
 
 The overlap row also has `b_text_score` 3.0 and `b_context_score` -3.0, which
@@ -334,9 +334,9 @@ What changes the outcome:
   compete with each other, and both beat `account_number`.
 - **A GB hint** (`hints: {GB: {london: 2}}`, text `Acct 2125550123 london
   office`): GB is parsed first, and the number is only possible there. With the
-  default `hint_fallback: not_valid` the list is parsed too, so both readings
-  come back; the reason says `hint GB not valid; hint_fallback: not_valid
-  parsed the list too`.
+  default `hint_fallback: if_not_valid` the regions are parsed too, so both readings
+  come back; the reason says `hint GB not valid; hint_fallback: if_not_valid
+  parsed the regions too`.
 - **The same hint with `hint_fallback: never`:** only `possible_GB_number`
   comes back. The US reading is never tried.
 - **`acct` does not lower the phone score,** because the phone pattern lists
@@ -350,7 +350,7 @@ it, `outcome` what happened, and `decided_by` the rule that decided.
 
 | `kind` | Written when | `outcome` | `decided_by` |
 | --- | --- | --- | --- |
-| `validation` | a phone hit was checked: one row per reading, or one for an impossible hit | `kept`, `not_returned`, `dropped` | `number`, `hint`, `list` |
+| `validation` | a phone hit was checked: one row per reading, or one for an impossible hit | `kept`, `not_kept`, `dropped` | `number`, `hint`, `regions` |
 | `below_min_score` | a candidate scored under `min_score` | `dropped` | `min_score` |
 | `overlap` | two candidates overlapped and one lost | `a_wins_b_dropped` | `score`, `length`, `priority`, `start_label` |
 | `coexist` | two candidates overlapped but their labels are a coexist pair | `both_kept` | `coexist` |
@@ -363,7 +363,7 @@ Questions the report answers:
 | Why did `A` beat `B`? | the `overlap` row: `a_*` is the winner, `b_*` the loser; `reason` shows the numbers |
 | Why is my match missing? | `b_` side of an `overlap` row; a `below_min_score` row; a `validation` row with `dropped`; or a `miss` row |
 | Why `possible_US_number` and not `valid_US_number`? | the `validation` row: `status`, `region`, and `reason` |
-| Why was a phone reading not returned? | a `validation` row with `not_returned`; `reason` names the `keep` or `hint_conflict` setting |
+| Why was a phone reading not returned? | a `validation` row with `not_kept`; `reason` names the `keep` or `hint_conflict` setting |
 | What do I tune first? | `extract.py --summarize` (see [Summaries](#summaries)) |
 
 ## How it works
@@ -535,9 +535,9 @@ library.
     hints:                      # optional; words that point to a region, weight > 0
       GB: {uk: 3, london: 2}
       IN: {india: 3}
-    keep: valid_and_home        # what the list returns: valid_and_home | all | valid_else_possible | valid
+    keep: valid_plus_home        # what the list returns: valid_plus_home | all | valid_else_possible | valid
     hint_conflict: all          # valid in several hinted regions: all | nearest
-    hint_fallback: not_valid    # after a hint, also parse `regions`: not_valid | impossible | always | never
+    hint_fallback: if_not_valid    # after a hint, also parse `regions`: if_not_valid | if_nothing | always | never
     output_format: E164         # the match text: E164 | INTERNATIONAL | NATIONAL | RAW
 ```
 
@@ -574,26 +574,26 @@ Readings that give the same number count as one. US and CA share +1, so
      context; then the higher hint score wins; an exact tie keeps both.
    - Source `hint`.
    - `hint_fallback` decides whether step 3 also runs. Its readings are
-     added, with source `list`, and the hinted readings stay:
+     added, with source `regions`, and the hinted readings stay:
 
      | `hint_fallback` | The list is also parsed when |
      | --- | --- |
-     | `not_valid` (default) | no hinted reading is valid |
-     | `impossible` | the number fits no hinted region at all |
+     | `if_not_valid` (default) | no hinted reading is valid |
+     | `if_nothing` | the number fits no hinted region at all |
      | `always` | always |
      | `never` | never: a number that fits no hinted region is dropped |
 
      Example: "london" plus `212-555-0123` is only possible in GB but valid
      in the US. The default gives `possible_GB_number` + `valid_US_number`;
-     `impossible` and `never` give only `possible_GB_number`.
+     `if_nothing` and `never` give only `possible_GB_number`.
    - The report notes why the list ran, e.g. `hint FR did not fit` or
-     `hint GB not valid; hint_fallback: not_valid parsed the list too`.
-3. **The list:** parse in every `regions` entry. Source `list`.
+     `hint GB not valid; hint_fallback: if_not_valid parsed the regions too`.
+3. **The list:** parse in every `regions` entry. Source `regions`.
    `keep` decides what is returned:
 
    | `keep` | Returned |
    | --- | --- |
-   | `valid_and_home` (default) | every valid reading, plus the home (first) region's reading when it is only possible |
+   | `valid_plus_home` (default) | every valid reading, plus the home (first) region's reading when it is only possible |
    | `all` | every valid and possible reading |
    | `valid_else_possible` | the valid readings if any, else every possible one |
    | `valid` | valid readings only |
@@ -608,7 +608,7 @@ valid in GB. With `regions: [US, GB]`:
 
 | `keep` | Matches |
 | --- | --- |
-| `valid_and_home` | `possible_US_number`, `valid_GB_number` |
+| `valid_plus_home` | `possible_US_number`, `valid_GB_number` |
 | `all` | the same |
 | `valid_else_possible`, `valid` | `valid_GB_number` |
 
@@ -631,8 +631,9 @@ The refined numbers are then scored like any other candidate.
   conflict with each other.
 - **Other patterns:** each reading competes normally with other patterns
   (e.g. `account_number`), by score, length and priority.
-- **`family`:** every reading carries `family`, the pattern's own label
-  (`phone_number`).
+- **`pattern`:** every match carries `pattern`, the label of the pattern it
+  came from. For a reading that is the phone pattern (`phone_number`); for
+  any other match it equals `label`.
   - `coexist: [[phone_number, account_number]]` covers every reading. A
     generated label works in `coexist` too.
   - Miss rows count a reading as a match of its pattern.
@@ -682,23 +683,23 @@ file is gitignored.
 
 - `extract_report.csv`: the decision log, one row per decision. Columns:
   `file, kind, outcome, reason`, the `a_*` and `b_*` candidate columns
-  (`label, text, start, end, score, text_score, context_score, family`), the
+  (`label, text, start, end, score, text_score, context_score, pattern`), the
   phone columns `status, region, normalized` (blank except on `validation`
-  rows), then `decided_by`. `family` is the pattern label (it differs from
+  rows), then `decided_by`. `pattern` is the pattern label (it differs from
   `label` only for phone readings).
   - `kind` is `below_min_score`, `overlap`, `coexist`, `miss` or `validation`.
   - `validation` rows: one per reading of a phone hit (`a` = the reading):
-    - `outcome` is `kept`, or `not_returned` when `keep` / `hint_conflict`
+    - `outcome` is `kept`, or `not_kept` when `keep` / `hint_conflict`
       filtered it out;
     - an impossible hit gets a single `dropped` row;
-    - `decided_by` is the reading's source (`number`, `hint`, `list`); one
-      hit can mix `hint` and `list` readings (see `hint_fallback`);
+    - `decided_by` is the reading's source (`number`, `hint`, `regions`); one
+      hit can mix `hint` and `regions` readings (see `hint_fallback`);
     - `reason` reads e.g. `possible in GB; keep: valid; phonenumbers 9.0.43`.
   - In an `overlap` row, `a` is the winner and `b` the dropped candidate.
   - `decided_by` is machine-readable: for `overlap`, the criterion that decided
     (`score`, `length`, `priority`, or `start_label` when everything tied);
     `coexist` for `coexist`; `min_score` for `below_min_score`; empty for `miss`;
-    the source (`number`, `hint`, `list`) for `validation`.
+    the source (`number`, `hint`, `regions`) for `validation`.
 - Library helpers (all optional, none called by `extract()`): `write_report_csv(decisions)`
   appends rows; `reset_report()` starts a fresh file; `open_report()` opens the
   report once for many calls (see the loop above).
@@ -733,7 +734,7 @@ is rejected: regenerate it with `--report`.
 ### Overlap summary
 
 `summarize_overlaps(path="extract_report.csv")` reads the report's `overlap`
-rows and returns one row per label pair:
+rows and returns one row per pattern pair (a phone reading counts as its pattern, e.g. `phone_number`), so a pair can go straight into `coexist`:
 `pair, overlaps, by_score, by_length, by_priority, by_start_label,
 not_by_score, not_by_score_pct, no_evidence, wins, examples, hint`.
 
@@ -757,12 +758,12 @@ not_by_score, not_by_score_pct, no_evidence, wins, examples, hint`.
 ### Validation summary
 
 `summarize_validation(path="extract_report.csv")` returns one row per phone
-pattern (`family`):
-`family, hits, kept, valid, possible, not_returned, dropped, multi, sources,
+pattern (`pattern`):
+`pattern, hits, kept, valid, possible, not_kept, dropped, multi, sources,
 regions, clusters, examples, hint`.
 
 - `hits` counts numbers in the text. `kept`, `valid` and `possible` count
-  returned readings, and `not_returned` counts the filtered ones.
+  returned readings, and `not_kept` counts the filtered ones.
 - `multi` counts hits with more than one returned reading.
 - `clusters` groups `possible` readings by leading digits (the area code for +1).
 - `examples` gives up to three multi or dropped hits.
@@ -796,5 +797,5 @@ as shown in the README and this reference. Phone tests cover the `validate`
 load and migration errors, each status, every `keep`, `hint_conflict`
 and `hint_fallback` mode, hints (including a hint that does not fit), `+`, `00` and
 `011`, span refinement and back-to-back numbers, readings competing with
-other patterns, `coexist` and misses through `family`, every `output_format`, the report
+other patterns, `coexist` and misses through `pattern`, every `output_format`, the report
 rows and the validation summary.

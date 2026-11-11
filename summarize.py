@@ -7,7 +7,7 @@
     checks = summarize_validation()        # phone validation, one row per phone pattern
     print(format_validation(checks))       # printed last, if there are any
 
-The overlap table shows which label pairs overlap most often without being
+The overlap table shows which pattern pairs overlap most often without being
 resolved by score. The miss table shows which labels the context pointed to
 but that produced no match. This module only reads report columns by name
 (COLUMNS_USED); it imports nothing from extract.py, which re-exports the four
@@ -26,7 +26,7 @@ DEFAULT_REPORT_PATH = "extract_report.csv"
 COLUMNS_USED = (
     "file", "kind", "a_label", "a_text", "a_start", "a_end",
     "b_label", "b_text", "b_start", "b_end", "decided_by", "outcome",
-    "status", "region", "normalized", "a_family",
+    "status", "region", "normalized", "a_pattern",
 )
 
 SUMMARY_CRITERIA = ("score", "length", "priority", "start_label")
@@ -43,7 +43,7 @@ MISS_FIELDS = ("label", "misses", "no_candidates", "dropped", "examples", "hint"
 HINT_MISS_REGEX = "the regex found nothing; check the regex against these inputs"
 HINT_MISS_TUNING = "candidates lost; raise their nearby/context weights or check min_score"
 VALIDATION_FIELDS = (
-    "family", "hits", "kept", "valid", "possible", "not_returned", "dropped", "multi",
+    "pattern", "hits", "kept", "valid", "possible", "not_kept", "dropped", "multi",
     "sources", "regions", "clusters", "examples", "hint",
 )
 _CLUSTER_MIN = 3        # possible numbers sharing leading digits before the hint shows
@@ -85,7 +85,7 @@ def _example(row: dict[str, str]) -> str:
 
 
 def summarize_overlaps(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]]:
-    """Summarize a report CSV's `overlap` rows by label pair.
+    """Summarize a report CSV's `overlap` rows by pattern pair (`a_pattern`; the label in older reports).
 
     Shows which pairs overlap most often without being resolved by score:
     counts per deciding criterion, `no_evidence` (decided by priority or
@@ -100,7 +100,10 @@ def summarize_overlaps(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]]:
         for row in reader:
             if row.get("kind") != "overlap":
                 continue
-            a, b = row.get("a_label", ""), row.get("b_label", "")
+            # By pattern, so every phone reading counts for its pattern and the
+            # pair can go straight into `coexist`. Older reports: the label.
+            a = row.get("a_pattern") or row.get("a_label", "")
+            b = row.get("b_pattern") or row.get("b_label", "")
             st = stats.setdefault("/".join(sorted((a, b))), _PairStats())
             by = row.get("decided_by", "")
             st.by[by] += 1
@@ -221,16 +224,16 @@ def _cluster_key(normalized: str) -> str | None:
 
 
 def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]]:
-    """Count a report CSV's `validation` rows per phone pattern (`a_family`).
+    """Count a report CSV's `validation` rows per phone pattern (`a_pattern`).
 
     A hit is one phone number in the text; it has one row per reading
-    (`kept` or `not_returned`) or one `dropped` row (impossible). Per pattern:
-    hits, kept readings by status, not_returned, dropped, `multi` (hits
+    (`kept` or `not_kept`) or one `dropped` row (impossible). Per pattern:
+    hits, kept readings by status, not_kept, dropped, `multi` (hits
     with more than one kept reading), counts by source (`decided_by`) and by
     region, `possible` readings grouped by leading digits (a cluster sharing
     an area code suggests the library's metadata is stale), up to three
     examples of multi or dropped hits, and a hint. Sorted by hits (highest
-    first), then family.
+    first), then pattern.
     """
     stats: dict[str, dict[str, Any]] = {}
     fh, reader = _open_report(path)
@@ -238,8 +241,8 @@ def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]
         for row in reader:
             if row.get("kind") != "validation":
                 continue
-            family = row.get("a_family") or row.get("a_label", "")
-            st = stats.setdefault(family, {
+            pattern = row.get("a_pattern") or row.get("a_label", "")
+            st = stats.setdefault(pattern, {
                 "out": Counter(), "status": Counter(), "sources": Counter(),
                 "regions": Counter(), "clusters": Counter(), "hits": Counter(),
                 "texts": {},
@@ -263,7 +266,7 @@ def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]
                     st["clusters"][key] += 1
 
     out: list[dict[str, Any]] = []
-    for family, st in stats.items():
+    for pattern, st in stats.items():
         hits = len(st["hits"])
         multi_hits = [h for h, n in st["hits"].items() if n > 1]
         examples = []
@@ -279,12 +282,12 @@ def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]
         if st["out"]["dropped"] * 2 > hits:
             hints.append(HINT_IMPOSSIBLE)
         out.append({
-            "family": family,
+            "pattern": pattern,
             "hits": hits,
             "kept": st["out"]["kept"],
             "valid": st["status"]["valid"],
             "possible": st["status"]["possible"],
-            "not_returned": st["out"]["not_returned"],
+            "not_kept": st["out"]["not_kept"],
             "dropped": st["out"]["dropped"],
             "multi": len(multi_hits),
             "sources": _joined(st["sources"]),
@@ -293,7 +296,7 @@ def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]
             "examples": " | ".join(examples),
             "hint": "; ".join(hints) or "ok",
         })
-    out.sort(key=lambda r: (-r["hits"], r["family"]))
+    out.sort(key=lambda r: (-r["hits"], r["pattern"]))
     return out
 
 

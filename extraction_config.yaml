@@ -53,9 +53,9 @@ patterns:
       # hints:                   # words that point to a region (text window + context);
       #   GB: {uk: 3, britain: 3, british: 2, england: 2, london: 2}   # parsed first, then
       #   IN: {india: 3, indian: 2, mumbai: 2, delhi: 2}                # see hint_fallback
-      # keep: valid_and_home     # which list readings come back: valid_and_home | all | valid_else_possible | valid
+      # keep: valid_plus_home     # which list readings come back: valid_plus_home | all | valid_else_possible | valid
       # hint_conflict: all       # valid in several hinted regions: all | nearest
-      # hint_fallback: not_valid # after a hint, also parse `regions`: not_valid | impossible | always | never
+      # hint_fallback: if_not_valid  # after a hint, also parse `regions`: if_not_valid | if_nothing | always | never
       # output_format: E164      # match text: E164 | INTERNATIONAL | NATIONAL | RAW (as written)
 
   - label: account_number

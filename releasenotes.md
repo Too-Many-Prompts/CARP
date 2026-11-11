@@ -22,8 +22,8 @@ every caller.
    `{status}_{REGION}_number` (`valid_US_number`, `possible_GB_number`), never
    `phone_number`.
    - Look for: `m.label == "phone_number"`, label sets, dicts keyed by label.
-   - Do: use `m.group` (new property, the pattern label `"phone_number"`) to
-     identify the pattern. Status and region are in the label:
+   - Do: use `m.pattern` (new field, the pattern label `"phone_number"`; equal
+     to `m.label` for every other match) to identify the pattern. Status and region are in the label:
      `status, region = m.label.split("_")[:2]` (`valid` | `possible`, `US`).
 2. **One number can return several matches on the same span** (one per plausible
    reading, e.g. `possible_US_number` and `valid_GB_number`).
@@ -41,14 +41,14 @@ every caller.
 4. **Phone results differ from before:** international forms (`+44 …`) are now
    found, and a hit impossible in every configured region is dropped (and
    logged). Re-record golden outputs. `555-xxx-xxxx` is `possible`, not `valid`.
-5. **(all) Report CSV has new columns:** `a_family`, `b_family`, `status`,
+5. **(all) Report CSV has new columns:** `a_pattern`, `b_pattern`, `status`,
    `region`, `normalized`. Column-name readers are fine; position-based readers
    break.
    - **Appending to an old report file misaligns it:** `open_report()` writes the
      header only for a new or empty file. Call `reset_report()` once, or use a
      new path.
 6. **(all, if you read `decisions`) New decision kind `validation`** with outcomes
-   `kept` / `not_returned` / `dropped`; `decided_by` is `number | hint | list`.
+   `kept` / `not_kept` / `dropped`; `decided_by` is `number | hint | regions`.
    Ignore kinds you don't know. Only `validate` configs produce them.
 7. **(all) `miss` reason text** now ends `(min_score/overlap/validation)`. Don't
    parse `reason`; use `outcome` (`no_candidates` | `candidates_dropped`).
@@ -56,7 +56,7 @@ every caller.
    `validation` rows. New importable functions: `summarize_validation`,
    `format_validation`.
 
-No effect on callers: `Candidate` gained `family`, `hit`, `raw` after its
+No effect on callers: `Candidate` gained `pattern`, `hit`, `raw` after its
 existing fields (all defaulted), so existing construction still works;
 `phonenumbers` is imported only when a config uses `validate` (install
 `phonenumbers>=9.0` only then); there is deliberately no per-call region argument.

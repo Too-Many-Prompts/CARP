@@ -282,7 +282,7 @@ into its text and context parts. Then run:
 
 It prints up to three tables:
 
-- **Overlaps worth tuning:** pairs of labels that fight over the same text
+- **Overlaps worth tuning:** pairs of patterns that fight over the same text
   without the score deciding.
 - **Likely misses:** labels the context pointed to that produced no match.
 - **Phone checks:** statuses, regions, numbers with several readings, and

@@ -1095,7 +1095,7 @@ def test_public_api_as_documented(
         assert len(matches) == 2
         for m in matches:
             assert set(m.to_dict()) == base
-        assert all(m.text == "+12125550123" for m in matches if m.group == "phone_number")
+        assert all(m.text == "+12125550123" for m in matches if m.pattern == "phone_number")
         assert decisions and all(list(d) == list(REPORT_FIELDS) for d in decisions)
         assert {d["file"] for d in decisions} == {"id-1"}
     matches, _ = extract({"text": "some text", "context": "call"}, cfg)
@@ -1126,7 +1126,7 @@ def test_public_api_as_documented(
     # Summaries from the library and their tables.
     rows = summarize_overlaps()
     assert rows and all(list(r) == list(summarize.SUMMARY_FIELDS) for r in rows)
-    assert rows[0]["pair"] == "account_number/valid_US_number"
+    assert rows[0]["pair"] == "account_number/phone_number"
     assert format_summary(rows).splitlines()[0].split() == list(summarize.SUMMARY_FIELDS)
     misses = summarize_misses()
     assert [r["label"] for r in misses] == ["phone_number"]
@@ -1427,6 +1427,16 @@ def test_old_validate_keys_name_the_migration(tmp_path: Path, key: str, value: A
         make_cfg(tmp_path, [phone_pattern(**{key: value})])
 
 
+@pytest.mark.parametrize("key, old, new", [
+    ("keep", "valid_and_home", "valid_plus_home"),
+    ("hint_fallback", "not_valid", "if_not_valid"),
+    ("hint_fallback", "impossible", "if_nothing"),
+])
+def test_renamed_values_name_the_new_value(tmp_path: Path, key: str, old: str, new: str) -> None:
+    with pytest.raises(ValueError, match=rf"validate.{key}: '{old}' was renamed to '{new}'"):
+        make_cfg(tmp_path, [phone_pattern(**{key: old})])
+
+
 def test_old_regions_map_points_to_hints(tmp_path: Path) -> None:
     pattern = {"label": "ph", "priority": 1, "regex": PHONE_RE,
                "validate": {"with": "phonenumbers", "regions": {"GB": {"uk": 3}}}}
@@ -1437,7 +1447,7 @@ def test_old_regions_map_points_to_hints(tmp_path: Path) -> None:
 def test_validate_defaults(tmp_path: Path) -> None:
     (p,) = make_cfg(tmp_path, [phone_pattern()]).patterns
     assert p.validate == phone.PhoneSpec(regions=["US"])
-    assert (p.validate.keep, p.validate.hint_conflict) == ("valid_and_home", "all")
+    assert (p.validate.keep, p.validate.hint_conflict) == ("valid_plus_home", "all")
 
 
 def test_validate_needs_phonenumbers_installed(
@@ -1461,15 +1471,15 @@ def test_validate_needs_phonenumbers_installed(
 def test_valid_number(tmp_path: Path) -> None:
     matches, decisions = run_phone(tmp_path, "call (212) 555-0123 today")
     (m,) = matches
-    assert (m.label, m.text, m.family, m.start, m.end) == (
+    assert (m.label, m.text, m.pattern, m.start, m.end) == (
         "valid_US_number", "+12125550123", "ph", 5, 19)
     assert m.to_dict() == {"label": "valid_US_number", "text": "+12125550123",
                            "start": 5, "end": 19, "score": 0.0}
     (row,) = vrows(decisions)
     # The report keeps the written form in a_text and the E.164 form in normalized.
     assert (row["outcome"], row["status"], row["region"], row["normalized"], row["decided_by"],
-            row["a_label"], row["a_text"], row["a_family"]) == (
-        "kept", "valid", "US", "+12125550123", "list", "valid_US_number", "(212) 555-0123", "ph")
+            row["a_label"], row["a_text"], row["a_pattern"]) == (
+        "kept", "valid", "US", "+12125550123", "regions", "valid_US_number", "(212) 555-0123", "ph")
     assert "FIXED_LINE_OR_MOBILE" not in m.to_dict().values()
     assert f"phonenumbers {phone.pn_version()}" in row["reason"]
 
@@ -1510,20 +1520,20 @@ def test_output_format(tmp_path: Path, fmt: str, value: str) -> None:
 # ---- the region list and `keep`
 @pytest.mark.parametrize("keep, text, expected", [
     # 555-123-4567: possible in US (home), valid in GB.
-    ("valid_and_home", "call 555-123-4567", [("possible_US_number", "+15551234567"),
+    ("valid_plus_home", "call 555-123-4567", [("possible_US_number", "+15551234567"),
                                              ("valid_GB_number", "+445551234567")]),
     ("all", "call 555-123-4567", [("possible_US_number", "+15551234567"),
                                   ("valid_GB_number", "+445551234567")]),
     ("valid_else_possible", "call 555-123-4567", [("valid_GB_number", "+445551234567")]),
     ("valid", "call 555-123-4567", [("valid_GB_number", "+445551234567")]),
     # 212-555-0123: valid in US, possible in GB.
-    ("valid_and_home", "call 212-555-0123", [("valid_US_number", "+12125550123")]),
+    ("valid_plus_home", "call 212-555-0123", [("valid_US_number", "+12125550123")]),
     ("all", "call 212-555-0123", [("valid_US_number", "+12125550123"),
                                   ("possible_GB_number", "+442125550123")]),
     ("valid_else_possible", "call 212-555-0123", [("valid_US_number", "+12125550123")]),
     ("valid", "call 212-555-0123", [("valid_US_number", "+12125550123")]),
     # A new area code: possible in US and GB, valid nowhere.
-    ("valid_and_home", "call 221-234-5678", [("possible_US_number", "+12212345678")]),
+    ("valid_plus_home", "call 221-234-5678", [("possible_US_number", "+12212345678")]),
     ("valid_else_possible", "call 221-234-5678", [("possible_US_number", "+12212345678"),
                                                   ("possible_GB_number", "+442212345678")]),
     ("valid", "call 221-234-5678", []),
@@ -1532,11 +1542,11 @@ def test_keep_modes(tmp_path: Path, keep: str, text: str, expected: list) -> Non
     matches, decisions = run_phone(tmp_path, text, regions=["US", "GB"], keep=keep)
     assert got(matches) == sorted(expected)
     rows = vrows(decisions)
-    assert {r["decided_by"] for r in rows} == {"list"}
+    assert {r["decided_by"] for r in rows} == {"regions"}
     assert sum(r["outcome"] == "kept" for r in rows) == len(expected)
-    assert sum(r["outcome"] == "not_returned" for r in rows) == len(rows) - len(expected)
+    assert sum(r["outcome"] == "not_kept" for r in rows) == len(rows) - len(expected)
     for r in rows:
-        if r["outcome"] == "not_returned":
+        if r["outcome"] == "not_kept":
             assert f"keep: {keep}" in r["reason"]
 
 
@@ -1596,7 +1606,7 @@ def test_hints_parse_only_the_hinted_regions(tmp_path: Path) -> None:
     assert got(matches) == [("valid_IN_number", "+919876543210")]
     rows = vrows(decisions)
     assert {r["decided_by"] for r in rows} == {"hint"}
-    assert [(r["region"], r["outcome"]) for r in rows] == [("IN", "kept"), ("GB", "not_returned")]
+    assert [(r["region"], r["outcome"]) for r in rows] == [("IN", "kept"), ("GB", "not_kept")]
 
 
 def test_hint_that_does_not_fit_falls_back_to_the_list(tmp_path: Path) -> None:
@@ -1604,7 +1614,7 @@ def test_hint_that_does_not_fit_falls_back_to_the_list(tmp_path: Path) -> None:
     matches, decisions = run_phone(tmp_path, ("paris", "call 212-555-0123"), hints=FR_NL)
     assert got(matches) == [("valid_US_number", "+12125550123")]
     (row,) = vrows(decisions)
-    assert row["decided_by"] == "list" and "hint FR did not fit" in row["reason"]
+    assert row["decided_by"] == "regions" and "hint FR did not fit" in row["reason"]
     # Impossible everywhere: dropped, with both notes.
     _, decisions = run_phone(tmp_path, ("paris", "call 1234-5678-9012345"), hints=FR_NL)
     (row,) = vrows(decisions)
@@ -1612,8 +1622,8 @@ def test_hint_that_does_not_fit_falls_back_to_the_list(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("fallback, expected", [
-    ("impossible", [("possible_GB_number", "+442125550123")]),
-    ("not_valid", [("possible_GB_number", "+442125550123"), ("valid_US_number", "+12125550123")]),
+    ("if_nothing", [("possible_GB_number", "+442125550123")]),
+    ("if_not_valid", [("possible_GB_number", "+442125550123"), ("valid_US_number", "+12125550123")]),
     ("always", [("possible_GB_number", "+442125550123"), ("valid_US_number", "+12125550123")]),
     ("never", [("possible_GB_number", "+442125550123")]),
 ])
@@ -1626,17 +1636,17 @@ def test_hint_fallback_when_the_hint_is_only_possible(
     assert got(matches) == expected
     sources = {r["region"]: r["decided_by"] for r in vrows(decisions)}
     assert sources["GB"] == "hint"
-    if fallback not in ("impossible", "never"):
-        assert sources["US"] == "list"
+    if fallback not in ("if_nothing", "never"):
+        assert sources["US"] == "regions"
         kept = {r["a_label"]: r["decided_by"] for r in vrows(decisions) if r["outcome"] == "kept"}
-        assert kept == {"possible_GB_number": "hint", "valid_US_number": "list"}
-    if fallback == "not_valid":
-        assert "hint_fallback: not_valid parsed the list too" in vrows(decisions)[0]["reason"]
+        assert kept == {"possible_GB_number": "hint", "valid_US_number": "regions"}
+    if fallback == "if_not_valid":
+        assert "hint_fallback: if_not_valid parsed the regions too" in vrows(decisions)[0]["reason"]
 
 
 @pytest.mark.parametrize("fallback, expected", [
-    ("impossible", [("valid_IN_number", "+919876543210")]),
-    ("not_valid", [("valid_IN_number", "+919876543210")]),
+    ("if_nothing", [("valid_IN_number", "+919876543210")]),
+    ("if_not_valid", [("valid_IN_number", "+919876543210")]),
     ("always", [("possible_US_number", "+19876543210"), ("valid_IN_number", "+919876543210")]),
     ("never", [("valid_IN_number", "+919876543210")]),
 ])
@@ -1649,15 +1659,15 @@ def test_hint_fallback_when_the_hint_is_valid(tmp_path: Path, fallback: str, exp
 
 def test_hint_fallback_default_and_errors(tmp_path: Path) -> None:
     (p,) = make_cfg(tmp_path, [phone_pattern()]).patterns
-    assert p.validate.hint_fallback == "not_valid"
+    assert p.validate.hint_fallback == "if_not_valid"
     with pytest.raises(ValueError, match="validate.hint_fallback: unknown value 'sometimes'"):
         make_cfg(tmp_path, [phone_pattern(hint_fallback="sometimes")])
 
 
 @pytest.mark.parametrize("fallback, expected", [
     ("never", []),
-    ("impossible", [("valid_US_number", "+12125550123")]),
-    ("not_valid", [("valid_US_number", "+12125550123")]),
+    ("if_nothing", [("valid_US_number", "+12125550123")]),
+    ("if_not_valid", [("valid_US_number", "+12125550123")]),
     ("always", [("valid_US_number", "+12125550123")]),
 ])
 def test_hint_fallback_when_the_hint_does_not_fit(tmp_path: Path, fallback: str, expected: list) -> None:
@@ -1686,7 +1696,7 @@ def test_hint_conflict_nearest(tmp_path: Path) -> None:
     matches, decisions = run_phone(tmp_path, text, hints=FR_NL, hint_conflict="nearest")
     assert got(matches) == [FR_NUM]
     (nl,) = [r for r in vrows(decisions) if r["region"] == "NL"]
-    assert nl["outcome"] == "not_returned" and "hint_conflict: nearest" in nl["reason"]
+    assert nl["outcome"] == "not_kept" and "hint_conflict: nearest" in nl["reason"]
 
 
 def test_hint_conflict_nearest_text_beats_context(tmp_path: Path) -> None:
@@ -1828,6 +1838,19 @@ def test_local_only_number_keeps_its_text(tmp_path: Path) -> None:
         assert [(m.label, m.text) for m in matches] == [("possible_US_number", "555-0123")]
 
 
+def test_overlap_summary_groups_phone_readings_by_pattern(tmp_path: Path) -> None:
+    acct = {"label": "account_number", "priority": 3, "regex": r"\b\d{10}\b",
+            "keywords": {"acct": 3}}
+    cfg = make_cfg(tmp_path, [phone_pattern(regions=["US", "GB"], keep="all"), acct])
+    reset_report()
+    with open_report() as write:
+        for i, text in enumerate(["acct 2125550123", "acct 5551234567"]):
+            write(extract(text, cfg, source=f"r{i}")[1])
+    (row,) = summarize_overlaps()
+    assert row["pair"] == "account_number/ph"
+    assert row["overlaps"] >= 2 and row["wins"].startswith("account_number")
+
+
 def test_validation_rows_in_report_and_summary(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, [phone_pattern(regions=["US", "GB"])])
     reset_report()
@@ -1836,10 +1859,10 @@ def test_validation_rows_in_report_and_summary(tmp_path: Path) -> None:
                                   "ref 1234-5678-9012345", "call 212-555-0123", "call 555-123-4567"]):
             write(extract(text, cfg, source=f"r{i}")[1])
     (row,) = summarize_validation()
-    assert row["family"] == "ph"
+    assert row["pattern"] == "ph"
     assert (row["hits"], row["kept"], row["valid"], row["possible"], row["dropped"], row["multi"]) == (
         6, 6, 2, 4, 1, 1)
-    assert row["not_returned"] == 4          # the possible GB readings of the 221 and 212 numbers
+    assert row["not_kept"] == 4          # the possible GB readings of the 221 and 212 numbers
     assert row["clusters"] == "+1 221 x3; +1 555 x1"
     assert summarize.HINT_STALE in row["hint"] and summarize.HINT_MULTI in row["hint"]
     assert 'r5: "555-123-4567"' in row["examples"] and 'r3: "1234-5678-9012345"' in row["examples"]
@@ -1852,9 +1875,9 @@ def test_summarize_cli_prints_validation_table(
     write_report_csv(extract("call 212-555-0123", REAL_CFG)[1])
     assert main(["--summarize"]) == 0
     out = capsys.readouterr().out
-    assert "family" in out and "hits" in out and "phone_number" in out
+    assert "pattern" in out and "hits" in out and "phone_number" in out
 
 
 def test_report_phone_columns_sit_before_decided_by() -> None:
     assert REPORT_FIELDS[-4:] == ("status", "region", "normalized", "decided_by")
-    assert "a_family" in REPORT_FIELDS and "b_family" in REPORT_FIELDS
+    assert "a_pattern" in REPORT_FIELDS and "b_pattern" in REPORT_FIELDS
