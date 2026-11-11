@@ -6,41 +6,47 @@ configs without it never need the library. extract.py does all word
 scoring and hands the region hints in (RegionHint); this module never reads
 words, so there is no second copy of the keyword matcher.
 
+It never guesses a country. Every plausible reading of a number comes back
+(readings_for), each later becoming its own match labeled
+`{status}_{REGION}_number`:
+
+  1. "+" number (or a leading "00" when nothing else fits): the country code.
+  2. caller region, else hinted regions: parsed in those regions only; valid
+     readings, else possible ones (hint_conflict: all | nearest). If none
+     fits, fall through to 3 with a note.
+  3. the `regions` list, filtered by `readings`.
+  4. impossible everywhere: no reading; the caller logs why.
+
     spec = load_validate(label, raw_block, weight_map)     # at load time
     spans = refine_spans(span_text, region)                # trim / split a regex hit
-    result = pick_region(raw, spec, caller, hints)         # status, region, value
+    out = readings_for(raw, spec, caller, hints)           # every reading + why
 """
 from __future__ import annotations
 
 import importlib
-import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-VALIDATE_KEYS = (
-    "with", "default_region", "try_regions", "region_from", "regions",
-    "possible_label", "on_invalid", "on_possible", "possible_min_score",
-    "on_ambiguous", "output_format",
-)
+VALIDATE_KEYS = ("with", "regions", "hints", "readings", "hint_conflict", "output_format")
 CHOICES = {
-    "region_from": ("both", "context", "text"),
-    "on_invalid": ("drop", "keep_flagged"),
-    "on_possible": ("keep", "drop", "keep_if_score"),
-    "on_ambiguous": ("first", "drop", "keep_flagged"),
+    "readings": ("valid_and_home", "all", "valid_else_possible", "valid"),
+    "hint_conflict": ("all", "nearest"),
     "output_format": ("E164", "INTERNATIONAL", "NATIONAL"),
 }
-DEFAULTS = {
-    "region_from": "both",
-    "on_invalid": "drop",
-    "on_possible": "keep",       # never lose a number the library doesn't know yet
-    "possible_min_score": 1.0,
-    "on_ambiguous": "first",
-    "output_format": "E164",
+DEFAULTS = {"readings": "valid_and_home", "hint_conflict": "all", "output_format": "E164"}
+# Keys of the earlier validate design, with what replaces them.
+OLD_KEYS = {
+    "default_region": "list the regions in `regions: [US, ...]` (the first is the home region)",
+    "try_regions": "list the regions in `regions: [US, ...]` (the first is the home region)",
+    "possible_label": "labels are generated: valid_US_number, possible_US_number, ...",
+    "on_invalid": "impossible numbers are always dropped and logged in the report",
+    "on_possible": "use `readings` (valid_and_home | all | valid_else_possible | valid)",
+    "on_ambiguous": "every reading is returned; use `hint_conflict: nearest` for hints",
+    "possible_min_score": "use settings.min_score",
+    "region_from": "hint words are read in the text window and the context, like keywords",
 }
 STATUSES = ("valid", "possible", "impossible")
-# decided_by values of a `validation` row (where the region came from).
-SOURCES = ("number", "caller", "keyword", "proximity", "trial", "format",
-           "fallback", "default")
+SOURCES = ("number", "caller", "hint", "list")   # decided_by of a validation row
 
 _pn_module: Any = None
 
@@ -57,20 +63,20 @@ def pn_version() -> str:
     return str(getattr(pn(), "__version__", "?"))
 
 
+def label_for(status: str, region: str | None) -> str:
+    """The match label of a reading: valid_US_number, possible_GB_number."""
+    return f"{status}_{region or 'ZZ'}_number"
+
+
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
 @dataclass
 class PhoneSpec:
-    default_region: str
-    try_regions: list[str]
-    region_from: str = "both"
-    regions: dict[str, dict[str, float]] = field(default_factory=dict)
-    possible_label: str | None = None
-    on_invalid: str = "drop"
-    on_possible: str = "keep"
-    possible_min_score: float = 1.0
-    on_ambiguous: str = "first"
+    regions: list[str]
+    hints: dict[str, dict[str, float]] = field(default_factory=dict)
+    readings: str = "valid_and_home"
+    hint_conflict: str = "all"
     output_format: str = "E164"
 
 
@@ -91,11 +97,19 @@ def load_validate(label: str, raw: Any, weight_map: WeightMap) -> PhoneSpec:
     """Check one pattern's `validate` block and return its PhoneSpec.
 
     `weight_map(label, key_name, raw)` is extract.py's keyword-map checker,
-    so region keywords follow exactly the same rules as pattern keywords.
+    so hint words follow exactly the same rules as pattern keywords.
     """
     where = f"pattern '{label}': validate"
     if not isinstance(raw, dict):
         raise ValueError(f"{where} must be a map, got {type(raw).__name__}")
+    for key, instead in OLD_KEYS.items():
+        if key in raw:
+            raise ValueError(f"{where}.{key} was removed: {instead}")
+    if isinstance(raw.get("regions"), dict):
+        raise ValueError(
+            f"{where}.regions is now the list of regions to parse in; "
+            "move the region hint words to `hints: {GB: {uk: 3}}`"
+        )
     unknown = [k for k in raw if k not in VALIDATE_KEYS]
     if unknown:
         raise ValueError(f"{where}: unknown key '{unknown[0]}' (expected one of {', '.join(VALIDATE_KEYS)})")
@@ -108,24 +122,16 @@ def load_validate(label: str, raw: Any, weight_map: WeightMap) -> PhoneSpec:
             f"pattern '{label}' uses validate but phonenumbers is not installed "
             "(pip install phonenumbers)"
         ) from exc
-    if "default_region" not in raw:
-        raise ValueError(f"{where}: missing required key 'default_region'")
-    default = _region(label, "default_region", raw["default_region"])
 
-    tries_raw = raw.get("try_regions")
-    if tries_raw is None:
-        tries = [default]
-    else:
-        if not isinstance(tries_raw, list) or not tries_raw:
-            raise ValueError(f"{where}.try_regions: expected a non-empty list of region codes")
-        tries = []
-        for r in tries_raw:
-            code = _region(label, "try_regions", r)
-            if code in tries:
-                raise ValueError(f"{where}.try_regions: '{code}' is listed twice")
-            tries.append(code)
-        if default not in tries:
-            raise ValueError(f"{where}.try_regions: must include default_region '{default}'")
+    listed = raw.get("regions")
+    if not isinstance(listed, list) or not listed:
+        raise ValueError(f"{where}.regions: expected a non-empty list of region codes, e.g. [US]")
+    regions: list[str] = []
+    for r in listed:
+        code = _region(label, "regions", r)
+        if code in regions:
+            raise ValueError(f"{where}.regions: '{code}' is listed twice")
+        regions.append(code)
 
     opts: dict[str, Any] = {}
     for key, choices in CHOICES.items():
@@ -134,39 +140,21 @@ def load_validate(label: str, raw: Any, weight_map: WeightMap) -> PhoneSpec:
             raise ValueError(f"{where}.{key}: unknown value {value!r} (expected one of {', '.join(choices)})")
         opts[key] = value
 
-    min_score = raw.get("possible_min_score", DEFAULTS["possible_min_score"])
-    if isinstance(min_score, bool) or not isinstance(min_score, (int, float)):
-        raise ValueError(f"{where}.possible_min_score: expected a number, got {min_score!r}")
-
-    possible_label = raw.get("possible_label")
-    if possible_label is not None:
-        if not isinstance(possible_label, str) or not possible_label:
-            raise ValueError(f"{where}.possible_label: expected a label name, got {possible_label!r}")
-        if possible_label == label:
-            raise ValueError(f"{where}.possible_label: must differ from the pattern's own label")
-
-    regions_raw = raw.get("regions") or {}
-    if not isinstance(regions_raw, dict):
-        raise ValueError(f"{where}.regions: expected a map of REGION: {{word: weight}}")
-    regions: dict[str, dict[str, float]] = {}
-    for code_raw, words in regions_raw.items():
-        code = _region(label, "regions", code_raw)
-        if code in regions:
-            raise ValueError(f"{where}.regions: '{code}' is listed twice")
-        weights = weight_map(label, f"validate.regions.{code}", words)
+    hints_raw = raw.get("hints") or {}
+    if not isinstance(hints_raw, dict):
+        raise ValueError(f"{where}.hints: expected a map of REGION: {{word: weight}}")
+    hints: dict[str, dict[str, float]] = {}
+    for code_raw, words in hints_raw.items():
+        code = _region(label, "hints", code_raw)
+        if code in hints:
+            raise ValueError(f"{where}.hints: '{code}' is listed twice")
+        weights = weight_map(label, f"validate.hints.{code}", words)
         bad = [w for w, v in weights.items() if v <= 0]
         if bad:
-            raise ValueError(f"{where}.regions.{code}: keyword '{bad[0]}' needs a weight > 0")
-        regions[code] = weights
+            raise ValueError(f"{where}.hints.{code}: keyword '{bad[0]}' needs a weight > 0")
+        hints[code] = weights
 
-    return PhoneSpec(
-        default_region=default,
-        try_regions=tries,
-        regions=regions,
-        possible_label=possible_label,
-        possible_min_score=float(min_score),
-        **opts,
-    )
+    return PhoneSpec(regions=regions, hints=hints, **opts)
 
 
 # --------------------------------------------------------------------------
@@ -193,13 +181,6 @@ class Check:
     number: Any = None          # phonenumbers.PhoneNumber, if it parsed
     full: bool = False          # possible as a full number (not local-only)
     why: str = ""               # why impossible
-
-    @property
-    def e164(self) -> str | None:
-        """E.164 of a full number; None if impossible or local-only."""
-        if self.number is None or self.status == "impossible" or not self.full:
-            return None
-        return pn().format_number(self.number, pn().PhoneNumberFormat.E164)
 
 
 def check(raw: str, region: str | None) -> Check:
@@ -231,26 +212,8 @@ def _reason_name(reason: int) -> str:
     return names.get(reason, f"not possible ({reason})")
 
 
-def _fits_region(c: Check) -> bool:
-    """True if the number fits its region's general number pattern (from the
-    library's metadata): e.g. US "[2-9]\\d{9}", which a new area code fits but
-    "0612345678" does not. Unknown metadata counts as a fit."""
-    lib = pn()
-    from phonenumbers.phonemetadata import PhoneMetadata
-    meta = PhoneMetadata.metadata_for_region(c.region or "")
-    pattern = getattr(getattr(meta, "general_desc", None), "national_number_pattern", None)
-    if not pattern:
-        return True
-    return re.fullmatch(pattern, lib.national_significant_number(c.number)) is not None
-
-
-def _group_lengths(s: str) -> list[int]:
-    """Digit-group lengths: "(555) 123-4567" -> [3, 3, 4]."""
-    return [len(g) for g in re.findall(r"\d+", s)]
-
-
 # --------------------------------------------------------------------------
-# Region choice
+# Readings
 # --------------------------------------------------------------------------
 @dataclass
 class RegionHint:
@@ -269,50 +232,52 @@ class RegionHint:
             return (1, self.context_dist)
         return (2, 0)
 
-    def where(self) -> str:
-        if self.text_dist is not None:
-            return f"{self.text_dist} word{'s' if self.text_dist != 1 else ''} away"
-        return f"in the context, {self.context_dist} from its end"
+
+@dataclass
+class Reading:
+    """One interpretation of a number in one region."""
+    status: str                 # valid | possible
+    region: str | None          # the number's region (416 -> CA)
+    normalized: str             # in output_format; raw text if local-only
+    key: str                    # E.164, or region:raw when there is none
+    number_type: str = ""
+    parsed_in: str | None = None  # the region it was parsed in (None: "+" number)
+    returned: bool = True       # False: filtered out by readings / hint_conflict
+    why: str = ""               # why not returned
+
+    @property
+    def label(self) -> str:
+        return label_for(self.status, self.region)
 
 
 @dataclass
-class Result:
-    status: str
-    region: str | None
-    source: str
-    normalized: str
-    number_type: str = ""
-    ambiguous: bool = False
-    tie: bool = False               # exact tie: on_ambiguous applies
-    runner_up: str | None = None
-    detail: str = ""                # human-readable part of the report reason
+class Outcome:
+    readings: list[Reading]     # returned and not returned, in order
+    source: str                 # number | caller | hint | list
+    notes: list[str] = field(default_factory=list)
+    why: str = ""               # why there is no reading at all (impossible)
 
-    def extra(self) -> dict[str, Any]:
-        return {
-            "normalized": self.normalized,
-            "region": self.region,
-            "region_source": self.source,
-            "status": self.status,
-            "number_type": self.number_type,
-            "ambiguous": self.ambiguous,
-            "runner_up": self.runner_up,
-        }
+    @property
+    def returned(self) -> list[Reading]:
+        return [r for r in self.readings if r.returned]
 
 
-def _result(raw: str, c: Check, source: str, spec: PhoneSpec, **kw: Any) -> Result:
+def _reading(raw: str, c: Check, spec: PhoneSpec) -> Reading:
     lib = pn()
     region = c.region
     number_type = ""
     normalized = raw
-    if c.number is not None and c.status != "impossible" and c.full:
+    key = f"{region}:{raw}"
+    if c.full:
         fmt = getattr(lib.PhoneNumberFormat, spec.output_format)
         normalized = lib.format_number(c.number, fmt)
+        key = lib.format_number(c.number, lib.PhoneNumberFormat.E164)
         if c.status == "valid":
             region = lib.region_code_for_number(c.number) or region
             number_type = _type_name(lib.number_type(c.number))
         elif region is None:
             region = lib.region_code_for_country_code(c.number.country_code)
-    return Result(c.status, region, source, normalized, number_type, **kw)
+    return Reading(c.status, region, normalized, key, number_type, parsed_in=c.region)
 
 
 def _type_name(value: int) -> str:
@@ -323,160 +288,99 @@ def _type_name(value: int) -> str:
     return str(value)
 
 
-def _international(raw: str) -> bool:
-    return raw.lstrip(" (").startswith("+")
+def _fitting(raw: str, regions: list[str], spec: PhoneSpec) -> tuple[list[Reading], list[Check]]:
+    """Readings (valid or possible) in each region, one per distinct number
+    (US and CA give the same +1 number: one reading), in region order."""
+    checks = [check(raw, r) for r in regions]
+    seen: dict[str, Reading] = {}
+    for c in checks:
+        if c.status == "impossible":
+            continue
+        r = _reading(raw, c, spec)
+        seen.setdefault(r.key, r)
+    return list(seen.values()), checks
 
 
-def pick_region(
+def _hold(readings: list[Reading], keep: Callable[[Reading], bool], why: str) -> None:
+    for r in readings:
+        if r.returned and not keep(r):
+            r.returned, r.why = False, why
+
+
+def readings_for(
     raw: str, spec: PhoneSpec, caller: str | None, hints: list[RegionHint]
-) -> Result:
-    """Decide the region and status of one candidate (first step that decides wins).
-
-    A step decides only when the number is not impossible there, so a wrong
-    caller region or keyword never turns a fitting number into a loss.
-    1. number: a leading "+" sets the country (00 / 011 prefixes are
-       handled by parse() in the regions below, per their own IDD).
-    2. caller: extract(..., region=). Like a keyword hint (3), a caller
-       region where the number is only possible yields to a valid trial.
-    3. keyword: hinted regions (score > 0), valid before possible, then the
-       nearest hint word; a valid tie between different numbers is
-       `proximity` (decided by distance) or `fallback` (exact tie). A hint
-       that only gives "possible" waits: a valid trial result (step 4) wins.
-    4. trial: every try_regions region; different valid numbers are split
-       by the formatting cue (`format`) or are an exact tie (`fallback`).
-    5. default: default_region, else the first try region where it is possible.
-    """
-    if _international(raw):
+) -> Outcome:
+    """Every reading of `raw`; the ones not returned are kept with returned=False."""
+    if raw.lstrip(" (").startswith("+"):
         c = check(raw, None)
-        return _result(raw, c, "number", spec, detail=c.why)
+        if c.status == "impossible":
+            return Outcome([], "number", why=c.why)
+        return Outcome([_reading(raw, c, spec)], "number")
 
-    # The caller region, else the keyword hints. A hint that is only
-    # "possible" waits: a valid trial result (step 4) beats it.
-    hint: Result | None = None
+    notes: list[str] = []
     if caller:
-        c = check(raw, caller)
-        if c.status != "impossible":
-            hint = _result(raw, c, "caller", spec)
-    if hint is None:
-        hinted = [h for h in hints if h.score > 0]
-        hint = _by_keyword(raw, spec, hinted) if hinted else None
-    if hint is not None and hint.status == "valid":
-        return hint
+        found, _ = _fitting(raw, [caller], spec)
+        if found:
+            return Outcome(found, "caller")
+        notes.append(f"caller {caller} did not fit")
 
-    checks = [check(raw, r) for r in spec.try_regions]
-    decided = _by_trial(raw, spec, checks)
-    if decided is not None:
-        if hint is not None:
-            decided.runner_up = decided.runner_up or hint.region
-            why = f" ({hint.detail})" if hint.detail else ""
-            decided.detail = "; ".join(filter(None, (
-                decided.detail, f"{hint.source} {hint.region} only possible{why}")))
-        return decided
-    if hint is not None:
-        return hint
+    hinted = [h for h in hints if h.score > 0]
+    if hinted:
+        found = _hinted(raw, spec, hinted)
+        if found:
+            return Outcome(found, "hint", notes)
+        notes.append(f"hint {', '.join(h.region for h in hinted)} did not fit")
 
-    default = next(c for c in checks if c.region == spec.default_region)
-    if default.status != "impossible":
-        return _result(raw, default, "default", spec)
-    other = next((c for c in checks if c.status != "impossible"), None)
-    if other is not None:
-        return _result(raw, other, "trial", spec)
-    # Last resort: "00" is the international prefix in most of the world but
-    # not in NANP regions, so "00 44 20 ..." is impossible there. Read it as "+".
+    found, checks = _fitting(raw, spec.regions, spec)
+    if found:
+        _filter_list(found, spec)
+        return Outcome(found, "list", notes)
+
     stripped = raw.lstrip(" (")
-    if stripped.startswith("00"):
+    if stripped.startswith("00"):       # "00" is not an international prefix in NANP
         c = check("+" + stripped[2:], None)
         if c.status != "impossible":
-            return _result(raw, c, "number", spec, detail="read the leading 00 as +")
-    return _result(raw, default, "default", spec, detail=default.why)
+            return Outcome([_reading(raw, c, spec)], "number", notes + ["read the leading 00 as +"])
+    home = checks[0]
+    return Outcome([], "list", notes, why=f"impossible in {', '.join(spec.regions)} ({home.why})")
 
 
-def _by_keyword(raw: str, spec: PhoneSpec, hinted: list[RegionHint]) -> Result | None:
-    order = {r: i for i, r in enumerate(spec.try_regions)}
-    scored = []
-    for h in hinted:
+def _hinted(raw: str, spec: PhoneSpec, hinted: list[RegionHint]) -> list[Reading]:
+    """Readings in the hinted regions: valid ones, else possible ones;
+    hint_conflict: nearest keeps only the nearest hint word's region(s)."""
+    by_region = {h.region: h for h in hinted}
+    order = sorted(hinted, key=lambda h: (h.nearness(), -h.score, h.region))
+    found: list[Reading] = []
+    seen: set[str] = set()
+    hint_of: dict[str, RegionHint] = {}
+    for h in order:
         c = check(raw, h.region)
-        if c.status != "impossible":
-            scored.append((h, c))
-    if not scored:
-        return None
-    scored.sort(key=lambda hc: (
-        hc[1].status != "valid", hc[0].nearness(), -hc[0].score,
-        order.get(hc[0].region, len(order)), hc[0].region,
-    ))
-    best_h, best_c = scored[0]
-    rivals = [(h, c) for h, c in scored[1:]
-              if best_c.status == "valid" and c.status == "valid" and c.e164 != best_c.e164]
-    if not rivals:
-        return _result(raw, best_c, "keyword", spec,
-                       detail=f"'{best_h.words[0]}' {best_h.where()}" if best_h.words else "")
-    rival_h, rival_c = rivals[0]
-    names = f"valid in {best_h.region} and {rival_h.region}"
-    near = (f"{best_h.region} chosen: '{best_h.words[0]}' {best_h.where()} "
-            f"vs '{rival_h.words[0]}' {rival_h.where()}")
-    if best_h.nearness() != rival_h.nearness():
-        return _result(raw, best_c, "proximity", spec, ambiguous=True,
-                       runner_up=rival_h.region, detail=f"{names}; {near}")
-    return _result(raw, best_c, "fallback", spec, ambiguous=True, tie=True,
-                   runner_up=rival_h.region, detail=f"{names}; hint words equally near; {near}")
+        if c.status == "impossible":
+            continue
+        r = _reading(raw, c, spec)
+        if r.key not in seen:
+            seen.add(r.key)
+            found.append(r)
+            hint_of[r.key] = by_region[h.region]
+    if any(r.status == "valid" for r in found):
+        _hold(found, lambda r: r.status == "valid", "a hinted region gives a valid reading")
+    if spec.hint_conflict == "nearest":
+        live = [r for r in found if r.returned]
+        if live:
+            best = min((hint_of[r.key].nearness(), -hint_of[r.key].score) for r in live)
+            _hold(found, lambda r: (hint_of[r.key].nearness(), -hint_of[r.key].score) == best,
+                  "hint_conflict: nearest (a nearer hint word won)")
+    return found
 
 
-def _by_trial(raw: str, spec: PhoneSpec, checks: list[Check]) -> Result | None:
-    """Group the valid results by E.164. The default region's `possible`
-    reading also competes (if it fits the region's general number pattern),
-    so a new area code at home is never silently replaced by a coincidental
-    valid number abroad."""
-    valid = [c for c in checks if c.status == "valid"]
-    if not valid:
-        return None
-    pool = list(valid)
-    default = next(c for c in checks if c.region == spec.default_region)
-    if default.status == "possible" and default.full and _fits_region(default):
-        pool.append(default)
-    pool.sort(key=lambda c: spec.try_regions.index(c.region))
-    distinct: dict[str, Check] = {}
-    for c in pool:
-        distinct.setdefault(c.e164 or "", c)
-    if len(distinct) == 1:
-        return _result(raw, pool[0], "trial", spec)
-
-    groups = _group_lengths(raw)
-    fits = [c for c in distinct.values()
-            if len(groups) > 1
-            and _group_lengths(pn().format_number(c.number, pn().PhoneNumberFormat.NATIONAL)) == groups]
-    others = [c for c in distinct.values() if c not in fits]
-    regions = " and ".join(f"{c.region} ({c.status})" for c in distinct.values())
-    if len(fits) == 1:
-        return _result(raw, fits[0], "format", spec, ambiguous=True,
-                       runner_up=others[0].region,
-                       detail=f"fits {regions}; grouping matches {fits[0].region}")
-    first, second = list(distinct.values())[:2]
-    return _result(raw, first, "fallback", spec, ambiguous=True, tie=True,
-                   runner_up=second.region, detail=f"fits {regions}; first in try_regions")
-
-
-def outcome(result: Result, spec: PhoneSpec, score: float) -> tuple[str, str]:
-    """(kept | kept_flagged | dropped, why) from the on_* settings."""
-    rules: list[tuple[str, str]] = []
-    if result.status == "impossible":
-        rules.append(("kept_flagged" if spec.on_invalid == "keep_flagged" else "dropped",
-                      f"on_invalid: {spec.on_invalid}"))
-    elif result.status == "possible":
-        if spec.on_possible == "keep":
-            rules.append(("kept", "on_possible: keep"))
-        elif spec.on_possible == "drop":
-            rules.append(("dropped", "on_possible: drop"))
-        elif score >= spec.possible_min_score:
-            rules.append(("kept", f"score {score:.2f} >= possible_min_score {spec.possible_min_score:g}"))
-        else:
-            rules.append(("dropped", f"score {score:.2f} < possible_min_score {spec.possible_min_score:g}"))
-    if result.tie:
-        verdict = {"first": "kept", "drop": "dropped", "keep_flagged": "kept_flagged"}[spec.on_ambiguous]
-        rules.append((verdict, f"on_ambiguous: {spec.on_ambiguous}"))
-    if not rules:
-        return "kept", "valid"
-    for verdict in ("dropped", "kept_flagged", "kept"):
-        for v, why in rules:
-            if v == verdict:
-                return v, why
-    return rules[0]
+def _filter_list(found: list[Reading], spec: PhoneSpec) -> None:
+    """Apply `readings` to the list readings (in region order)."""
+    has_valid = any(r.status == "valid" for r in found)
+    home = next((r for r in found if r.parsed_in == spec.regions[0]), None)
+    mode = spec.readings
+    if mode == "valid":
+        _hold(found, lambda r: r.status == "valid", "readings: valid")
+    elif mode == "valid_else_possible" and has_valid:
+        _hold(found, lambda r: r.status == "valid", "readings: valid_else_possible")
+    elif mode == "valid_and_home":
+        _hold(found, lambda r: r.status == "valid" or r is home, "readings: valid_and_home")

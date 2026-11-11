@@ -46,14 +46,16 @@ patterns:
     keywords: {phone: 3, tel: 3, call: 2, mobile: 2, fax: 1, invoice: -2, account: -2, order: -1}
     validate:                    # optional: check matches with the phonenumbers library
       with: phonenumbers
-      default_region: US         # region for numbers without +country code
-      possible_label: possible_phone_number  # right length, not a known range (e.g. a new area code)
-      # try_regions: [US, GB]    # also try these when no hint word decides
-      # regions:                 # hint words, read like keywords (text window + context)
-      #   GB: {uk: 3, britain: 3, british: 2, england: 2, london: 2}
-      #   IN: {india: 3, indian: 2, mumbai: 2, delhi: 2}
-      # Defaults: on_invalid: drop, on_possible: keep, on_ambiguous: first,
-      # output_format: E164, region_from: both. See docs/REFERENCE.md.
+      regions: [US]              # parse in these, in order; the first is the home region
+      # Each reading becomes a match: valid_US_number, possible_US_number (right
+      # length, unknown range, e.g. a new area code), valid_GB_number ...
+      # Impossible hits are dropped and logged in the report.
+      # hints:                   # words that point to a region (text window + context);
+      #   GB: {uk: 3, britain: 3, british: 2, england: 2, london: 2}   # only those regions
+      #   IN: {india: 3, indian: 2, mumbai: 2, delhi: 2}                # are parsed then
+      # readings: valid_and_home # with no hint: valid_and_home | all | valid_else_possible | valid
+      # hint_conflict: all       # valid in several hinted regions: all | nearest
+      # output_format: E164      # extra.normalized: E164 | INTERNATIONAL | NATIONAL
 
   - label: account_number
     priority: 3
@@ -86,12 +88,12 @@ tests:
   - name: 555 is not a real area code, so the number is possible, not valid (kept)
     text: "call 555-123-4567"
     expect:
-      - {label: possible_phone_number, text: "555-123-4567"}
+      - {label: possible_US_number, text: "555-123-4567"}
 
   - name: a +country code sets the region; parsed as a valid UK number
     text: "London office +44 20 7946 0018"
     expect:
-      - {label: phone_number, text: "+44 20 7946 0018"}
+      - {label: valid_GB_number, text: "+44 20 7946 0018"}
 
   - name: a ZIP+4 code is phone-shaped but impossible, so it is dropped (logged)
     text: "ship to 94105-1234"
@@ -99,7 +101,7 @@ tests:
 
   - text: "Please call 212-555-0123 about the order."
     expect:
-      - {label: phone_number, text: "212-555-0123"}
+      - {label: valid_US_number, text: "212-555-0123"}
 
   - text: "Acct 2125550123 is overdue."
     expect:
@@ -121,7 +123,7 @@ tests:
   - name: without context the 10-digit number reads as a phone (call is next to it)
     text: "2125550123 call"
     expect:
-      - {label: phone_number, text: "2125550123"}
+      - {label: valid_US_number, text: "2125550123"}
 
   - name: context "account" flips the same overlap (account +3, phone -2)
     context: "account"
@@ -134,7 +136,7 @@ tests:
     text: "Acct 2125550123 call 212-555-0123"
     expect:
       - {label: account_number, text: "2125550123"}
-      - {label: phone_number, text: "212-555-0123"}
+      - {label: valid_US_number, text: "212-555-0123"}
 
   - name: context phrase adds to every pattern listing it; nothing is excluded
     context: "amount due"
@@ -143,7 +145,7 @@ tests:
       - {label: invoice_number, text: "INV-004521"}
       - {label: date, text: "03/14/2026"}
       - {label: amount, text: "$1,250.00"}
-      - {label: phone_number, text: "212-555-0123"}
+      - {label: valid_US_number, text: "212-555-0123"}
 
   - name: context with no keyword hits changes nothing
     context: "nothing relevant here"

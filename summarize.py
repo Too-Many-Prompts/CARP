@@ -4,7 +4,7 @@
     print(format_summary(rows))            # the overlap table `extract.py --summarize` prints
     misses = summarize_misses()            # list of dicts, most misses first
     print(format_misses(misses))           # the miss table printed under it
-    checks = summarize_validation()        # phone validation, one row per label
+    checks = summarize_validation()        # phone validation, one row per phone pattern
     print(format_validation(checks))       # printed last, if there are any
 
 The overlap table shows which label pairs overlap most often without being
@@ -26,7 +26,7 @@ DEFAULT_REPORT_PATH = "extract_report.csv"
 COLUMNS_USED = (
     "file", "kind", "a_label", "a_text", "a_start", "a_end",
     "b_label", "b_text", "b_start", "b_end", "decided_by", "outcome",
-    "status", "normalized",
+    "status", "region", "normalized", "a_family",
 )
 
 SUMMARY_CRITERIA = ("score", "length", "priority", "start_label")
@@ -43,15 +43,14 @@ MISS_FIELDS = ("label", "misses", "no_candidates", "dropped", "examples", "hint"
 HINT_MISS_REGEX = "the regex found nothing; check the regex against these inputs"
 HINT_MISS_TUNING = "candidates lost; raise their nearby/context weights or check min_score"
 VALIDATION_FIELDS = (
-    "label", "checked", "valid", "possible", "impossible", "dropped", "ambiguous",
-    "sources", "clusters", "examples", "hint",
+    "family", "hits", "kept", "valid", "possible", "not_returned", "dropped", "multi",
+    "sources", "regions", "clusters", "examples", "hint",
 )
-_AMBIGUOUS_SOURCES = ("proximity", "format", "fallback")
 _CLUSTER_MIN = 3        # possible numbers sharing leading digits before the hint shows
 HINT_STALE = ("many possible numbers share these digits; phonenumbers metadata "
               "may be stale, upgrade it")
-HINT_AMBIGUOUS = "ambiguous regions; add region hint words or pass region="
-HINT_IMPOSSIBLE = "many impossible; tighten the regex or add try_regions"
+HINT_MULTI = "numbers fit several regions; add hints, or set readings / hint_conflict"
+HINT_IMPOSSIBLE = "many impossible; tighten the regex or add regions"
 
 
 @dataclass
@@ -222,14 +221,16 @@ def _cluster_key(normalized: str) -> str | None:
 
 
 def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]]:
-    """Count a report CSV's `validation` rows (phone patterns) per label.
+    """Count a report CSV's `validation` rows per phone pattern (`a_family`).
 
-    Per label: counts by status, dropped, ambiguous (region chosen by
-    proximity, format or fallback), counts by region source (`decided_by`),
-    `possible` numbers grouped by leading digits (a cluster of possible
-    numbers sharing an area code suggests the library's metadata is stale),
-    up to three examples of ambiguous or dropped rows, and a hint. Sorted by
-    rows checked (highest first), then label.
+    A hit is one phone number in the text; it has one row per reading
+    (`kept` or `not_returned`) or one `dropped` row (impossible). Per pattern:
+    hits, kept readings by status, not_returned, dropped, `multi` (hits
+    with more than one kept reading), counts by source (`decided_by`) and by
+    region, `possible` readings grouped by leading digits (a cluster sharing
+    an area code suggests the library's metadata is stale), up to three
+    examples of multi or dropped hits, and a hint. Sorted by hits (highest
+    first), then family.
     """
     stats: dict[str, dict[str, Any]] = {}
     fh, reader = _open_report(path)
@@ -237,49 +238,71 @@ def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]
         for row in reader:
             if row.get("kind") != "validation":
                 continue
-            st = stats.setdefault(row.get("a_label", ""), {
-                "status": Counter(), "sources": Counter(), "clusters": Counter(),
-                "dropped": 0, "ambiguous": 0, "examples": [],
+            family = row.get("a_family") or row.get("a_label", "")
+            st = stats.setdefault(family, {
+                "out": Counter(), "status": Counter(), "sources": Counter(),
+                "regions": Counter(), "clusters": Counter(), "hits": Counter(),
+                "texts": {},
             })
-            status, source = row.get("status", ""), row.get("decided_by", "")
-            st["status"][status] += 1
-            st["sources"][source] += 1
-            dropped = row.get("outcome") == "dropped"
-            ambiguous = source in _AMBIGUOUS_SOURCES
-            st["dropped"] += dropped
-            st["ambiguous"] += ambiguous
-            if status == "possible":
+            hit = (row.get("file", ""), row.get("a_start", ""), row.get("a_end", ""))
+            outcome = row.get("outcome", "")
+            st["out"][outcome] += 1
+            st["texts"].setdefault(hit, row.get("a_text", ""))
+            st["hits"][hit] += outcome == "kept"
+            if outcome == "dropped":
+                st.setdefault("dropped_hits", []).append(hit)
+                continue
+            if outcome != "kept":
+                continue
+            st["status"][row.get("status", "")] += 1
+            st["sources"][row.get("decided_by", "")] += 1
+            st["regions"][row.get("region", "")] += 1
+            if row.get("status") == "possible":
                 key = _cluster_key(row.get("normalized", ""))
                 if key:
                     st["clusters"][key] += 1
-            if (dropped or ambiguous) and len(st["examples"]) < _MAX_EXAMPLES:
-                st["examples"].append(f'{row.get("file") or "(no id)"}: "{row.get("a_text", "")}"')
 
     out: list[dict[str, Any]] = []
-    for label, st in stats.items():
-        checked = sum(st["status"].values())
-        clusters = sorted(st["clusters"].items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+    for family, st in stats.items():
+        hits = len(st["hits"])
+        multi_hits = [h for h, n in st["hits"].items() if n > 1]
+        examples = []
+        for h in multi_hits + st.get("dropped_hits", []):
+            if len(examples) < _MAX_EXAMPLES:
+                examples.append(f'{h[0] or "(no id)"}: "{st["texts"][h]}"')
+        clusters = _top(st["clusters"])
         hints = []
         if clusters and clusters[0][1] >= _CLUSTER_MIN:
             hints.append(HINT_STALE)
-        if st["ambiguous"]:
-            hints.append(HINT_AMBIGUOUS)
-        if st["status"]["impossible"] * 2 > checked:
+        if multi_hits:
+            hints.append(HINT_MULTI)
+        if st["out"]["dropped"] * 2 > hits:
             hints.append(HINT_IMPOSSIBLE)
-        sources = sorted(st["sources"].items(), key=lambda kv: (-kv[1], kv[0]))
         out.append({
-            "label": label,
-            "checked": checked,
-            **{s: st["status"][s] for s in ("valid", "possible", "impossible")},
-            "dropped": st["dropped"],
-            "ambiguous": st["ambiguous"],
-            "sources": "; ".join(f"{k} {n}" for k, n in sources),
+            "family": family,
+            "hits": hits,
+            "kept": st["out"]["kept"],
+            "valid": st["status"]["valid"],
+            "possible": st["status"]["possible"],
+            "not_returned": st["out"]["not_returned"],
+            "dropped": st["out"]["dropped"],
+            "multi": len(multi_hits),
+            "sources": _joined(st["sources"]),
+            "regions": _joined(st["regions"]),
             "clusters": "; ".join(f"{k} x{n}" for k, n in clusters),
-            "examples": " | ".join(st["examples"]),
+            "examples": " | ".join(examples),
             "hint": "; ".join(hints) or "ok",
         })
-    out.sort(key=lambda r: (-r["checked"], r["label"]))
+    out.sort(key=lambda r: (-r["hits"], r["family"]))
     return out
+
+
+def _top(counter: Counter, n: int = 3) -> list[tuple[str, int]]:
+    return sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+
+
+def _joined(counter: Counter) -> str:
+    return "; ".join(f"{k} {n}" for k, n in _top(counter, len(counter)))
 
 
 def format_validation(rows: list[dict[str, Any]]) -> str:

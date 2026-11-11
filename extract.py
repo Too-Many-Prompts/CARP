@@ -41,7 +41,7 @@ import re
 import sys
 import warnings
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence, Union
 
@@ -65,7 +65,7 @@ CONTEXT_DIRECTIONS = ("before", "after", "both")
 
 # The decision report (extract's log) as CSV; main() resets it once per run.
 REPORT_PATH = DEFAULT_REPORT_PATH       # "extract_report.csv", defined in summarize.py
-_CAND_COLS = ("label", "text", "start", "end", "score", "text_score", "context_score")
+_CAND_COLS = ("label", "text", "start", "end", "score", "text_score", "context_score", "family")
 # Phone validation columns; blank on every other row kind.
 _PHONE_COLS = ("status", "region", "normalized")
 REPORT_FIELDS = (
@@ -77,10 +77,9 @@ REPORT_FIELDS = (
 )
 # decided_by: overlap -> score | length | priority | start_label;
 # coexist -> coexist; below_min_score -> min_score; miss -> "";
-# validation -> the region source (phone.SOURCES: number | caller | keyword |
-# proximity | trial | format | fallback | default).
+# validation -> the region source (phone.SOURCES: number | caller | hint | list).
 # miss outcome: no_candidates (regex gap) | candidates_dropped (tuning).
-# validation outcome: kept | kept_flagged | dropped.
+# validation outcome: kept | not_returned (a reading filtered out) | dropped (impossible).
 REQUIRED_SETTINGS = (
     "context_window_words",
     "distance_decay",
@@ -127,8 +126,18 @@ class Candidate:
     text_score: float = 0
     context_score: float = 0
     # Set only on matches from a pattern with `validate`: normalized, region,
-    # region_source, status, number_type, ambiguous, runner_up.
+    # region_source, status, number_type, readings.
     extra: dict[str, Any] | None = None
+    # The pattern label when `label` is generated (valid_US_number ->
+    # phone_number); "" means the same as label. coexist and misses use it.
+    family: str = ""
+    # Readings of one phone hit share a hit id and never conflict (-1: none).
+    hit: int = -1
+
+    @property
+    def group(self) -> str:
+        """The pattern label this match belongs to."""
+        return self.family or self.label
 
     def to_dict(self) -> dict[str, Any]:
         """The CLI JSON form: label, text, start, end, score (+ extra if set)."""
@@ -149,6 +158,7 @@ class Candidate:
             **{k: v for k, v in self.to_dict().items() if k != "extra"},
             "text_score": round(float(self.text_score), 4),
             "context_score": round(float(self.context_score), 4),
+            "family": self.group,
         }
 
 
@@ -383,20 +393,7 @@ def load_config(path: str | Path) -> Config:
             )
         )
 
-    for p in patterns:
-        extra_label = p.validate.possible_label if p.validate else None
-        if extra_label is None:
-            continue
-        if extra_label in seen:
-            raise ValueError(
-                f"pattern '{p.label}': validate.possible_label '{extra_label}' "
-                "is already used by another pattern"
-            )
-        seen.add(extra_label)
-
-    coexist = _expand_coexist(
-        {frozenset(pair) for pair in (raw.get("coexist") or [])}, patterns
-    )
+    coexist = {frozenset(pair) for pair in (raw.get("coexist") or [])}
     return Config(
         settings=settings,
         normalize=raw.get("normalize") or {},
@@ -404,25 +401,6 @@ def load_config(path: str | Path) -> Config:
         coexist=coexist,
         tests=raw.get("tests") or [],
     )
-
-
-def _expand_coexist(
-    coexist: set[frozenset[str]], patterns: list[Pattern]
-) -> set[frozenset[str]]:
-    """A coexist pair naming a validated pattern's label also covers its
-    possible_label, so relabeled matches keep the same overlap rules."""
-    out = set(coexist)
-    for p in patterns:
-        alt = p.validate.possible_label if p.validate else None
-        if alt is None:
-            continue
-        for pair in list(out):
-            if p.label in pair:
-                rest = set(pair) - {p.label}
-                out.add(frozenset(rest | {alt}))
-                if not rest:            # [x, x]: also x with its own possible label
-                    out.add(frozenset({p.label, alt}))
-    return out
 
 
 # --------------------------------------------------------------------------
@@ -642,13 +620,11 @@ def _hint_side(weights: dict[str, float], find: DistanceFinder, decay: bool) -> 
 def _context_hints(
     spec: phone.PhoneSpec, words: list[str], settings: dict[str, Any]
 ) -> dict[str, _Side]:
-    """The context part of every region's hints; once per pattern."""
-    if spec.region_from == "text":
-        return {}
+    """The context part of every hinted region; once per pattern."""
     decay = bool(settings["distance_decay"])
     return {
         region: _hint_side(weights, lambda kw: _nearest_distance(words, [], kw), decay)
-        for region, weights in spec.regions.items()
+        for region, weights in spec.hints.items()
     }
 
 
@@ -657,16 +633,13 @@ def _region_hints(
     ctx: dict[str, _Side], settings: dict[str, Any],
 ) -> list[phone.RegionHint]:
     """Every region's keyword evidence for the span: the text window (same
-    rules as the text score) plus the precomputed context part, per region_from."""
-    use_text = spec.region_from in ("both", "text")
-    before, after = _window(text, start, end, settings) if use_text else ([], [])
+    rules as the text score) plus the precomputed context part."""
+    before, after = _window(text, start, end, settings)
     decay = bool(settings["distance_decay"])
     hints: list[phone.RegionHint] = []
-    for region, weights in spec.regions.items():
-        t_score, t_dist, t_words = (
-            _hint_side(weights, lambda kw: _nearest_distance(before, after, kw), decay)
-            if use_text else (0.0, None, [])
-        )
+    for region, weights in spec.hints.items():
+        t_score, t_dist, t_words = _hint_side(
+            weights, lambda kw: _nearest_distance(before, after, kw), decay)
         c_score, c_dist, c_words = ctx.get(region, (0.0, None, []))
         hints.append(phone.RegionHint(
             region, t_score + c_score, t_dist, c_dist,
@@ -682,8 +655,8 @@ def _find_validated(
     """Candidates of a pattern with `validate`: its regex hits, each trimmed
     or split by PhoneNumberMatcher (POSSIBLE leniency).
 
-    The matcher runs in the caller's region, else the top keyword region,
-    else default_region. The regex scan resumes where the last refined
+    The matcher runs in the caller's region, else the top hinted region,
+    else the first of `regions`. The regex scan resumes where the last refined
     number ended, not where the regex hit ended: a greedy hit that ran into
     the next number ("212-555-0123 212-555") would otherwise lose it. If the
     matcher finds nothing, the raw hit is kept as it is, so validation (not
@@ -702,7 +675,7 @@ def _find_validated(
             continue
         hints = _region_hints(text, m.start(), m.end(), spec, ctx, settings)
         top = max((h for h in hints if h.score > 0), key=lambda h: h.score, default=None)
-        region = caller or (top.region if top else spec.default_region)
+        region = caller or (top.region if top else spec.regions[0])
         spans = phone.refine_spans(m.group(0), region)
         if not spans:
             out.append(Candidate(pattern.label, m.start(), m.end(), m.group(0), pattern.priority))
@@ -719,37 +692,49 @@ def validate_candidates(
     text: str, cands: list[Candidate], cfg: Config,
     ctx_hints: dict[str, dict[str, _Side]], caller: str | None = None,
 ) -> tuple[list[Candidate], list[Decision]]:
-    """Grade every candidate of a validated pattern (valid / possible /
-    impossible), pick its region, apply the on_* settings and log one
-    `validation` row each. Runs after scoring and before min_score/overlaps,
-    so an invalid phone number never competes. Other candidates pass through."""
+    """Turn each phone hit (a candidate of a pattern with `validate`) into one
+    match per returned reading, labeled valid_US_number, possible_GB_number...
+    (phone.readings_for). The readings share the hit's span and score and
+    never conflict with each other. Logs one `validation` row per reading
+    (kept / not_returned), or one `dropped` row when the hit is impossible
+    everywhere. Runs after scoring and before min_score/overlaps; other
+    candidates pass through."""
     by_label = {p.label: p for p in cfg.patterns}
     kept: list[Candidate] = []
     decisions: list[Decision] = []
-    version = None
-    for c in cands:
+    version = ""
+    for hit_id, c in enumerate(cands):
         spec = by_label[c.label].validate
         if spec is None:
             kept.append(c)
             continue
         version = version or phone.pn_version()
         hints = _region_hints(text, c.start, c.end, spec, ctx_hints[c.label], cfg.settings)
-        result = phone.pick_region(c.text, spec, caller, hints)
-        verdict, why = phone.outcome(result, spec, c.score)
-        if result.status != "valid" and spec.possible_label:
-            c.label = spec.possible_label
-        c.extra = result.extra()
-        parts = [f"{result.status} in {result.region or '?'}"]
-        if result.detail:
-            parts.append(result.detail)
-        parts.append(f"{verdict}: {why}")
-        parts.append(f"phonenumbers {version}")
-        decisions.append(_decision(
-            "validation", verdict, "; ".join(parts), a=c, decided_by=result.source,
-            status=result.status, region=result.region, normalized=result.normalized,
-        ))
-        if verdict != "dropped":
-            kept.append(c)
+        out = phone.readings_for(c.text, spec, caller, hints)
+        tail = out.notes + [f"phonenumbers {version}"]
+        if not out.readings:
+            c.family = c.label
+            decisions.append(_decision(
+                "validation", "dropped", "; ".join([out.why] + tail), a=c,
+                decided_by=out.source, status="impossible", normalized=c.text,
+            ))
+            continue
+        returned = out.returned
+        for r in out.readings:
+            m = replace(c, label=r.label, family=c.label, hit=hit_id, extra={
+                "normalized": r.normalized, "region": r.region, "status": r.status,
+                "region_source": out.source, "number_type": r.number_type,
+                "readings": len(returned),
+            })
+            verdict = "kept" if r.returned else "not_returned"
+            head = f"{r.status} in {r.region}" + (f"; {r.why}" if r.why else "")
+            decisions.append(_decision(
+                "validation", verdict, "; ".join([head] + tail), a=m,
+                decided_by=out.source, status=r.status, region=r.region,
+                normalized=r.normalized,
+            ))
+            if r.returned:
+                kept.append(m)
     return kept, decisions
 
 
@@ -834,9 +819,10 @@ def resolve_overlaps(
         pending: list[Decision] = []
         beaten = False
         for a in accepted:
-            if not _overlaps(a, c):
-                continue
-            if frozenset((a.label, c.label)) in cfg.coexist:
+            if not _overlaps(a, c) or (a.hit >= 0 and a.hit == c.hit):
+                continue                # readings of one phone hit never conflict
+            if (frozenset((a.label, c.label)) in cfg.coexist
+                    or frozenset((a.group, c.group)) in cfg.coexist):
                 pending.append(
                     _decision("coexist", "both_kept",
                               f"{a.label}/{c.label} pair is in coexist; both kept",
@@ -882,14 +868,12 @@ def _miss_decisions(
     matches: list[Candidate],
 ) -> list[Decision]:
     """One `miss` row per label the context scored above 0 that has no match.
-    A validated pattern's match relabeled to its possible_label counts as found."""
-    alias = {p.validate.possible_label: p.label for p in cfg.patterns
-             if p.validate and p.validate.possible_label}
-    kept = {alias.get(m.label, m.label) for m in matches}
+    Labels are compared by pattern (Candidate.group), so a valid_US_number
+    match counts for its phone pattern."""
+    kept = {m.group for m in matches}
     found: dict[str, int] = {}
     for c in cands:
-        label = alias.get(c.label, c.label)
-        found[label] = found.get(label, 0) + 1
+        found[c.group] = found.get(c.group, 0) + 1
     rows: list[Decision] = []
     for p in cfg.patterns:
         score, hits = ctx_scores[p.label]
