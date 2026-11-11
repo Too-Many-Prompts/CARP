@@ -105,8 +105,7 @@ reading of a number comes back as its own match.
   report.
 - **Where a number is parsed**, in order:
   1. A leading `+`: the country code decides.
-  2. A caller `region=` / `--region`, or the regions whose hint words appear:
-     only those regions are parsed. If the number fits none of them, CARP
+  2. The regions whose hint words appear: only those regions are parsed. If the number fits none of them, CARP
      falls back to the list.
   3. Every region in `regions`. `readings` chooses what comes back; by
      default, every valid reading plus the home region's possible one.

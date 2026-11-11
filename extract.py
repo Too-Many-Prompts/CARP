@@ -24,7 +24,7 @@ Scoring: every pattern runs on the text. A candidate's score is
 
 CLI (one text per run; for many texts use the library):
     extract.py --config extraction_config.yaml [--text TEXT | < stdin]
-               [--context TEXT] [--region CODE] [--report]
+               [--context TEXT] [--report]
     extract.py --summarize [PATH]
 Prints the matches as a JSON list. Nothing is written unless asked:
     --report     ./extract_report.csv  one row per decision (overwritten)
@@ -77,7 +77,7 @@ REPORT_FIELDS = (
 )
 # decided_by: overlap -> score | length | priority | start_label;
 # coexist -> coexist; below_min_score -> min_score; miss -> "";
-# validation -> the region source (phone.SOURCES: number | caller | hint | list).
+# validation -> the region source (phone.SOURCES: number | hint | list).
 # miss outcome: no_candidates (regex gap) | candidates_dropped (tuning).
 # validation outcome: kept | not_returned (a reading filtered out) | dropped (impossible).
 REQUIRED_SETTINGS = (
@@ -650,13 +650,12 @@ def _region_hints(
 
 def _find_validated(
     text: str, pattern: Pattern, ctx: dict[str, _Side],
-    settings: dict[str, Any], caller: str | None,
+    settings: dict[str, Any],
 ) -> list[Candidate]:
     """Candidates of a pattern with `validate`: its regex hits, each trimmed
     or split by PhoneNumberMatcher (POSSIBLE leniency).
 
-    The matcher runs in the caller's region, else the top hinted region,
-    else the first of `regions`. The regex scan resumes where the last refined
+    The matcher runs in the top hinted region, else the first of `regions`. The regex scan resumes where the last refined
     number ended, not where the regex hit ended: a greedy hit that ran into
     the next number ("212-555-0123 212-555") would otherwise lose it. If the
     matcher finds nothing, the raw hit is kept as it is, so validation (not
@@ -675,7 +674,7 @@ def _find_validated(
             continue
         hints = _region_hints(text, m.start(), m.end(), spec, ctx, settings)
         top = max((h for h in hints if h.score > 0), key=lambda h: h.score, default=None)
-        region = caller or (top.region if top else spec.regions[0])
+        region = top.region if top else spec.regions[0]
         spans = phone.refine_spans(m.group(0), region)
         if not spans:
             out.append(Candidate(pattern.label, m.start(), m.end(), m.group(0), pattern.priority))
@@ -690,7 +689,7 @@ def _find_validated(
 
 def validate_candidates(
     text: str, cands: list[Candidate], cfg: Config,
-    ctx_hints: dict[str, dict[str, _Side]], caller: str | None = None,
+    ctx_hints: dict[str, dict[str, _Side]],
 ) -> tuple[list[Candidate], list[Decision]]:
     """Turn each phone hit (a candidate of a pattern with `validate`) into one
     match per returned reading, labeled valid_US_number, possible_GB_number...
@@ -710,7 +709,7 @@ def validate_candidates(
             continue
         version = version or phone.pn_version()
         hints = _region_hints(text, c.start, c.end, spec, ctx_hints[c.label], cfg.settings)
-        out = phone.readings_for(c.text, spec, caller, hints)
+        out = phone.readings_for(c.text, spec, hints)
         tail = out.notes + [f"phonenumbers {version}"]
         if not out.readings:
             c.family = c.label
@@ -893,7 +892,7 @@ def _miss_decisions(
 
 
 def extract(
-    inp: ExtractInput, cfg: Config, source: str = "", region: str | None = None
+    inp: ExtractInput, cfg: Config, source: str = ""
 ) -> tuple[list[Candidate], list[Decision]]:
     """Run steps 2-5 and return (matches, decisions). Writes no files.
 
@@ -903,12 +902,8 @@ def extract(
     the context scored above 0 that ended with no match. Ignore the log with
     `matches, _ = extract(...)`, or write it with write_report_csv() /
     open_report().
-
-    `region` (e.g. "GB") is the caller's region for patterns with a
-    `validate:` block; other patterns ignore it.
     """
     raw_text, context = _split_input(inp)
-    caller = _caller_region(region)
     text = normalize(raw_text, cfg)
     words = context_words(normalize(context, cfg) if context else None)
     ctx_scores = {p.label: context_score(words, p, cfg.settings) for p in cfg.patterns}
@@ -921,7 +916,7 @@ def extract(
     cands = find_candidates(text, [p for p in cfg.patterns if not p.validate])
     for p in cfg.patterns:
         if p.validate:
-            cands += _find_validated(text, p, ctx_hints[p.label], cfg.settings, caller)
+            cands += _find_validated(text, p, ctx_hints[p.label], cfg.settings)
     cands.sort(key=lambda c: (c.start, c.end, c.label))
     for c in cands:
         c.text_score = score_candidate(text, c, by_label[c.label], cfg.settings)
@@ -931,24 +926,10 @@ def extract(
     found = list(cands)              # before validation drops any, for the miss rows
     checked: list[Decision] = []
     if ctx_hints:
-        cands, checked = validate_candidates(text, cands, cfg, ctx_hints, caller)
+        cands, checked = validate_candidates(text, cands, cfg, ctx_hints)
     matches, decisions = resolve_overlaps(cands, cfg)
     decisions = checked + decisions + _miss_decisions(cfg, ctx_scores, found, matches)
     return matches, [{**d, "file": source} for d in decisions]
-
-
-def _caller_region(region: str | None) -> str | None:
-    """Check extract(region=...): None, or a region code phonenumbers knows."""
-    if region is None or region == "":
-        return None
-    code = str(region).upper()
-    try:
-        known = phone.pn().SUPPORTED_REGIONS
-    except ImportError as exc:
-        raise ValueError("region= needs phonenumbers, which is not installed") from exc
-    if code not in known:
-        raise ValueError(f"region: unknown region '{region}'")
-    return code
 
 
 # --------------------------------------------------------------------------
@@ -964,8 +945,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--context", default=None,
                         help="optional context text; its words add each pattern's "
                              "context/keywords weights to that pattern's score")
-    parser.add_argument("--region", default=None,
-                        help="caller region (e.g. GB) for patterns with a validate block")
     parser.add_argument("--report", action="store_true",
                         help=f"write the decision log to ./{REPORT_PATH} (overwritten)")
     parser.add_argument("--summarize", nargs="?", const=REPORT_PATH, default=None,
@@ -977,7 +956,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.summarize is not None:
         clashes = [flag for flag, used in (
             ("--text", args.text is not None), ("--context", args.context is not None),
-            ("--report", args.report), ("--region", args.region is not None),
+            ("--report", args.report),
         ) if used]
         if clashes:
             parser.error(f"--summarize cannot be combined with {', '.join(clashes)}")
@@ -1015,11 +994,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("no text: pass --text TEXT or pipe the text on stdin")
         text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
 
-    try:
-        matches, decisions = extract((args.context, text), cfg, region=args.region)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+    matches, decisions = extract((args.context, text), cfg)
 
     if args.report:
         reset_report()

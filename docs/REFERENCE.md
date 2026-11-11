@@ -10,7 +10,7 @@ Scans one text per run. For many texts, or a CSV of them, use the library.
 
 ```bash
 .venv/bin/python extract.py --config extraction_config.yaml \
-    [--text TEXT] [--context TEXT] [--region CODE] [--report]
+    [--text TEXT] [--context TEXT] [--report]
 .venv/bin/python extract.py --summarize [PATH]
 ```
 
@@ -18,8 +18,6 @@ Scans one text per run. For many texts, or a CSV of them, use the library.
   (UTF-8, `errors="replace"`).
 - `--context TEXT` is an optional context string. Its words add to the score
   of every pattern that lists them (see [Scoring](#scoring)).
-- `--region CODE` (e.g. `GB`) is the caller's region for
-  [phone patterns](#phone-numbers). An unknown code is an error (exit 2).
 - Prints the matches as a JSON list of `{label, text, start, end, score}`.
   Matches of a pattern with `validate` also have `extra` (see
   [Phone numbers](#phone-numbers)).
@@ -27,7 +25,7 @@ Scans one text per run. For many texts, or a CSV of them, use the library.
   `./extract_report.csv` (overwritten each time).
 - `--summarize [PATH]` prints the [overlap and miss summaries](#summaries) of
   a report (default `./extract_report.csv`) and exits. It needs no `--config`
-  and cannot be combined with `--text`, `--context`, `--region` or `--report`.
+  and cannot be combined with `--text`, `--context` or `--report`.
 - Config warnings go to stderr as `warning: ...` and do not change the exit code.
 - Exit codes: `0` success; `2` for a config or report error (`error: ...` on
   stderr, nothing printed) or a usage error.
@@ -51,7 +49,6 @@ cfg = load_config("extraction_config.yaml")
 matches, decisions = extract("some text", cfg)
 matches, _ = extract({"text": "some text", "context": "call"}, cfg)   # ignore the log
 matches, decisions = extract(("call", "some text"), cfg, source="id-1")  # (context, text)
-matches, _ = extract("office 020 7946 0018", cfg, region="GB")         # caller region for phones
 ```
 
 `extract()` returns `(matches, decisions)` and **writes no files**.
@@ -265,6 +262,7 @@ library.
 - Hint words follow the usual [keyword rules](#keywords), and they are read
   like `keywords`: in the text window and in the whole context.
 - A hinted region need not be in `regions`.
+- Regions come only from the config; `extract()` and the CLI take no region.
 - `load_config` names the pattern and key for an unknown key, region,
   value or keyword, and fails if phonenumbers is not installed.
 
@@ -283,15 +281,14 @@ Readings that give the same number count as one. US and CA share +1, so
 ### The rule
 
 1. **A `+` number** uses its country code: one reading. Source `number`.
-2. **Caller region or hint words.** The caller region (`extract(region=...)`
-   / `--region`), or else every region whose hint words appear, is parsed
+2. **Hint words.** If hint words for any region appear, the number is parsed
    in those regions only.
    - Valid readings are returned. If there are none, the possible ones are
      returned.
    - `hint_conflict: nearest` keeps only the region of the nearest hint
      word. A hint word in the text window is nearer than any word in the
      context; then the higher hint score wins; an exact tie keeps both.
-   - Source `caller` or `hint`.
+   - Source `hint`.
    - If the number fits none of those regions, the report notes e.g.
      `hint FR did not fit` and step 3 runs.
 3. **The list:** parse in every `regions` entry. Source `list`.
@@ -321,7 +318,7 @@ valid in GB. With `regions: [US, GB]`:
 ### Before the rule: refining the regex hit
 
 Each regex hit first goes to `PhoneNumberMatcher` (POSSIBLE leniency) in the
-caller region, else the top hinted region, else the first of `regions`.
+top hinted region, else the first of `regions`.
 - It trims a greedy hit: `212-555-0123 2026` becomes `212-555-0123`.
 - It splits two numbers found in one hit.
 - The regex scan resumes after the last number found, so back-to-back
@@ -385,13 +382,13 @@ file is gitignored.
     - `outcome` is `kept`, or `not_returned` when `readings` / `hint_conflict`
       filtered it out;
     - an impossible hit gets a single `dropped` row;
-    - `decided_by` is the source (`number`, `caller`, `hint`, `list`);
+    - `decided_by` is the source (`number`, `hint`, `list`);
     - `reason` reads e.g. `possible in GB; readings: valid; phonenumbers 9.0.43`.
   - In an `overlap` row, `a` is the winner and `b` the dropped candidate.
   - `decided_by` is machine-readable: for `overlap`, the criterion that decided
     (`score`, `length`, `priority`, or `start_label` when everything tied);
     `coexist` for `coexist`; `min_score` for `below_min_score`; empty for `miss`;
-    the source (`number`, `caller`, `hint`, `list`) for `validation`.
+    the source (`number`, `hint`, `list`) for `validation`.
 - Library helpers (all optional, none called by `extract()`): `write_report_csv(decisions)`
   appends rows; `reset_report()` starts a fresh file; `open_report()` opens the
   report once for many calls (see the loop above).
@@ -487,7 +484,7 @@ keyword validation and old-format errors, `decided_by`, `miss` rows, the
 report CSV and its score breakdown, the summaries, the CLI, and the public API
 as shown in the README and this reference. Phone tests cover the `validate`
 load and migration errors, each status, every `readings` and `hint_conflict`
-mode, caller and hints (including a hint that does not fit), `+`, `00` and
+mode, hints (including a hint that does not fit), `+`, `00` and
 `011`, span refinement and back-to-back numbers, readings competing with
 other patterns, `coexist` and misses through `family`, `extra`, the report
 rows and the validation summary.

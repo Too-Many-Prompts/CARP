@@ -1367,11 +1367,11 @@ def phone_pattern(label: str = "ph", **validate: Any) -> dict[str, Any]:
 
 
 def run_phone(
-    tmp_path: Path, inp: Any, region: str | None = None,
+    tmp_path: Path, inp: Any,
     patterns: list[dict[str, Any]] | None = None, **validate: Any,
 ) -> tuple[list[Any], list[dict[str, Any]]]:
     cfg = make_cfg(tmp_path, patterns or [phone_pattern(**validate)])
-    return extract(inp, cfg, region=region)
+    return extract(inp, cfg)
 
 
 def vrows(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1570,27 +1570,13 @@ def test_011_prefix_from_the_us(tmp_path: Path) -> None:
     assert got(matches) == [("valid_GB_number", "+442079460018")]
 
 
-# ---- caller and hints
-def test_caller_region_restricts_parsing(tmp_path: Path) -> None:
-    matches, decisions = run_phone(tmp_path, "office 020 7946 0018", region="gb")
-    assert got(matches) == [("valid_GB_number", "+442079460018")]
-    assert vrows(decisions)[0]["decided_by"] == "caller"
-    # 212-555-0123 is valid in DE: the caller is trusted, the US list is not consulted.
-    matches, _ = run_phone(tmp_path, "call 212-555-0123", region="DE")
-    assert got(matches) == [("valid_DE_number", "+492125550123")]
-
-
-def test_caller_region_that_does_not_fit_falls_back_to_the_list(tmp_path: Path) -> None:
-    """212-555-0123 is impossible in FR, so the list (US) is parsed instead."""
-    matches, decisions = run_phone(tmp_path, "call 212-555-0123", region="FR")
-    assert got(matches) == [("valid_US_number", "+12125550123")]
-    (row,) = vrows(decisions)
-    assert row["decided_by"] == "list" and "caller FR did not fit" in row["reason"]
-
-
-def test_unknown_caller_region_is_an_error(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="region: unknown region 'XQ'"):
-        run_phone(tmp_path, "call 212-555-0123", region="XQ")
+# ---- hints
+def test_regions_come_only_from_the_config(tmp_path: Path) -> None:
+    """There is no per-call region: extract() and the CLI take none."""
+    with pytest.raises(TypeError):
+        extract("call 212-555-0123", make_cfg(tmp_path, [phone_pattern()]), region="GB")
+    with pytest.raises(SystemExit):
+        main(["--config", str(CONFIG_PATH), "--region", "GB", "--text", "x"])
 
 
 UK_INDIA = {"GB": {"uk": 3, "london": 2}, "IN": {"india": 3}}
@@ -1743,16 +1729,13 @@ def test_validation_drop_counts_as_dropped_in_miss_row(tmp_path: Path) -> None:
 
 
 # ---- CLI, report, summary
-def test_extra_in_cli_json_and_region_flag(capsys: pytest.CaptureFixture[str]) -> None:
+def test_extra_in_cli_json(capsys: pytest.CaptureFixture[str]) -> None:
     import json
 
-    assert main(["--config", str(CONFIG_PATH), "--region", "GB",
-                 "--text", "office 020 7946 0018"]) == 0
+    assert main(["--config", str(CONFIG_PATH), "--text", "office +44 20 7946 0018"]) == 0
     (out,) = json.loads(capsys.readouterr().out)
     assert (out["label"], out["extra"]["normalized"], out["extra"]["region_source"]) == (
-        "valid_GB_number", "+442079460018", "caller")
-    assert main(["--config", str(CONFIG_PATH), "--region", "XQ", "--text", "x"]) == 2
-    assert "unknown region 'XQ'" in capsys.readouterr().err
+        "valid_GB_number", "+442079460018", "number")
 
 
 def test_validation_rows_in_report_and_summary(tmp_path: Path) -> None:

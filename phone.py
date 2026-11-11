@@ -11,15 +11,15 @@ It never guesses a country. Every plausible reading of a number comes back
 `{status}_{REGION}_number`:
 
   1. "+" number (or a leading "00" when nothing else fits): the country code.
-  2. caller region, else hinted regions: parsed in those regions only; valid
-     readings, else possible ones (hint_conflict: all | nearest). If none
-     fits, fall through to 3 with a note.
+  2. hinted regions: parsed in those regions only; valid readings, else
+     possible ones (hint_conflict: all | nearest). If none fits, fall
+     through to 3 with a note.
   3. the `regions` list, filtered by `readings`.
-  4. impossible everywhere: no reading; the caller logs why.
+  4. impossible everywhere: no reading; extract.py logs why.
 
     spec = load_validate(label, raw_block, weight_map)     # at load time
     spans = refine_spans(span_text, region)                # trim / split a regex hit
-    out = readings_for(raw, spec, caller, hints)           # every reading + why
+    out = readings_for(raw, spec, hints)                   # every reading + why
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ OLD_KEYS = {
     "region_from": "hint words are read in the text window and the context, like keywords",
 }
 STATUSES = ("valid", "possible", "impossible")
-SOURCES = ("number", "caller", "hint", "list")   # decided_by of a validation row
+SOURCES = ("number", "hint", "list")   # decided_by of a validation row
 
 _pn_module: Any = None
 
@@ -253,7 +253,7 @@ class Reading:
 @dataclass
 class Outcome:
     readings: list[Reading]     # returned and not returned, in order
-    source: str                 # number | caller | hint | list
+    source: str                 # number | hint | list
     notes: list[str] = field(default_factory=list)
     why: str = ""               # why there is no reading at all (impossible)
 
@@ -308,7 +308,7 @@ def _hold(readings: list[Reading], keep: Callable[[Reading], bool], why: str) ->
 
 
 def readings_for(
-    raw: str, spec: PhoneSpec, caller: str | None, hints: list[RegionHint]
+    raw: str, spec: PhoneSpec, hints: list[RegionHint]
 ) -> Outcome:
     """Every reading of `raw`; the ones not returned are kept with returned=False."""
     if raw.lstrip(" (").startswith("+"):
@@ -318,11 +318,6 @@ def readings_for(
         return Outcome([_reading(raw, c, spec)], "number")
 
     notes: list[str] = []
-    if caller:
-        found, _ = _fitting(raw, [caller], spec)
-        if found:
-            return Outcome(found, "caller")
-        notes.append(f"caller {caller} did not fit")
 
     hinted = [h for h in hints if h.score > 0]
     if hinted:

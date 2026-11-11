@@ -45,7 +45,7 @@ string, and resolves overlapping matches.
    before step 5: `phone.readings_for()` returns every reading of the hit
    (no tie-breaking between regions). The steps, first that applies:
    - `+` number (or `00` as a last resort);
-   - the caller or hinted regions only (valid readings, else possible ones;
+   - the hinted regions only (valid readings, else possible ones;
      `hint_conflict` all | nearest; if none fits, fall through with a note);
    - the `regions` list, filtered by `readings`.
    Each returned reading becomes a match labeled `{status}_{REGION}_number`,
@@ -58,8 +58,8 @@ string, and resolves overlapping matches.
    one hit never conflict), else apply `overlap_tiebreak` in
    order (`score`, `length`, `priority`). Empty list or full tie: earlier
    start, then label. Identical spans count as overlapping.
-6. `extract(text, cfg, source="", region=None)` chains 2-5 and returns `(matches, decisions)`; it writes no files. `main()` is an argparse CLI:
-   `extract.py --config extraction_config.yaml [--text TEXT | stdin] [--context TEXT] [--region CODE] [--report]`
+6. `extract(text, cfg, source="")` chains 2-5 and returns `(matches, decisions)`; it writes no files. `main()` is an argparse CLI:
+   `extract.py --config extraction_config.yaml [--text TEXT | stdin] [--context TEXT] [--report]`
    It scans one text and prints the matches as a JSON list (`label, text, start,
    end, score`, plus `extra` for validated matches); the library is the main interface, so the CLI takes no files.
    Load warnings go to stderr as `warning: ...` (exit code unchanged).
@@ -101,11 +101,13 @@ string, and resolves overlapping matches.
   a `dropped` row with a reason (which includes the phonenumbers version).
 - `coexist`, miss rows and `summarize_validation` use `family`
   (`Candidate.group`), so rules naming the pattern label cover every reading.
+- Regions come only from the YAML (`regions`, `hints`, a `+` in the number);
+  there is no per-call region argument or CLI flag.
 
 ## Decisions and report
 - The decisions from `extract()` are flat dicts (`REPORT_FIELDS`, ending in
   `decided_by`). Kinds: `below_min_score`, `overlap`, `coexist`, `miss`,
-  `validation` (`decided_by` = source: number | caller | hint | list; columns
+  `validation` (`decided_by` = source: number | hint | list; columns
   `status`, `region`, `normalized` sit just before `decided_by`, blank on other
   kinds; candidate columns end in `family`).
   `decided_by` is set from the deciding criterion (`_why_wins` returns
@@ -130,7 +132,7 @@ string, and resolves overlapping matches.
   `miss` rows, the score breakdown, every `decided_by` value,
   `summarize_overlaps`, `summarize_misses` and `--summarize`, and the public
   API as the README shows it. Phone: `validate` load and migration errors,
-  each status, every `readings` and `hint_conflict` mode, caller and hints
+  each status, every `readings` and `hint_conflict` mode, hints
   (including misfits), `+`/`00`/`011`, span refinement and back-to-back
   numbers, readings vs other patterns, coexist/misses via `family`, `extra`,
   report rows, `summarize_validation`.
