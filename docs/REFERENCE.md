@@ -87,6 +87,151 @@ print(format_misses(summarize_misses()))          # the miss table printed under
 print(format_validation(summarize_validation()))  # phone validation, printed last
 ```
 
+## Decision flow
+
+What happens to every piece of text, and which report row each decision
+leaves. Read the diagrams top to bottom.
+
+### From text to matches
+
+```mermaid
+flowchart TD
+    A["text, optional context"] --> B["normalize"]
+    B --> C["run every pattern's regex on its own"]
+    C --> D{"regex hit?"}
+    D -- "no" --> D0["nothing to decide"]
+    D -- "yes" --> E{"pattern has validate?"}
+    E -- "yes" --> F["trim or split the hit<br/>with PhoneNumberMatcher"]
+    E -- "no" --> G
+    F --> G["score = text score + context score"]
+    G --> H{"pattern has validate?"}
+    H -- "yes" --> I["phone flow: zero or more readings<br/>(next diagram)"]
+    I -- "no reading" --> X1["dropped<br/>row: validation, dropped"]
+    I -- "readings" --> J
+    H -- "no" --> J{"score >= min_score?"}
+    J -- "no" --> X2["dropped<br/>row: below_min_score"]
+    J -- "yes" --> K{"overlaps a candidate<br/>already accepted?"}
+    K -- "no" --> OK["kept<br/>no row"]
+    K -- "yes" --> L{"coexist pair, or readings<br/>of one phone number?"}
+    L -- "yes" --> OK2["both kept<br/>row: coexist (pairs only)"]
+    L -- "no" --> M["tie-break chain<br/>(third diagram)"]
+    M --> X3["loser dropped<br/>row: overlap"]
+```
+
+- **Scoring comes before the phone check**, so a phone reading keeps the score
+  of the hit it came from.
+- **Candidates are taken best first**, in `overlap_tiebreak` order, and each
+  is compared with the ones already accepted. That is why the loser is always
+  the lower-ranked one.
+- **A candidate that survives with no overlap writes no row.** Rows record
+  decisions; nothing was decided.
+- **Misses are added at the end:** each label the context scored above 0 that
+  has no match gets a `miss` row (see [Misses](#misses)).
+
+### Phone decision flow
+
+For one phone-shaped hit, in a pattern with a `validate:` block. The result is
+zero or more readings; each reading becomes a match.
+
+```mermaid
+flowchart TD
+    A["one phone number"] --> B{"starts with +?"}
+    B -- "yes" --> C["parse with its own country code"]
+    C --> D{"possible?"}
+    D -- "yes" --> R1["1 reading<br/>source: number"]
+    D -- "no" --> X["dropped<br/>row: validation, dropped"]
+    B -- "no" --> E{"hint words found?"}
+    E -- "no" --> L
+    E -- "yes" --> F["parse in the hinted regions<br/>valid readings, else possible ones<br/>(hint_conflict: all or nearest)"]
+    F --> G{"any hinted reading?"}
+    G -- "none" --> H{"hint_fallback = never?"}
+    H -- "yes" --> X
+    H -- "no" --> L
+    G -- "some" --> I{"hint_fallback"}
+    I -- "never or impossible" --> R2["hinted readings only<br/>source: hint"]
+    I -- "not_valid" --> J{"any hinted reading valid?"}
+    J -- "yes" --> R2
+    J -- "no" --> L
+    I -- "always" --> L
+    L["parse in each region of regions<br/>keep what readings allows"] --> M{"any reading in total?"}
+    M -- "yes" --> R3["hinted + list readings<br/>sources: hint and list"]
+    M -- "no" --> N{"starts with 00, and possible<br/>when 00 is read as +?"}
+    N -- "yes" --> R1
+    N -- "no" --> X
+```
+
+- **Never a guess about the country.** Every reading that survives is
+  returned, labeled with its status and region (`valid_US_number`,
+  `possible_GB_number`).
+- **Hints narrow the search first.** A hint word is a reason to look at a
+  region, not a verdict. `hint_fallback` says when the `regions` list gets a
+  turn too.
+- **Dropped means logged.** Every dropped hit has a `validation` row with the
+  reason, such as `impossible in US (TOO_SHORT)`.
+- **Several readings of one number** share its span and score and never
+  compete with each other. Each competes with other patterns normally.
+
+### Tie-break chain
+
+When two candidates overlap and are not a `coexist` pair, `overlap_tiebreak`
+is applied in the order you list it. This is the default order:
+
+```mermaid
+flowchart TD
+    A["two overlapping candidates"] --> B{"score differs?"}
+    B -- "yes" --> W1["higher score wins<br/>decided_by: score"]
+    B -- "no" --> C{"length differs?"}
+    C -- "yes" --> W2["longer match wins<br/>decided_by: length"]
+    C -- "no" --> D{"priority differs?"}
+    D -- "yes" --> W3["lower priority number wins<br/>decided_by: priority"]
+    D -- "no" --> W4["earlier start, then label<br/>decided_by: start_label"]
+```
+
+A criterion you leave out of `overlap_tiebreak` is skipped. An empty list goes
+straight to `start_label`. A `start_label` result in the summary means nothing
+in your input decided it, which is the cue to add keywords.
+
+### Worked example
+
+Context `Acct`, text `Acct 2125550123 call 212-555-0123`, with the example
+config (decay on, `min_score` 0, `phone_number` validated for the US):
+
+| Step | What happens |
+| --- | --- |
+| Find | `account_number` hits `2125550123`. `phone_number` hits `2125550123` and `212-555-0123`. |
+| Score | `account_number`: text `acct` +3, `call` -2 = 1.0; context `acct` +3; total **4.0**. Phone hit 1: `call` +2 = **2.0**. Phone hit 2: `call` +2 = **2.0**. |
+| Validate | Both phone hits are valid in the US: two `validation` rows, `kept`, source `list`. Labels become `valid_US_number`. |
+| `min_score` | All three are at or above 0. No `below_min_score` rows. |
+| Overlap | `account_number` and the first phone reading share a span. Not a coexist pair, so the chain runs: score 4.00 > 2.00. The `overlap` row says `decided_by: score`, and the phone reading is dropped. |
+| Result | `account_number` `2125550123` (4.0) and `valid_US_number` `212-555-0123` (2.0). The second phone hit overlapped nothing, so it has no row beyond its validation row. |
+
+The same text without the context scores `account_number` 1.0 against the
+first phone reading's 2.0, so the phone reading wins instead. That flip is the
+context doing its job.
+
+## Reading the report
+
+Each row of `extract_report.csv` is one decision. `kind` says which step wrote
+it, `outcome` what happened, and `decided_by` the rule that decided.
+
+| `kind` | Written when | `outcome` | `decided_by` |
+| --- | --- | --- | --- |
+| `validation` | a phone hit was checked: one row per reading, or one for an impossible hit | `kept`, `not_returned`, `dropped` | `number`, `hint`, `list` |
+| `below_min_score` | a candidate scored under `min_score` | `dropped` | `min_score` |
+| `overlap` | two candidates overlapped and one lost | `a_wins_b_dropped` | `score`, `length`, `priority`, `start_label` |
+| `coexist` | two candidates overlapped but their labels are a coexist pair | `both_kept` | `coexist` |
+| `miss` | the context scored a label above 0 and it has no match | `no_candidates`, `candidates_dropped` | (empty) |
+
+Questions the report answers:
+
+| Question | Where to look |
+| --- | --- |
+| Why did `A` beat `B`? | the `overlap` row: `a_*` is the winner, `b_*` the loser; `reason` shows the numbers |
+| Why is my match missing? | `b_` side of an `overlap` row; a `below_min_score` row; a `validation` row with `dropped`; or a `miss` row |
+| Why `possible_US_number` and not `valid_US_number`? | the `validation` row: `status`, `region`, and `reason` |
+| Why was a phone reading not returned? | a `validation` row with `not_returned`; `reason` names the `readings` or `hint_conflict` setting |
+| What do I tune first? | `extract.py --summarize` (see [Summaries](#summaries)) |
+
 ## How it works
 
 1. **Load**: read the YAML and compile each regex once (IGNORECASE unless
