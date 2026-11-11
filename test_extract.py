@@ -414,9 +414,9 @@ def test_cli_text_prints_matches_and_writes_nothing(
     assert main(["--config", str(CONFIG_PATH),
                  "--text", "Please call 212-555-0123 about the order."]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out[0]["text"] == "212-555-0123"
-    assert set(out[0]) == {"label", "text", "start", "end", "score", "extra"}
-    assert out[0]["extra"]["normalized"] == "+12125550123"
+    # A validated match's text is the number in output_format (E.164 by default).
+    assert out[0]["text"] == "+12125550123"
+    assert set(out[0]) == {"label", "text", "start", "end", "score"}
     assert not Path("extract_report.csv").exists()
 
 
@@ -667,7 +667,8 @@ def test_stop_at_period_changes_overlap_winner(stop_at: str, expected_label: str
     (+3) so it beats phone_number. With stop_at='.' the scan ends at the period,
     both scores are 0, and the priority tie-break picks phone_number."""
     matches = matches_of("Acct. 2125550123", _real_cfg_with_stop_at(stop_at))
-    assert [(m.label, m.text) for m in matches] == [(expected_label, "2125550123")]
+    expected_text = "+12125550123" if expected_label.startswith("valid_") else "2125550123"
+    assert [(m.label, m.text) for m in matches] == [(expected_label, expected_text)]
 
 
 @pytest.mark.parametrize("stop_at", ["", ".!?"])
@@ -675,7 +676,7 @@ def test_stop_at_keeps_context_after_period(stop_at: str) -> None:
     """'phone' is after the period and before the number, so it still counts
     whether or not stop_at is set: phone/2 words away = 1.5."""
     matches = matches_of("acct. phone is 212-456-2342", _real_cfg_with_stop_at(stop_at))
-    assert [(m.label, m.text) for m in matches] == [("valid_US_number", "212-456-2342")]
+    assert [(m.label, m.text) for m in matches] == [("valid_US_number", "+12124562342")]
     assert matches[0].score == pytest.approx(1.5)
 
 
@@ -1090,10 +1091,11 @@ def test_public_api_as_documented(
                 ("call", "Call 212-555-0123 acct 2125550123")):
         matches, decisions = extract(inp, cfg, source="id-1")
         base = {"label", "text", "start", "end", "score"}
-        # Matches of a pattern with `validate` also carry `extra`.
+        # Validated matches have the same shape; their text is the E.164 number.
         assert len(matches) == 2
         for m in matches:
-            assert set(m.to_dict()) == (base | {"extra"} if m.family == "phone_number" else base)
+            assert set(m.to_dict()) == base
+        assert all(m.text == "+12125550123" for m in matches if m.group == "phone_number")
         assert decisions and all(list(d) == list(REPORT_FIELDS) for d in decisions)
         assert {d["file"] for d in decisions} == {"id-1"}
     matches, _ = extract({"text": "some text", "context": "call"}, cfg)
@@ -1379,9 +1381,9 @@ def vrows(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def got(matches: list[Any]) -> list[tuple[str, str]]:
-    """(label, normalized) of each phone match, sorted (matches on one span
+    """(label, text) of each phone match (text = the E.164 number), sorted (matches on one span
     are ordered by label)."""
-    return sorted((m.label, m.extra["normalized"]) for m in matches)
+    return sorted((m.label, m.text) for m in matches)
 
 
 # ---- loading
@@ -1451,21 +1453,23 @@ def test_validate_needs_phonenumbers_installed(
     cfg = make_cfg(tmp_path, [{"label": "n", "priority": 1, "regex": r"\d+"}])
     matches, decisions = extract("call 212-555-0123", cfg)
     assert [m.text for m in matches] == ["212", "555", "0123"]
-    assert all(m.extra is None for m in matches) and not vrows(decisions)
+    assert all(m.raw == "" for m in matches) and not vrows(decisions)
 
 
 # ---- statuses and labels
 def test_valid_number(tmp_path: Path) -> None:
     matches, decisions = run_phone(tmp_path, "call (212) 555-0123 today")
     (m,) = matches
-    assert (m.label, m.text, m.family) == ("valid_US_number", "(212) 555-0123", "ph")
-    assert m.extra == {"normalized": "+12125550123", "region": "US", "status": "valid",
-                       "region_source": "list", "number_type": "FIXED_LINE_OR_MOBILE",
-                       "readings": 1}
+    assert (m.label, m.text, m.family, m.start, m.end) == (
+        "valid_US_number", "+12125550123", "ph", 5, 19)
+    assert m.to_dict() == {"label": "valid_US_number", "text": "+12125550123",
+                           "start": 5, "end": 19, "score": 0.0}
     (row,) = vrows(decisions)
+    # The report keeps the written form in a_text and the E.164 form in normalized.
     assert (row["outcome"], row["status"], row["region"], row["normalized"], row["decided_by"],
-            row["a_label"], row["a_family"]) == (
-        "kept", "valid", "US", "+12125550123", "list", "valid_US_number", "ph")
+            row["a_label"], row["a_text"], row["a_family"]) == (
+        "kept", "valid", "US", "+12125550123", "list", "valid_US_number", "(212) 555-0123", "ph")
+    assert "FIXED_LINE_OR_MOBILE" not in m.to_dict().values()
     assert f"phonenumbers {phone.pn_version()}" in row["reason"]
 
 
@@ -1537,8 +1541,9 @@ def test_readings_modes(tmp_path: Path, readings: str, text: str, expected: list
 
 def test_readings_of_one_hit_share_span_and_count(tmp_path: Path) -> None:
     matches, decisions = run_phone(tmp_path, "call 555-123-4567", regions=["US", "GB"])
-    assert {(m.start, m.end, m.text) for m in matches} == {(5, 17, "555-123-4567")}
-    assert [m.extra["readings"] for m in matches] == [2, 2]
+    # Two readings on one span; their texts differ (+1..., +44...).
+    assert {(m.start, m.end) for m in matches} == {(5, 17)}
+    assert len(matches) == 2 and len({m.text for m in matches}) == 2
     assert not [d for d in decisions if d["kind"] in ("overlap", "coexist")]
 
 
@@ -1622,8 +1627,8 @@ def test_hint_fallback_when_the_hint_is_only_possible(
     assert sources["GB"] == "hint"
     if fallback not in ("impossible", "never"):
         assert sources["US"] == "list"
-        assert {m.label: m.extra["region_source"] for m in matches} == {
-            "possible_GB_number": "hint", "valid_US_number": "list"}
+        kept = {r["a_label"]: r["decided_by"] for r in vrows(decisions) if r["outcome"] == "kept"}
+        assert kept == {"possible_GB_number": "hint", "valid_US_number": "list"}
     if fallback == "not_valid":
         assert "hint_fallback: not_valid parsed the list too" in vrows(decisions)[0]["reason"]
 
@@ -1702,10 +1707,12 @@ def test_hint_regions_need_not_be_listed(tmp_path: Path) -> None:
 
 # ---- refinement
 def test_span_refinement_trims_and_splits(tmp_path: Path) -> None:
-    matches, _ = run_phone(tmp_path, "call 212-555-0123 2026 renewal")
-    assert [(m.text, m.start, m.end) for m in matches] == [("212-555-0123", 5, 17)]
-    matches, _ = run_phone(tmp_path, "call 212-555-0123 or 212-555-0199")
-    assert [m.text for m in matches] == ["212-555-0123", "212-555-0199"]
+    text = "call 212-555-0123 2026 renewal"
+    matches, _ = run_phone(tmp_path, text)
+    assert [(text[m.start:m.end], m.start, m.end) for m in matches] == [("212-555-0123", 5, 17)]
+    text = "call 212-555-0123 or 212-555-0199"
+    matches, _ = run_phone(tmp_path, text)
+    assert [text[m.start:m.end] for m in matches] == ["212-555-0123", "212-555-0199"]
 
 
 def test_span_refinement_scores_the_trimmed_span(tmp_path: Path) -> None:
@@ -1713,7 +1720,7 @@ def test_span_refinement_scores_the_trimmed_span(tmp_path: Path) -> None:
     so "renewal" is the first word after the number)."""
     pattern = {**phone_pattern(), "keywords": {"renewal": 2}}
     (m,) = run_phone(tmp_path, "212-555-0123 2026 renewal", patterns=[pattern])[0]
-    assert (m.text, m.end) == ("212-555-0123", 12) and m.score == pytest.approx(2.0)
+    assert (m.text, m.start, m.end) == ("+12125550123", 0, 12) and m.score == pytest.approx(2.0)
 
 
 @pytest.mark.parametrize("text, expected", [
@@ -1727,7 +1734,7 @@ def test_back_to_back_numbers_are_all_found(tmp_path: Path, text: str, expected:
     """A greedy hit can run into the next number; the scan resumes where the
     refined number ended, so the next one is still found whole."""
     matches, _ = run_phone(tmp_path, text)
-    assert [m.text for m in matches] == expected
+    assert [text[m.start:m.end] for m in matches] == expected
 
 
 def test_matcher_finding_nothing_keeps_the_raw_span(tmp_path: Path) -> None:
@@ -1782,13 +1789,42 @@ def test_validation_drop_counts_as_dropped_in_miss_row(tmp_path: Path) -> None:
 
 
 # ---- CLI, report, summary
-def test_extra_in_cli_json(capsys: pytest.CaptureFixture[str]) -> None:
+def test_normalized_number_in_cli_json(capsys: pytest.CaptureFixture[str]) -> None:
     import json
 
     assert main(["--config", str(CONFIG_PATH), "--text", "office +44 20 7946 0018"]) == 0
     (out,) = json.loads(capsys.readouterr().out)
-    assert (out["label"], out["extra"]["normalized"], out["extra"]["region_source"]) == (
-        "valid_GB_number", "+442079460018", "number")
+    assert (out["label"], out["text"], out["start"], out["end"]) == (
+        "valid_GB_number", "+442079460018", 7, 23)
+
+
+@pytest.mark.parametrize("fmt, expected", [
+    ("E164", "+12125550123"),
+    ("INTERNATIONAL", "+1 212-555-0123"),
+    ("NATIONAL", "(212) 555-0123"),
+    ("RAW", "212.555.0123"),
+])
+def test_output_format_sets_the_match_text(tmp_path: Path, fmt: str, expected: str) -> None:
+    text = "call 212.555.0123"
+    matches, decisions = run_phone(tmp_path, text, output_format=fmt)
+    (m,) = matches
+    assert (m.label, m.text) == ("valid_US_number", expected)
+    if fmt == "RAW":
+        assert m.text == text[m.start:m.end]
+    (row,) = vrows(decisions)
+    # The report: written form in a_text, E.164 in normalized, in every format.
+    assert (row["a_text"], row["normalized"]) == ("212.555.0123", "+12125550123")
+
+
+def test_output_format_rejects_unknown_values(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="RAW"):
+        run_phone(tmp_path, "call 212-555-0123", output_format="E.164")
+
+
+def test_local_only_number_keeps_its_text(tmp_path: Path) -> None:
+    for fmt in ("E164", "NATIONAL"):
+        matches, _ = run_phone(tmp_path, "call 555-0123", output_format=fmt, readings="all")
+        assert [(m.label, m.text) for m in matches] == [("possible_US_number", "555-0123")]
 
 
 def test_validation_rows_in_report_and_summary(tmp_path: Path) -> None:

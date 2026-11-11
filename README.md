@@ -156,8 +156,9 @@ reading of a number comes back as its own match.
 ```
 
 - **Labels** are `{status}_{REGION}_number`. A **valid** number in a known
-  range becomes `valid_US_number`, and `extra.normalized` holds its E.164
-  form (`+12125550123`). The right length in an unknown range (a new area
+  range becomes `valid_US_number`, and its `text` is the number in E.164
+  form (`+12125550123`). Set `output_format` to `INTERNATIONAL`, `NATIONAL` or
+  `RAW` (the text as written) to change that. The right length in an unknown range (a new area
   code, say) becomes `possible_US_number`. Nothing is lost.
 - **Impossible hits** (wrong length everywhere) are dropped and logged in the
   report.
@@ -176,7 +177,7 @@ reading of a number comes back as its own match.
 
 ```text
 text:    "our UK office called India at 98765 43210"
-match:   valid_IN_number  extra.normalized +919876543210  (fits IN, not GB)
+match:   valid_IN_number  text +919876543210  (fits IN, not GB)
 ```
 
 Without `hints`, the same text gives `possible_US_number`, since 10 digits
@@ -200,7 +201,8 @@ python -m venv .venv
 ## Quick start
 
 CLI: see step 3 above. It scans one text per run and prints JSON. Phone
-matches also carry an `extra` object (normalized number, region, status, ...).
+matches have the same fields; their `text` is the normalized number, and
+`start`/`end` still point at the number as written.
 
 Library:
 

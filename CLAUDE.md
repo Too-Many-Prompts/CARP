@@ -22,7 +22,7 @@ string, and resolves overlapping matches.
    `finditer`. Never combine patterns into one alternation (it hides overlaps).
    Every pattern always runs on the text; the context never selects patterns.
    Candidate = dataclass(label, start, end, text, priority, score=0,
-   text_score=0, context_score=0, extra=None, family="", hit=-1);
+   text_score=0, context_score=0, family="", hit=-1, raw="");
    `score = text_score + context_score`; `group` = family or label.
    A pattern with `validate` is scanned by `_find_validated()`: each regex hit
    is refined by `phone.refine_spans()` (PhoneNumberMatcher, POSSIBLE), the
@@ -52,8 +52,10 @@ string, and resolves overlapping matches.
      impossible (no hinted reading), always, never. Its readings are added
      (source `list`); each reading keeps its own source.
    Each returned reading becomes a match labeled `{status}_{REGION}_number`,
-   with `family` = the pattern label, a shared `hit` id, and `extra`
-   {normalized, region, status, region_source, number_type, readings}.
+   with `family` = the pattern label, a shared `hit` id, `text` = the
+   number in `output_format` (E164 | INTERNATIONAL | NATIONAL | RAW; RAW keeps
+   the input slice) and `raw` = the written form (report `a_text` only; never
+   in `to_dict()`). The report's `normalized` column is always E.164.
    Validation rows: one per reading (kept / not_returned), or one `dropped`
    row when the hit is impossible everywhere.
 5. `resolve_overlaps(...)`: drop below `min_score`; for overlapping spans keep
@@ -64,7 +66,7 @@ string, and resolves overlapping matches.
 6. `extract(text, cfg, source="")` chains 2-5 and returns `(matches, decisions)`; it writes no files. `main()` is an argparse CLI:
    `extract.py --config extraction_config.yaml [--text TEXT | stdin] [--context TEXT] [--report]`
    It scans one text and prints the matches as a JSON list (`label, text, start,
-   end, score`, plus `extra` for validated matches); the library is the main interface, so the CLI takes no files.
+   end, score`, the same for validated matches); the library is the main interface, so the CLI takes no files.
    Load warnings go to stderr as `warning: ...` (exit code unchanged).
 7. `summarize_overlaps(path=REPORT_PATH)` (in `summarize.py`, a leaf module
    that imports nothing from `extract.py`; `extract.py` re-exports it) reads a report CSV's `overlap` rows
@@ -96,7 +98,7 @@ string, and resolves overlapping matches.
   - `readings` (valid_and_home | all | valid_else_possible | valid);
   - `hint_conflict` (all | nearest);
   - `hint_fallback` (not_valid | impossible | always | never);
-  - `output_format` (E164).
+  - `output_format` (E164 | INTERNATIONAL | NATIONAL | RAW): the match `text`.
 
   The earlier keys (`default_region`, `try_regions`, `possible_label`,
   `on_*`, `possible_min_score`, `region_from`, `regions` as a map) fail with
@@ -138,7 +140,7 @@ string, and resolves overlapping matches.
   API as the README shows it. Phone: `validate` load and migration errors,
   each status, every `readings`, `hint_conflict` and `hint_fallback` mode, hints
   (including misfits), `+`/`00`/`011`, span refinement and back-to-back
-  numbers, readings vs other patterns, coexist/misses via `family`, `extra`,
+  numbers, readings vs other patterns, coexist/misses via `family`, every `output_format`,
   report rows, `summarize_validation`.
 - Run `pytest -q` after every change and do not report success until it passes.
 

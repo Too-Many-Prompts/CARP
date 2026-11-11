@@ -36,7 +36,7 @@ CHOICES = {
     "hint_conflict": ("all", "nearest"),
     # When the `regions` list is also parsed after a hint matched:
     "hint_fallback": ("not_valid", "impossible", "always", "never"),
-    "output_format": ("E164", "INTERNATIONAL", "NATIONAL"),
+    "output_format": ("E164", "INTERNATIONAL", "NATIONAL", "RAW"),
 }
 DEFAULTS = {"readings": "valid_and_home", "hint_conflict": "all", "hint_fallback": "not_valid",
             "output_format": "E164"}
@@ -245,13 +245,16 @@ class Reading:
     """One interpretation of a number in one region."""
     status: str                 # valid | possible
     region: str | None          # the number's region (416 -> CA)
-    normalized: str             # in output_format; raw text if local-only
+    normalized: str             # the match text: in output_format (RAW: as written);
+                                # raw text if local-only
     key: str                    # E.164, or region:raw when there is none
     number_type: str = ""
     parsed_in: str | None = None  # the region it was parsed in (None: "+" number)
     source: str = "list"        # number | hint | list
     returned: bool = True       # False: filtered out by readings / hint_conflict
     why: str = ""               # why not returned
+    e164: str = ""              # always E.164 (raw text if local-only): the report's
+                                # `normalized` column, whatever output_format says
 
     @property
     def label(self) -> str:
@@ -274,18 +277,20 @@ def _reading(raw: str, c: Check, spec: PhoneSpec) -> Reading:
     lib = pn()
     region = c.region
     number_type = ""
-    normalized = raw
+    normalized = e164 = raw
     key = f"{region}:{raw}"
     if c.full:
-        fmt = getattr(lib.PhoneNumberFormat, spec.output_format)
-        normalized = lib.format_number(c.number, fmt)
-        key = lib.format_number(c.number, lib.PhoneNumberFormat.E164)
+        e164 = key = lib.format_number(c.number, lib.PhoneNumberFormat.E164)
+        if spec.output_format != "RAW":
+            fmt = getattr(lib.PhoneNumberFormat, spec.output_format)
+            normalized = lib.format_number(c.number, fmt)
         if c.status == "valid":
             region = lib.region_code_for_number(c.number) or region
             number_type = _type_name(lib.number_type(c.number))
         elif region is None:
             region = lib.region_code_for_country_code(c.number.country_code)
-    return Reading(c.status, region, normalized, key, number_type, parsed_in=c.region)
+    return Reading(c.status, region, normalized, key, number_type, parsed_in=c.region,
+                   e164=e164)
 
 
 def _type_name(value: int) -> str:

@@ -23,18 +23,21 @@ every caller.
    `phone_number`.
    - Look for: `m.label == "phone_number"`, label sets, dicts keyed by label.
    - Do: use `m.group` (new property, the pattern label `"phone_number"`) to
-     identify the pattern; `m.extra["status"]` (`valid` | `possible`) and
-     `m.extra["region"]` for detail.
+     identify the pattern. Status and region are in the label:
+     `status, region = m.label.split("_")[:2]` (`valid` | `possible`, `US`).
 2. **One number can return several matches on the same span** (one per plausible
    reading, e.g. `possible_US_number` and `valid_GB_number`).
    - Look for: code assuming one match per `(start, end)` or per `text`.
-   - Do: group by `(m.start, m.end)`, or keep `m.extra["status"] == "valid"`.
-     `m.extra["readings"]` is the reading count for that number.
-3. **New field `m.extra`** (dict) on validated matches, and an `"extra"` key in
-   `m.to_dict()` and the CLI JSON. Keys: `normalized` (E.164 by default),
-   `region`, `status`, `region_source`, `number_type`, `readings`. Non-validated
-   matches are unchanged (`m.extra is None`, no `"extra"` key).
-   - Look for: strict JSON schemas or fixed-key types. Do: allow the key.
+   - Do: group by `(m.start, m.end)` (the group size is the reading count), or
+     keep labels starting `valid_`.
+3. **`m.text` of a validated match is the normalized number** (`+12125550123`),
+   not the input slice. The match shape is unchanged (`label, text, start, end,
+   score`; no new keys in `to_dict()` or the CLI JSON).
+   - Look for: code that slices, highlights, redacts or re-finds `m.text` in the
+     input, or compares it to the input. Do: use `input[m.start:m.end]`
+     (offsets still point at the number as written), or set
+     `output_format: RAW` in the pattern's `validate` block to keep `text` as
+     the input slice. `INTERNATIONAL` and `NATIONAL` are also available.
 4. **Phone results differ from before:** international forms (`+44 …`) are now
    found, and a hit impossible in every configured region is dropped (and
    logged). Re-record golden outputs. `555-xxx-xxxx` is `possible`, not `valid`.
@@ -53,7 +56,7 @@ every caller.
    `validation` rows. New importable functions: `summarize_validation`,
    `format_validation`.
 
-No effect on callers: `Candidate` gained `extra`, `family`, `hit` after its
+No effect on callers: `Candidate` gained `family`, `hit`, `raw` after its
 existing fields (all defaulted), so existing construction still works;
 `phonenumbers` is imported only when a config uses `validate` (install
 `phonenumbers>=9.0` only then); there is deliberately no per-call region argument.

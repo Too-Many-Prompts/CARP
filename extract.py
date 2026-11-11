@@ -14,8 +14,9 @@ summarize_misses() / format_misses() and summarize_validation() /
 format_validation() (defined in summarize.py).
 
 Phone numbers: a pattern with a `validate:` block is checked with the
-phonenumbers library (phone.py); its matches carry `extra` (normalized
-number, region, status, ...).
+phonenumbers library (phone.py); their label carries status and region
+(valid_US_number) and their `text` is the number in `output_format` (E.164 by
+default; RAW keeps the input slice).
 
 Scoring: every pattern runs on the text. A candidate's score is
     text_score    (its `nearby` + `keywords` words in the text window)
@@ -125,14 +126,14 @@ class Candidate:
     score: float = 0            # text_score + context_score
     text_score: float = 0
     context_score: float = 0
-    # Set only on matches from a pattern with `validate`: normalized, region,
-    # region_source, status, number_type, readings.
-    extra: dict[str, Any] | None = None
     # The pattern label when `label` is generated (valid_US_number ->
     # phone_number); "" means the same as label. coexist and misses use it.
     family: str = ""
     # Readings of one phone hit share a hit id and never conflict (-1: none).
     hit: int = -1
+    # The written form of a validated match whose `text` is the formatted
+    # number; "" otherwise. Report only (a_text): never in to_dict() / the JSON.
+    raw: str = ""
 
     @property
     def group(self) -> str:
@@ -140,22 +141,20 @@ class Candidate:
         return self.family or self.label
 
     def to_dict(self) -> dict[str, Any]:
-        """The CLI JSON form: label, text, start, end, score (+ extra if set)."""
-        out: dict[str, Any] = {
+        """The CLI JSON form: label, text, start, end, score."""
+        return {
             "label": self.label,
             "text": self.text,
             "start": self.start,
             "end": self.end,
             "score": round(float(self.score), 4),
         }
-        if self.extra is not None:
-            out["extra"] = dict(self.extra)
-        return out
 
     def report_dict(self) -> dict[str, Any]:
         """to_dict() plus the score breakdown, for the report columns."""
         return {
-            **{k: v for k, v in self.to_dict().items() if k != "extra"},
+            **self.to_dict(),
+            "text": self.raw or self.text,      # the report shows the written form
             "text_score": round(float(self.text_score), 4),
             "context_score": round(float(self.context_score), 4),
             "family": self.group,
@@ -718,19 +717,15 @@ def validate_candidates(
                 decided_by=out.source, status="impossible", normalized=c.text,
             ))
             continue
-        returned = out.returned
         for r in out.readings:
-            m = replace(c, label=r.label, family=c.label, hit=hit_id, extra={
-                "normalized": r.normalized, "region": r.region, "status": r.status,
-                "region_source": r.source, "number_type": r.number_type,
-                "readings": len(returned),
-            })
+            m = replace(c, label=r.label, text=r.normalized, raw=c.text,
+                        family=c.label, hit=hit_id)
             verdict = "kept" if r.returned else "not_returned"
             head = f"{r.status} in {r.region}" + (f"; {r.why}" if r.why else "")
             decisions.append(_decision(
                 "validation", verdict, "; ".join([head] + tail), a=m,
                 decided_by=r.source, status=r.status, region=r.region,
-                normalized=r.normalized,
+                normalized=r.e164,
             ))
             if r.returned:
                 kept.append(m)

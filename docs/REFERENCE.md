@@ -19,8 +19,8 @@ Scans one text per run. For many texts, or a CSV of them, use the library.
 - `--context TEXT` is an optional context string. Its words add to the score
   of every pattern that lists them (see [Scoring](#scoring)).
 - Prints the matches as a JSON list of `{label, text, start, end, score}`.
-  Matches of a pattern with `validate` also have `extra` (see
-  [Phone numbers](#phone-numbers)).
+  For a pattern with `validate`, `text` is the number in `output_format`
+  (E.164 by default), not the input slice (see [Phone numbers](#phone-numbers)).
 - Writes nothing else unless asked: `--report` writes the decision log to
   `./extract_report.csv` (overwritten each time).
 - `--summarize [PATH]` prints the [overlap and miss summaries](#summaries) of
@@ -54,9 +54,10 @@ matches, decisions = extract(("call", "some text"), cfg, source="id-1")  # (cont
 `extract()` returns `(matches, decisions)` and **writes no files**.
 `matches` are the candidates that survived scoring and overlap resolution; each
 has `label`, `text`, `start`, `end`, `score`, and the breakdown `text_score`
-and `context_score` (`score` is their sum), and `extra` (a dict for matches
-of a pattern with `validate`, else `None`). Offsets refer to the
-**normalized** text. `decisions` is the flat decision log (see
+and `context_score` (`score` is their sum). Offsets refer to the
+**normalized** text. For a pattern with `validate`, `text` is the formatted
+number (see [Phone numbers](#phone-numbers)); `text[start:end]` of the input
+gives the written form. `decisions` is the flat decision log (see
 [Output files](#output-files)); ignore it, keep it, or write it with the helpers
 below. `source` fills its `file` column.
 
@@ -203,7 +204,7 @@ config (decay on, `min_score` 0, `phone_number` validated for the US):
 | Validate | Both phone hits are valid in the US: two `validation` rows, `kept`, source `list`. Labels become `valid_US_number`. |
 | `min_score` | All three are at or above 0. No `below_min_score` rows. |
 | Overlap | `account_number` and the first phone reading share a span. Not a coexist pair, so the chain runs: score 4.00 > 2.00. The `overlap` row says `decided_by: score`, and the phone reading is dropped. |
-| Result | `account_number` `2125550123` (4.0) and `valid_US_number` `212-555-0123` (2.0). The second phone hit overlapped nothing, so it has no row beyond its validation row. |
+| Result | `account_number` `2125550123` (4.0) and `valid_US_number` `+12125550123` (2.0, written `212-555-0123`). The second phone hit overlapped nothing, so it has no row beyond its validation row. |
 
 The same text without the context scores `account_number` 1.0 against the
 first phone reading's 2.0, so the phone reading wins instead. That flip is the
@@ -400,7 +401,7 @@ library.
     readings: valid_and_home    # what the list returns: valid_and_home | all | valid_else_possible | valid
     hint_conflict: all          # valid in several hinted regions: all | nearest
     hint_fallback: not_valid    # after a hint, also parse `regions`: not_valid | impossible | always | never
-    output_format: E164         # extra.normalized: E164 | INTERNATIONAL | NATIONAL
+    output_format: E164         # the match text: E164 | INTERNATIONAL | NATIONAL | RAW
 ```
 
 - The minimum is `validate: {with: phonenumbers, regions: [US]}`.
@@ -498,12 +499,24 @@ The refined numbers are then scored like any other candidate.
   - `coexist: [[phone_number, account_number]]` covers every reading. A
     generated label works in `coexist` too.
   - Miss rows count a reading as a match of its pattern.
-- **`extra`:** kept matches carry
-  `{normalized, region, status, region_source, number_type, readings}`.
-  - `normalized` is in `output_format`. A local-only number (7 digits, no
-    area code) keeps its raw text.
-  - `number_type` is the library's type name (`MOBILE`, ...) for valid readings.
-  - `readings` is how many readings the hit returned.
+- **Match shape:** validated matches have the usual `label, text, start, end,
+  score` and nothing more. The label gives status and region; matches with the
+  same `(start, end)` are readings of one number.
+- **`text` is the number in `output_format`:**
+
+  | `output_format` | `text` for `212-555-0123` in the US |
+  | --- | --- |
+  | `E164` (default) | `+12125550123` |
+  | `INTERNATIONAL` | `+1 212-555-0123` |
+  | `NATIONAL` | `(212) 555-0123` |
+  | `RAW` | `212-555-0123`, the input slice |
+
+  - Except with `RAW`, `text` is not the input slice; use `start`/`end` to
+    highlight or redact.
+  - A local-only number (7 digits, no area code) keeps its raw text.
+  - The report keeps the written form in `a_text` and always puts E.164 in
+    `normalized`, whatever the format. The source and number type are in the
+    validation rows (`decided_by`, `reason`).
 - **Choosing one answer:** if your code needs a single answer per number,
   take the `valid_*` match, or set `readings: valid` /
   `hint_conflict: nearest`.
@@ -646,5 +659,5 @@ as shown in the README and this reference. Phone tests cover the `validate`
 load and migration errors, each status, every `readings`, `hint_conflict`
 and `hint_fallback` mode, hints (including a hint that does not fit), `+`, `00` and
 `011`, span refinement and back-to-back numbers, readings competing with
-other patterns, `coexist` and misses through `family`, `extra`, the report
+other patterns, `coexist` and misses through `family`, every `output_format`, the report
 rows and the validation summary.
