@@ -1395,7 +1395,7 @@ def got(matches: list[Any]) -> list[tuple[str, str]]:
     ({"with": "phonenumbers", "regions": ["US"], "colour": 1}, "unknown key 'colour'"),
     ({"with": "phonenumbers", "regions": ["XQ"]}, "validate.regions: unknown region 'XQ'"),
     ({"with": "phonenumbers", "regions": ["US", "us"]}, "'US' is listed twice"),
-    ({"with": "phonenumbers", "regions": ["US"], "readings": "some"}, "validate.readings: unknown value 'some'"),
+    ({"with": "phonenumbers", "regions": ["US"], "keep": "some"}, "validate.keep: unknown value 'some'"),
     ({"with": "phonenumbers", "regions": ["US"], "hint_conflict": "first"}, "validate.hint_conflict: unknown value"),
     ({"with": "phonenumbers", "regions": ["US"], "output_format": "e164"}, "validate.output_format: unknown value"),
     ({"with": "phonenumbers", "regions": ["US"], "hints": {"GB": {"uk2": 1}}},
@@ -1416,7 +1416,8 @@ def test_validate_load_errors(tmp_path: Path, validate: Any, message: str) -> No
     ("try_regions", ["US"], "regions: \\[US, ...\\]"),
     ("possible_label", "x", "labels are generated"),
     ("on_invalid", "drop", "always dropped and logged"),
-    ("on_possible", "keep", "use `readings`"),
+    ("on_possible", "keep", "use `keep`"),
+    ("readings", "all", "renamed to `keep`"),
     ("on_ambiguous", "first", "hint_conflict: nearest"),
     ("possible_min_score", 1, "settings.min_score"),
     ("region_from", "both", "text window and the context"),
@@ -1436,7 +1437,7 @@ def test_old_regions_map_points_to_hints(tmp_path: Path) -> None:
 def test_validate_defaults(tmp_path: Path) -> None:
     (p,) = make_cfg(tmp_path, [phone_pattern()]).patterns
     assert p.validate == phone.PhoneSpec(regions=["US"])
-    assert (p.validate.readings, p.validate.hint_conflict) == ("valid_and_home", "all")
+    assert (p.validate.keep, p.validate.hint_conflict) == ("valid_and_home", "all")
 
 
 def test_validate_needs_phonenumbers_installed(
@@ -1495,7 +1496,7 @@ def test_local_only_number_keeps_raw_value(tmp_path: Path) -> None:
 
 def test_nanp_readings_are_one_reading(tmp_path: Path) -> None:
     """US and CA give the same +1 number: one reading, labeled by its real region."""
-    matches, _ = run_phone(tmp_path, "call 416-555-0123", regions=["US", "CA"], readings="all")
+    matches, _ = run_phone(tmp_path, "call 416-555-0123", regions=["US", "CA"], keep="all")
     assert got(matches) == [("valid_CA_number", "+14165550123")]
 
 
@@ -1506,8 +1507,8 @@ def test_output_format(tmp_path: Path, fmt: str, value: str) -> None:
     assert got(matches) == [("valid_US_number", value)]
 
 
-# ---- the region list and `readings`
-@pytest.mark.parametrize("readings, text, expected", [
+# ---- the region list and `keep`
+@pytest.mark.parametrize("keep, text, expected", [
     # 555-123-4567: possible in US (home), valid in GB.
     ("valid_and_home", "call 555-123-4567", [("possible_US_number", "+15551234567"),
                                              ("valid_GB_number", "+445551234567")]),
@@ -1527,8 +1528,8 @@ def test_output_format(tmp_path: Path, fmt: str, value: str) -> None:
                                                   ("possible_GB_number", "+442212345678")]),
     ("valid", "call 221-234-5678", []),
 ])
-def test_readings_modes(tmp_path: Path, readings: str, text: str, expected: list) -> None:
-    matches, decisions = run_phone(tmp_path, text, regions=["US", "GB"], readings=readings)
+def test_keep_modes(tmp_path: Path, keep: str, text: str, expected: list) -> None:
+    matches, decisions = run_phone(tmp_path, text, regions=["US", "GB"], keep=keep)
     assert got(matches) == sorted(expected)
     rows = vrows(decisions)
     assert {r["decided_by"] for r in rows} == {"list"}
@@ -1536,7 +1537,7 @@ def test_readings_modes(tmp_path: Path, readings: str, text: str, expected: list
     assert sum(r["outcome"] == "not_returned" for r in rows) == len(rows) - len(expected)
     for r in rows:
         if r["outcome"] == "not_returned":
-            assert f"readings: {readings}" in r["reason"]
+            assert f"keep: {keep}" in r["reason"]
 
 
 def test_readings_of_one_hit_share_span_and_count(tmp_path: Path) -> None:
@@ -1823,7 +1824,7 @@ def test_output_format_rejects_unknown_values(tmp_path: Path) -> None:
 
 def test_local_only_number_keeps_its_text(tmp_path: Path) -> None:
     for fmt in ("E164", "NATIONAL"):
-        matches, _ = run_phone(tmp_path, "call 555-0123", output_format=fmt, readings="all")
+        matches, _ = run_phone(tmp_path, "call 555-0123", output_format=fmt, keep="all")
         assert [(m.label, m.text) for m in matches] == [("possible_US_number", "555-0123")]
 
 

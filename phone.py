@@ -16,7 +16,7 @@ It never guesses a country. Every plausible reading of a number comes back
      when 3 also runs: not_valid (no valid hinted reading; default),
      impossible (no hinted reading at all), always, or never (a number
      that fits no hinted region is then dropped).
-  3. the `regions` list, filtered by `readings`.
+  3. the `regions` list, filtered by `keep`.
   4. impossible everywhere: no reading; extract.py logs why.
 
     spec = load_validate(label, raw_block, weight_map)     # at load time
@@ -29,16 +29,16 @@ import importlib
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-VALIDATE_KEYS = ("with", "regions", "hints", "readings", "hint_conflict", "hint_fallback",
+VALIDATE_KEYS = ("with", "regions", "hints", "keep", "hint_conflict", "hint_fallback",
                  "output_format")
 CHOICES = {
-    "readings": ("valid_and_home", "all", "valid_else_possible", "valid"),
+    "keep": ("valid_and_home", "all", "valid_else_possible", "valid"),
     "hint_conflict": ("all", "nearest"),
     # When the `regions` list is also parsed after a hint matched:
     "hint_fallback": ("not_valid", "impossible", "always", "never"),
     "output_format": ("E164", "INTERNATIONAL", "NATIONAL", "RAW"),
 }
-DEFAULTS = {"readings": "valid_and_home", "hint_conflict": "all", "hint_fallback": "not_valid",
+DEFAULTS = {"keep": "valid_and_home", "hint_conflict": "all", "hint_fallback": "not_valid",
             "output_format": "E164"}
 # Keys of the earlier validate design, with what replaces them.
 OLD_KEYS = {
@@ -46,7 +46,8 @@ OLD_KEYS = {
     "try_regions": "list the regions in `regions: [US, ...]` (the first is the home region)",
     "possible_label": "labels are generated: valid_US_number, possible_US_number, ...",
     "on_invalid": "impossible numbers are always dropped and logged in the report",
-    "on_possible": "use `readings` (valid_and_home | all | valid_else_possible | valid)",
+    "on_possible": "use `keep` (valid_and_home | all | valid_else_possible | valid)",
+    "readings": "renamed to `keep` (same values: valid_and_home | all | valid_else_possible | valid)",
     "on_ambiguous": "every reading is returned; use `hint_conflict: nearest` for hints",
     "possible_min_score": "use settings.min_score",
     "region_from": "hint words are read in the text window and the context, like keywords",
@@ -81,7 +82,7 @@ def label_for(status: str, region: str | None) -> str:
 class PhoneSpec:
     regions: list[str]
     hints: dict[str, dict[str, float]] = field(default_factory=dict)
-    readings: str = "valid_and_home"
+    keep: str = "valid_and_home"
     hint_conflict: str = "all"
     hint_fallback: str = "not_valid"
     output_format: str = "E164"
@@ -251,7 +252,7 @@ class Reading:
     number_type: str = ""
     parsed_in: str | None = None  # the region it was parsed in (None: "+" number)
     source: str = "list"        # number | hint | list
-    returned: bool = True       # False: filtered out by readings / hint_conflict
+    returned: bool = True       # False: filtered out by keep / hint_conflict
     why: str = ""               # why not returned
     e164: str = ""              # always E.164 (raw text if local-only): the report's
                                 # `normalized` column, whatever output_format says
@@ -403,13 +404,13 @@ def _hinted(raw: str, spec: PhoneSpec, hinted: list[RegionHint]) -> list[Reading
 
 
 def _filter_list(found: list[Reading], spec: PhoneSpec) -> None:
-    """Apply `readings` to the list readings (in region order)."""
+    """Apply `keep` to the list readings (in region order)."""
     has_valid = any(r.status == "valid" for r in found)
     home = next((r for r in found if r.parsed_in == spec.regions[0]), None)
-    mode = spec.readings
+    mode = spec.keep
     if mode == "valid":
-        _hold(found, lambda r: r.status == "valid", "readings: valid")
+        _hold(found, lambda r: r.status == "valid", "keep: valid")
     elif mode == "valid_else_possible" and has_valid:
-        _hold(found, lambda r: r.status == "valid", "readings: valid_else_possible")
+        _hold(found, lambda r: r.status == "valid", "keep: valid_else_possible")
     elif mode == "valid_and_home":
-        _hold(found, lambda r: r.status == "valid" or r is home, "readings: valid_and_home")
+        _hold(found, lambda r: r.status == "valid" or r is home, "keep: valid_and_home")

@@ -47,7 +47,7 @@ string, and resolves overlapping matches.
    - `+` number (or `00` as a last resort);
    - the hinted regions (valid readings, else possible ones;
      `hint_conflict` all | nearest);
-   - the `regions` list, filtered by `readings`. After a hint, it runs per
+   - the `regions` list, filtered by `keep`. After a hint, it runs per
      `hint_fallback`: not_valid (default; no valid hinted reading),
      impossible (no hinted reading), always, never. Its readings are added
      (source `list`); each reading keeps its own source.
@@ -95,13 +95,15 @@ string, and resolves overlapping matches.
   - `with: phonenumbers` and `regions: [US, ...]` (required; the first is
     the home region);
   - `hints` ({REGION: {word: weight > 0}}, read like `keywords`);
-  - `readings` (valid_and_home | all | valid_else_possible | valid);
+  - `keep` (valid_and_home | all | valid_else_possible | valid): which
+    readings of the `regions` list come back;
   - `hint_conflict` (all | nearest);
   - `hint_fallback` (not_valid | impossible | always | never);
   - `output_format` (E164 | INTERNATIONAL | NATIONAL | RAW): the match `text`.
 
   The earlier keys (`default_region`, `try_regions`, `possible_label`,
-  `on_*`, `possible_min_score`, `region_from`, `regions` as a map) fail with
+  `on_*`, `possible_min_score`, `region_from`, `readings` (now `keep`),
+  `regions` as a map) fail with
   a migration message.
 - Never lose a hit silently: every validated regex hit ends up as matches or
   a `dropped` row with a reason (which includes the phonenumbers version).
@@ -138,7 +140,7 @@ string, and resolves overlapping matches.
   `miss` rows, the score breakdown, every `decided_by` value,
   `summarize_overlaps`, `summarize_misses` and `--summarize`, and the public
   API as the README shows it. Phone: `validate` load and migration errors,
-  each status, every `readings`, `hint_conflict` and `hint_fallback` mode, hints
+  each status, every `keep`, `hint_conflict` and `hint_fallback` mode, hints
   (including misfits), `+`/`00`/`011`, span refinement and back-to-back
   numbers, readings vs other patterns, coexist/misses via `family`, every `output_format`,
   report rows, `summarize_validation`.

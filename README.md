@@ -182,7 +182,7 @@ Every setting except `regions` has a default you can leave alone.
 | --- | --- | --- |
 | Which countries are my numbers from? | `regions` | required |
 | Are there words that say which country (`uk`, `london`)? | `hints` | none |
-| Do I want maybe-numbers, or only real ones? | `readings` | real ones, plus maybe-numbers for the home country |
+| Do I want maybe-numbers, or only real ones? | `keep` | real ones, plus maybe-numbers for the home country |
 | Should a country word replace my list? | `hint_fallback` | only if the hinted country gives a real number |
 | A number is real in two hinted countries: keep both? | `hint_conflict` | both |
 | How should `text` be written? | `output_format` | `+12125550123` (`INTERNATIONAL`, `NATIONAL`, `RAW` = as written) |
@@ -210,7 +210,7 @@ With `regions: [US, GB]`, context `"customer phone"`, text
 
 - **Without the context,** `account_number` wins 3.0 to 0.0. The context alone
   flips the answer.
-- **With `readings: all`,** both `valid_US_number` and `possible_GB_number`
+- **With `keep: all`,** both `valid_US_number` and `possible_GB_number`
   come back on the same span. Readings of one number never compete with each
   other.
 - **`acct` didn't count against the phone hit,** because the phone pattern

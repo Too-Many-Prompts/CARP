@@ -49,7 +49,7 @@ VALIDATION_FIELDS = (
 _CLUSTER_MIN = 3        # possible numbers sharing leading digits before the hint shows
 HINT_STALE = ("many possible numbers share these digits; phonenumbers metadata "
               "may be stale, upgrade it")
-HINT_MULTI = "numbers fit several regions; add hints, or set readings / hint_conflict"
+HINT_MULTI = "numbers fit several regions; add hints, or set keep / hint_conflict"
 HINT_IMPOSSIBLE = "many impossible; tighten the regex or add regions"
 
 

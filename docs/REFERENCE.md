@@ -191,7 +191,7 @@ zero or more readings, and each reading becomes a match.
    - **`not_valid`** → is any hinted reading valid? Yes: return the hinted
      readings only (**done**). No: go to step 5.
    - **`always`** → go to step 5. The hinted readings stay.
-5. **Parse in each region of `regions`.** Keep what `readings` allows, and add
+5. **Parse in each region of `regions`.** Return what `keep` allows, and add
    the readings you already have from the hints, if any.
    - **some readings** → return them, sources `hint` and `list`. **Done.**
    - **none** → go to step 6.
@@ -309,7 +309,7 @@ shape in GB, and the context points to a phone.
 | --- | --- |
 | Find | `account_number` and `phone_number` both hit `2125550123` (5-15). The phone library confirms the span, so nothing is trimmed. |
 | Score | `account_number`: text `acct` +3 (1 word away); context `phone` -3 (the context's last word, distance 1); total **0.0**. Phone hit: no phone words in the text; context `phone` +3; total **3.0**. |
-| Validate | No `+`, no hint words, so it is parsed in each region of `regions`. US: `+12125550123` **valid**. GB: `+442125550123` only **possible**. `readings: valid_and_home` returns the valid reading and the home region's possible one; the home region (US) is already valid, so GB is not returned. |
+| Validate | No `+`, no hint words, so it is parsed in each region of `regions`. US: `+12125550123` **valid**. GB: `+442125550123` only **possible**. `keep: valid_and_home` returns the valid reading and the home region's possible one; the home region (US) is already valid, so GB is not returned. |
 | `min_score` | 0.0 and 3.0 are both at or above 0. |
 | Overlap | `valid_US_number` and `account_number` share a span and are not a coexist pair. Score 3.00 > 0.00: the phone reading wins. |
 | Result | `valid_US_number`, `text` `+12125550123`, `start` 5, `end` 15, score 3.0. |
@@ -319,7 +319,7 @@ The report has three rows:
 | kind | outcome | a_label | a_text | normalized | decided_by | reason |
 | --- | --- | --- | --- | --- | --- | --- |
 | validation | kept | valid_US_number | 2125550123 | +12125550123 | list | valid in US |
-| validation | not_returned | possible_GB_number | 2125550123 | +442125550123 | list | possible in GB; readings: valid_and_home |
+| validation | not_returned | possible_GB_number | 2125550123 | +442125550123 | list | possible in GB; keep: valid_and_home |
 | overlap | a_wins_b_dropped | valid_US_number (b: account_number) | 2125550123 | | score | score 3.00 > 0.00 |
 
 The overlap row also has `b_text_score` 3.0 and `b_context_score` -3.0, which
@@ -329,7 +329,7 @@ What changes the outcome:
 
 - **No context:** `account_number` wins 3.0 to 0.0. Both validation rows are
   still written; the phone reading is the loser in the overlap row.
-- **`readings: all`:** `possible_GB_number` (`+442125550123`) and
+- **`keep: all`:** `possible_GB_number` (`+442125550123`) and
   `valid_US_number` both come back on the span, score 3.0 each. They do not
   compete with each other, and both beat `account_number`.
 - **A GB hint** (`hints: {GB: {london: 2}}`, text `Acct 2125550123 london
@@ -363,7 +363,7 @@ Questions the report answers:
 | Why did `A` beat `B`? | the `overlap` row: `a_*` is the winner, `b_*` the loser; `reason` shows the numbers |
 | Why is my match missing? | `b_` side of an `overlap` row; a `below_min_score` row; a `validation` row with `dropped`; or a `miss` row |
 | Why `possible_US_number` and not `valid_US_number`? | the `validation` row: `status`, `region`, and `reason` |
-| Why was a phone reading not returned? | a `validation` row with `not_returned`; `reason` names the `readings` or `hint_conflict` setting |
+| Why was a phone reading not returned? | a `validation` row with `not_returned`; `reason` names the `keep` or `hint_conflict` setting |
 | What do I tune first? | `extract.py --summarize` (see [Summaries](#summaries)) |
 
 ## How it works
@@ -535,7 +535,7 @@ library.
     hints:                      # optional; words that point to a region, weight > 0
       GB: {uk: 3, london: 2}
       IN: {india: 3}
-    readings: valid_and_home    # what the list returns: valid_and_home | all | valid_else_possible | valid
+    keep: valid_and_home        # what the list returns: valid_and_home | all | valid_else_possible | valid
     hint_conflict: all          # valid in several hinted regions: all | nearest
     hint_fallback: not_valid    # after a hint, also parse `regions`: not_valid | impossible | always | never
     output_format: E164         # the match text: E164 | INTERNATIONAL | NATIONAL | RAW
@@ -589,9 +589,9 @@ Readings that give the same number count as one. US and CA share +1, so
    - The report notes why the list ran, e.g. `hint FR did not fit` or
      `hint GB not valid; hint_fallback: not_valid parsed the list too`.
 3. **The list:** parse in every `regions` entry. Source `list`.
-   `readings` decides what is returned:
+   `keep` decides what is returned:
 
-   | `readings` | Returned |
+   | `keep` | Returned |
    | --- | --- |
    | `valid_and_home` (default) | every valid reading, plus the home (first) region's reading when it is only possible |
    | `all` | every valid and possible reading |
@@ -606,7 +606,7 @@ Readings that give the same number count as one. US and CA share +1, so
 Example: `555-123-4567` is possible in the US (555 is no real area code) and
 valid in GB. With `regions: [US, GB]`:
 
-| `readings` | Matches |
+| `keep` | Matches |
 | --- | --- |
 | `valid_and_home` | `possible_US_number`, `valid_GB_number` |
 | `all` | the same |
@@ -655,7 +655,7 @@ The refined numbers are then scored like any other candidate.
     `normalized`, whatever the format. The source and number type are in the
     validation rows (`decided_by`, `reason`).
 - **Choosing one answer:** if your code needs a single answer per number,
-  take the `valid_*` match, or set `readings: valid` /
+  take the `valid_*` match, or set `keep: valid` /
   `hint_conflict: nearest`.
 
 ### Limits
@@ -688,12 +688,12 @@ file is gitignored.
   `label` only for phone readings).
   - `kind` is `below_min_score`, `overlap`, `coexist`, `miss` or `validation`.
   - `validation` rows: one per reading of a phone hit (`a` = the reading):
-    - `outcome` is `kept`, or `not_returned` when `readings` / `hint_conflict`
+    - `outcome` is `kept`, or `not_returned` when `keep` / `hint_conflict`
       filtered it out;
     - an impossible hit gets a single `dropped` row;
     - `decided_by` is the reading's source (`number`, `hint`, `list`); one
       hit can mix `hint` and `list` readings (see `hint_fallback`);
-    - `reason` reads e.g. `possible in GB; readings: valid; phonenumbers 9.0.43`.
+    - `reason` reads e.g. `possible in GB; keep: valid; phonenumbers 9.0.43`.
   - In an `overlap` row, `a` is the winner and `b` the dropped candidate.
   - `decided_by` is machine-readable: for `overlap`, the criterion that decided
     (`score`, `length`, `priority`, or `start_label` when everything tied);
@@ -793,7 +793,7 @@ parity), `keywords` reaching both sources, `context_direction`, `stop_at`,
 keyword validation and old-format errors, `decided_by`, `miss` rows, the
 report CSV and its score breakdown, the summaries, the CLI, and the public API
 as shown in the README and this reference. Phone tests cover the `validate`
-load and migration errors, each status, every `readings`, `hint_conflict`
+load and migration errors, each status, every `keep`, `hint_conflict`
 and `hint_fallback` mode, hints (including a hint that does not fit), `+`, `00` and
 `011`, span refinement and back-to-back numbers, readings competing with
 other patterns, `coexist` and misses through `family`, every `output_format`, the report
