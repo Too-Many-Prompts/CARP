@@ -5,7 +5,6 @@ from __future__ import annotations
 import csv
 import re
 import sys
-import warnings
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -17,14 +16,13 @@ import yaml
 from extract import (
     REPORT_FIELDS,
     Config,
-    _context_penalty,
-    _context_words,
+    context_score,
+    context_words,
     extract,
     load_config,
-    log_context_miss,
     main,
     open_report,
-    select_patterns,
+    summarize_misses,
     summarize_overlaps,
     write_report_csv,
 )
@@ -36,16 +34,8 @@ REAL_CFG = load_config(CONFIG_PATH)
 
 @pytest.fixture(autouse=True)
 def _isolated_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """errorlog.csv is written to the working directory; keep it out of the repo."""
+    """The report CSV is written to the working directory; keep it out of the repo."""
     monkeypatch.chdir(tmp_path)
-
-
-def read_error_log() -> list[dict[str, str]]:
-    path = Path("errorlog.csv")
-    if not path.exists():
-        return []
-    with open(path, encoding="utf-8", newline="") as fh:
-        return list(csv.DictReader(fh))
 
 
 def matches_of(inp: Any, cfg: Config) -> list[Any]:
@@ -249,131 +239,150 @@ def test_invalid_regex_names_label(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="bad_label"):
         make_cfg(tmp_path, patterns)
 
-
 # ---------------------------------------------------------------- context
 CTX_TEXT = "Invoice INV-004521 dated 03/14/2026 on 2026-03-14"
-
-
-# The restrict / fall-back / no-match context scenarios live in the YAML
-# `tests` section (run by test_config_cases). These cover the decision log
-# and input forms.
-def test_context_decisions_are_logged() -> None:
-    _, no_hits = extract(("nothing relevant here", CTX_TEXT), REAL_CFG)
-    assert "no context hits" in no_hits[0]["reason"]
-    _, hit = extract(("dated", CTX_TEXT), REAL_CFG)
-    assert hit[0]["patterns"] == "date"
-    assert "date (dated)" in hit[0]["reason"]
+N_CTX = [{"label": "n", "priority": 1, "regex": r"\d+", "context": {"acct": 6}}]
 
 
 def test_context_none_or_empty_matches_plain() -> None:
-    plain = pairs(matches_of(CTX_TEXT, REAL_CFG))
-    assert pairs(matches_of({"text": CTX_TEXT, "context": None}, REAL_CFG)) == plain
-    assert pairs(matches_of({"text": CTX_TEXT}, REAL_CFG)) == plain
-    assert pairs(matches_of((None, CTX_TEXT), REAL_CFG)) == plain
-    assert pairs(matches_of(("   ", CTX_TEXT), REAL_CFG)) == plain
+    plain = [m.to_dict() for m in matches_of(CTX_TEXT, REAL_CFG)]
+    for inp in ({"text": CTX_TEXT, "context": None}, {"text": CTX_TEXT},
+                (None, CTX_TEXT), ("   ", CTX_TEXT), ("", CTX_TEXT)):
+        assert [m.to_dict() for m in matches_of(inp, REAL_CFG)] == plain
 
 
-def _misses(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [d for d in decisions if d["kind"] == "context_miss"]
+def test_every_pattern_runs_whatever_the_context() -> None:
+    text = "Acct 5551234567 call 555-123-4567"
+    for context in (None, "acct", "phone", "nothing relevant"):
+        assert "phone_number" in {m.label for m in matches_of((context, text), REAL_CFG)}
 
 
-def test_context_miss_is_returned_and_nothing_is_written() -> None:
-    inp = ("please call", "Invoice INV-004521,\nno phone here")
-    matches, decisions = extract(inp, REAL_CFG, source="doc1.txt")
-    assert matches == []
-    (miss,) = _misses(decisions)
-    assert miss["file"] == "doc1.txt"
-    assert miss["patterns"] == "phone_number"
-    assert "no matches in text" in miss["reason"]
-    assert not Path("errorlog.csv").exists()            # the library writes no files
-    assert not Path("extract_report.csv").exists()
+def test_context_score_decays_from_the_right(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, N_CTX)
+    assert matches_of(("acct", "12"), cfg)[0].score == pytest.approx(6.0)        # distance 1
+    assert matches_of(("acct a b", "12"), cfg)[0].score == pytest.approx(2.0)    # distance 3
+    assert matches_of(("acct a b acct", "12"), cfg)[0].score == pytest.approx(6.0)  # nearest only
+    no_decay = make_cfg(tmp_path, N_CTX, distance_decay=False)
+    assert matches_of(("acct a b", "12"), no_decay)[0].score == pytest.approx(6.0)
 
 
-def test_log_context_miss_writes_error_log_row() -> None:
-    context, text = "please call", "Invoice INV-004521,\nno phone here"
-    _, decisions = extract((context, text), REAL_CFG, source="doc1.txt")
-    log_context_miss("doc1.txt", context, text, _misses(decisions)[0])
-    (row,) = read_error_log()
-    assert list(row) == ["timestamp", "file", "context", "text", "context_patterns", "reason"]
-    assert row["file"] == "doc1.txt"
-    assert row["context"] == "please call"              # raw, un-normalized
-    assert row["text"] == "Invoice INV-004521,\nno phone here"
-    assert row["context_patterns"] == "phone_number"
-    assert "no matches in text" in row["reason"]
+def test_context_reads_every_word_without_a_window(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, N_CTX, context_window_words=1, distance_decay=False)
+    far = "acct " + "word " * 50
+    assert matches_of((far, "12"), cfg)[0].context_score == pytest.approx(6.0)
+    assert matches_of(f"{far} 12", cfg)[0].text_score == 0      # context key: not the text
 
 
-def test_context_miss_when_candidates_all_dropped(tmp_path: Path) -> None:
-    patterns = [
-        {"label": "n", "priority": 1, "regex": "\\d+",
-         "context": {"positive": ["num"]}, "nearby": {"bad": -1}},
-    ]
+def test_context_ignores_stop_at_and_direction(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, N_CTX, stop_at=".!?", context_direction="after",
+                   distance_decay=False)
+    assert matches_of(("acct. Done!", "12"), cfg)[0].score == pytest.approx(6.0)
+
+
+def test_context_phrase_last_word_sets_distance(tmp_path: Path) -> None:
+    patterns = [{"label": "n", "priority": 1, "regex": r"\d+", "context": {"amount due": 4}}]
+    cfg = make_cfg(tmp_path, patterns)
+    assert matches_of(("amount due", "12"), cfg)[0].score == pytest.approx(4.0)
+    assert matches_of(("amount due now", "12"), cfg)[0].score == pytest.approx(2.0)
+    assert matches_of(("amount now due", "12"), cfg)[0].score == 0               # broken
+
+
+def test_context_score_is_the_same_for_every_candidate(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, N_CTX + [{"label": "w", "priority": 2, "regex": "zz"}])
+    matches = matches_of(("acct", "1 zz 22 333"), cfg)
+    assert {(m.label, m.context_score) for m in matches} == {("n", 6.0), ("w", 0.0)}
+
+
+def test_keywords_count_in_text_and_context(tmp_path: Path) -> None:
+    patterns = [{"label": "n", "priority": 1, "regex": r"\d+", "keywords": {"tel": 3}}]
+    cfg = make_cfg(tmp_path, patterns)
+    (m,) = matches_of(("tel", "tel 12"), cfg)
+    assert (m.text_score, m.context_score, m.score) == (3.0, 3.0, 6.0)   # both add
+
+
+def test_nearby_reads_only_text_and_context_reads_only_context(tmp_path: Path) -> None:
+    patterns = [{"label": "n", "priority": 1, "regex": r"\d+",
+                 "nearby": {"tel": 3}, "context": {"acct": 2}}]
+    cfg = make_cfg(tmp_path, patterns)
+    (m,) = matches_of(("tel", "acct 12"), cfg)
+    assert (m.text_score, m.context_score) == (0, 0)
+    (m,) = matches_of(("acct", "tel 12"), cfg)
+    assert (m.text_score, m.context_score) == (3.0, 2.0)
+
+
+def test_negative_context_drops_below_min_score(tmp_path: Path) -> None:
+    patterns = [{"label": "n", "priority": 1, "regex": r"\d+", "context": {"memo": -1}}]
     cfg = make_cfg(tmp_path, patterns, min_score=0)
-    matches, decisions = extract(("num", "bad 12"), cfg)
+    assert len(matches_of("12", cfg)) == 1
+    matches, decisions = extract(("memo", "12"), cfg)
     assert matches == []
-    assert "dropped" in _misses(decisions)[0]["reason"]
+    (row,) = [d for d in decisions if d["kind"] == "below_min_score"]
+    assert (row["a_text_score"], row["a_context_score"], row["a_score"]) == (0.0, -1.0, -1.0)
 
 
-def test_no_context_miss_when_not_a_miss() -> None:
-    for inp in (
-        (None, "no matches at all"),                     # no context
-        ("nothing relevant here", "no matches at all"),  # context, no hits
-        ("tel", "call 555-123-4567"),                    # context hit, matched
-    ):
-        assert _misses(extract(inp, REAL_CFG)[1]) == []
-
-
-def test_log_context_miss_accumulates_within_a_run() -> None:
-    for i in range(2):
-        text = f"nothing {i}"
-        _, decisions = extract(("tel", text), REAL_CFG)
-        log_context_miss("", "tel", text, _misses(decisions)[0])
-    assert [r["text"] for r in read_error_log()] == ["nothing 0", "nothing 1"]
+def test_context_flips_an_overlap() -> None:
+    assert [m.label for m in matches_of("5551234567 call", REAL_CFG)] == ["phone_number"]
+    assert [m.label for m in matches_of(("account", "5551234567 call"), REAL_CFG)] == [
+        "account_number"]
 
 
 def test_context_match_ignores_case_and_punctuation() -> None:
-    result = matches_of(("ACCT:", "Acct 5551234567 call 555-123-4567"), REAL_CFG)
-    assert {m.label for m in result} == {"account_number"}
+    (m,) = matches_of(("ACCOUNT:", "5551234567 call"), REAL_CFG)
+    assert m.label == "account_number"
 
 
-def _sel(context: str) -> list[str]:
-    chosen, _ = select_patterns(context, REAL_CFG.patterns)
-    return [p.label for p in chosen]
+def test_context_whole_words_only(tmp_path: Path) -> None:
+    patterns = [{"label": "n", "priority": 1, "regex": r"\d+", "context": {"tel": 1}}]
+    assert matches_of(("hotel", "12"), make_cfg(tmp_path, patterns))[0].score == 0
 
 
-def test_select_patterns_whole_words_only() -> None:
-    # 'tel' inside 'hotel' is not a hit, so nothing is selected and all run.
-    chosen, decision = select_patterns("hotel", REAL_CFG.patterns)
-    assert decision["outcome"] == "all_patterns_used"
-    assert [p.label for p in chosen] == [p.label for p in REAL_CFG.patterns]
-
-
-def test_select_patterns_phrase_must_be_contiguous() -> None:
-    assert "amount" in _sel("amount due")
-    assert _sel("due total") != _sel("amount due")      # 'amount due' phrase absent
-    assert "invoice_number" not in _sel("due total")
-
-
-def test_select_patterns_penalize_and_nearby_words_do_not_select(tmp_path: Path) -> None:
-    patterns = [
-        {"label": "A", "priority": 1, "regex": "a", "context": {"positive": ["yes"]}},
-        {"label": "B", "priority": 2, "regex": "b", "context": {"penalize": {"no": -1}},
-         "nearby": {"maybe": 2}},
-    ]
-    cfg = make_cfg(tmp_path, patterns, overlap_tiebreak=["context_penalty"])
-    chosen, decision = select_patterns("no maybe", cfg.patterns)   # only B's penalize/nearby words
-    assert [p.label for p in chosen] == ["A", "B"] and decision["outcome"] == "all_patterns_used"
-    chosen, decision = select_patterns("yes no", cfg.patterns)
-    assert [p.label for p in chosen] == ["A"] and decision["outcome"] == "patterns_restricted"
-
-
-def test_select_patterns_never_runs_regex_on_context() -> None:
-    # A phone number in the context has no keyword, so nothing is selected.
-    assert _sel("555-123-4567") == [p.label for p in REAL_CFG.patterns]
+def test_regex_never_runs_on_context() -> None:
+    assert matches_of(("555-123-4567", "no numbers"), REAL_CFG) == []
 
 
 def test_bad_input_type() -> None:
     with pytest.raises(ValueError):
         extract(42, REAL_CFG)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------- miss rows
+def _misses(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [d for d in decisions if d["kind"] == "miss"]
+
+
+def test_miss_when_context_points_to_a_label_with_no_candidates() -> None:
+    matches, decisions = extract(("call me", "Invoice INV-004521"), REAL_CFG, source="d1")
+    assert [m.label for m in matches] == ["invoice_number"]
+    (miss,) = _misses(decisions)
+    assert (miss["file"], miss["outcome"], miss["a_label"]) == ("d1", "no_candidates", "phone_number")
+    assert miss["a_context_score"] == 1.0                      # call (2) at distance 2
+    assert miss["reason"] == "context scored phone_number +1.00 (call); no candidates in text"
+    assert (miss["a_text"], miss["a_score"], miss["b_label"], miss["decided_by"]) == ("", "", "", "")
+    assert not Path("extract_report.csv").exists()             # the library writes no files
+
+
+def test_miss_when_candidates_all_dropped(tmp_path: Path) -> None:
+    patterns = [{"label": "n", "priority": 1, "regex": r"\d+",
+                 "context": {"num": 1}, "nearby": {"bad": -3}}]
+    cfg = make_cfg(tmp_path, patterns)
+    matches, decisions = extract(("num", "bad 12 bad 34"), cfg)
+    assert matches == []
+    (miss,) = _misses(decisions)
+    assert miss["outcome"] == "candidates_dropped"
+    assert miss["reason"].endswith("; 2 candidate(s) dropped (min_score/overlap)")
+
+
+def test_no_miss_otherwise(tmp_path: Path) -> None:
+    for inp in (
+        (None, "no matches at all"),                     # no context
+        ("nothing relevant here", "no matches at all"),  # context, no hits
+        ("tel", "call 555-123-4567"),                    # context hit, matched
+        ("order", "no numbers"),                         # only phone scored, and < 0
+    ):
+        assert _misses(extract(inp, REAL_CFG)[1]) == []
+    neg = make_cfg(tmp_path, [{"label": "n", "priority": 1, "regex": r"\d+",
+                               "context": {"memo": -1}}])
+    assert _misses(extract(("memo", "no digits"), neg)[1]) == []
 
 
 # ---------------------------------------------------------------- words
@@ -407,7 +416,6 @@ def test_cli_text_prints_matches_and_writes_nothing(
     assert out[0]["text"] == "555-123-4567"
     assert set(out[0]) == {"label", "text", "start", "end", "score"}
     assert not Path("extract_report.csv").exists()
-    assert not Path("errorlog.csv").exists()
 
 
 def test_cli_reads_text_from_stdin(
@@ -419,7 +427,6 @@ def test_cli_reads_text_from_stdin(
     assert main(["--config", str(CONFIG_PATH), "--context", "phone"]) == 0
     assert json.loads(capsys.readouterr().out)[0]["label"] == "phone_number"
 
-
 def read_report() -> list[dict[str, str]]:
     with open("extract_report.csv", encoding="utf-8", newline="") as fh:
         return list(csv.DictReader(fh))
@@ -428,13 +435,12 @@ def read_report() -> list[dict[str, str]]:
 def test_decision_log_overlap_and_coexist(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, OVERLAP_PATTERNS)
     _, decisions = extract("abc12", cfg, source="f.txt")
-    rows = {r["kind"]: r for r in decisions}
-    overlap = rows["overlap"]
+    (overlap,) = decisions
+    assert overlap["kind"] == "overlap"
     assert overlap["file"] == "f.txt"
     assert overlap["outcome"] == "a_wins_b_dropped"
     assert overlap["a_label"] != overlap["b_label"] and overlap["b_label"]
     assert overlap["reason"]
-    assert rows["context"]["outcome"] == "all_patterns_used"
 
     co_cfg = make_cfg(tmp_path, OVERLAP_PATTERNS, coexist=[["A", "B"]])
     _, co_decisions = extract("abc12", co_cfg)
@@ -443,20 +449,27 @@ def test_decision_log_overlap_and_coexist(tmp_path: Path) -> None:
     assert {co["a_label"], co["b_label"]} == {"A", "B"}
 
 
-def test_decision_log_min_score_and_context_miss(tmp_path: Path) -> None:
-    patterns = [
-        {"label": "n", "priority": 1, "regex": "\\d+",
-         "context": {"positive": ["num"]}, "nearby": {"bad": -1}},
-    ]
+def test_decision_log_min_score(tmp_path: Path) -> None:
+    patterns = [{"label": "n", "priority": 1, "regex": "\\d+", "nearby": {"bad": -1}}]
     cfg = make_cfg(tmp_path, patterns, min_score=0)
-    _, decisions = extract(("num", "bad 12"), cfg)
-    rows = {r["kind"]: r for r in decisions}
-    assert rows["context"]["outcome"] == "patterns_restricted"
-    assert rows["context"]["patterns"] == "n"
-    dropped = rows["below_min_score"]
+    (dropped,) = extract("bad 12", cfg)[1]
+    assert dropped["kind"] == "below_min_score"
     assert (dropped["outcome"], dropped["a_label"], dropped["a_text"]) == ("dropped", "n", "12")
     assert dropped["b_label"] == ""
-    assert rows["context_miss"]["outcome"] == "context_miss"
+
+
+def test_report_has_score_breakdown(tmp_path: Path) -> None:
+    patterns = [
+        {"label": "A", "priority": 1, "regex": "abcd", "nearby": {"go": 1}, "context": {"ctx": 2}},
+        {"label": "B", "priority": 2, "regex": "abcd", "nearby": {"go": 0.5}},
+    ]
+    cfg = make_cfg(tmp_path, patterns)
+    write_report_csv(extract(("ctx", "go abcd"), cfg)[1])
+    (row,) = read_report()
+    assert (row["a_label"], row["a_score"], row["a_text_score"], row["a_context_score"]) == (
+        "A", "3.0", "1.0", "2.0")
+    assert (row["b_label"], row["b_score"], row["b_text_score"], row["b_context_score"]) == (
+        "B", "0.5", "0.5", "0.0")
 
 
 def test_write_report_csv_header_once_and_appends(tmp_path: Path) -> None:
@@ -476,7 +489,7 @@ def test_open_report_streams_many_calls_with_one_header(tmp_path: Path) -> None:
             write(extract("abc12", cfg, source=f"row-{i}")[1])
     text = Path("extract_report.csv").read_text(encoding="utf-8")
     assert text.count(",".join(REPORT_FIELDS)) == 1
-    assert [r["file"] for r in read_report() if r["kind"] == "context"] == [
+    assert [r["file"] for r in read_report() if r["kind"] == "overlap"] == [
         "row-0", "row-1", "row-2",
     ]
     with open_report() as write:                       # reopening appends, no 2nd header
@@ -500,20 +513,12 @@ def test_cli_report_flag_writes_and_overwrites_report() -> None:
     assert len(read_report()) == len(rows)
 
 
-def test_cli_error_log_flag_overwrites_each_run() -> None:
-    args = ["--config", str(CONFIG_PATH), "--context", "tel", "--error-log"]
 
-    assert main(args + ["--text", "Invoice INV-004521"]) == 0
-    rows = read_error_log()
-    assert len(rows) == 1 and rows[0]["text"] == "Invoice INV-004521"
-    assert rows[0]["context"] == "tel"                     # raw context kept
-
-    assert main(args + ["--text", "call 555-123-4567"]) == 0   # clean run wipes old rows
-    assert read_error_log() == []
-    assert Path("errorlog.csv").read_text(encoding="utf-8").startswith("timestamp,")
-
-
-
+def test_cli_error_log_flag_is_gone(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["--config", str(CONFIG_PATH), "--text", "x", "--error-log"])
+    assert exc.value.code == 2
+    assert not Path("errorlog.csv").exists()
 
 
 # ---------------------------------------------------------------- keyword validation
@@ -521,122 +526,121 @@ def _one(**keys: Any) -> list[dict[str, Any]]:
     return [{"label": "p", "priority": 1, "regex": "x", **keys}]
 
 
+KEY_NAMES = ["keywords", "nearby", "context"]
+
+
 @pytest.mark.parametrize("keyword", ["w2", "1099", "café", "$"])
-@pytest.mark.parametrize(
-    "where, build",
-    [
-        ("context.positive", lambda k: {"context": {"positive": [k]}}),
-        ("context.penalize", lambda k: {"context": {"penalize": {k: -1}}}),
-        ("nearby", lambda k: {"nearby": {k: 1}}),
-    ],
-)
+@pytest.mark.parametrize("where", KEY_NAMES)
 def test_keyword_that_can_never_match_is_rejected(
-    tmp_path: Path, keyword: str, where: str, build: Any
+    tmp_path: Path, keyword: str, where: str
 ) -> None:
     with pytest.raises(ValueError, match=rf"pattern 'p': {where} keyword .*ASCII letters"):
-        make_cfg(tmp_path, _one(**build(keyword)), overlap_tiebreak=["context_penalty"])
+        make_cfg(tmp_path, _one(**{where: {keyword: 1}}))
 
 
-@pytest.mark.parametrize(
-    "keys, where",
-    [
-        ({"context": {"positive": ["invoice", "Invoice"]}}, "context.positive"),
-        ({"context": {"penalize": {"bad": -1, "BAD": -2}}}, "context.penalize"),
-        ({"nearby": {"tel": 1, "Tel": 2}}, "nearby"),
-    ],
-)
-def test_duplicate_keyword_within_a_key_is_rejected(
-    tmp_path: Path, keys: dict[str, Any], where: str
-) -> None:
+@pytest.mark.parametrize("where", KEY_NAMES)
+def test_duplicate_keyword_within_a_key_is_rejected(tmp_path: Path, where: str) -> None:
     with pytest.raises(ValueError, match=rf"pattern 'p': {where} keyword .* more than once"):
-        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
-
-
-def test_keyword_in_positive_and_penalize_is_rejected(tmp_path: Path) -> None:
-    keys = {"context": {"positive": ["invoice"], "penalize": {"Invoice": -3}}}
-    with pytest.raises(ValueError, match="pattern 'p': keyword 'invoice' is in both"):
-        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+        make_cfg(tmp_path, _one(**{where: {"tel": 1, "Tel": 2}}))
 
 
 def test_keyword_may_be_in_context_and_nearby(tmp_path: Path) -> None:
-    keys = {"context": {"positive": ["tel"], "penalize": {"fax": -1}},
-            "nearby": {"tel": 2, "fax": -1}}
-    cfg = make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
-    assert cfg.patterns[0].positive == ["tel"] and cfg.patterns[0].nearby == {"tel": 2, "fax": -1}
+    p = make_cfg(tmp_path, _one(context={"tel": 1, "fax": -1}, nearby={"tel": 2})).patterns[0]
+    assert (p.context, p.nearby) == ({"tel": 1.0, "fax": -1.0}, {"tel": 2.0})
 
 
-def test_positive_penalize_weight_is_rejected(tmp_path: Path) -> None:
-    keys = {"context": {"penalize": {"word": 3}}}
-    with pytest.raises(ValueError, match="context.penalize keyword 'word' has weight 3"):
-        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+@pytest.mark.parametrize("where", KEY_NAMES)
+@pytest.mark.parametrize("weight", [-2, 2.5])
+def test_weights_may_have_either_sign(tmp_path: Path, where: str, weight: float) -> None:
+    p = make_cfg(tmp_path, _one(**{where: {"word": weight}})).patterns[0]
+    assert {"word": float(weight)} in (p.nearby, p.context)
 
 
-@pytest.mark.parametrize("weight", [-2, 0, 2.5])
-def test_nearby_weights_may_have_any_sign(tmp_path: Path, weight: float) -> None:
-    cfg = make_cfg(tmp_path, _one(nearby={"word": weight}))
-    assert cfg.patterns[0].nearby == {"word": float(weight)}
+@pytest.mark.parametrize("where", KEY_NAMES)
+def test_weight_zero_is_rejected(tmp_path: Path, where: str) -> None:
+    with pytest.raises(ValueError) as exc:
+        make_cfg(tmp_path, _one(**{where: {"tel": 0}}))
+    assert str(exc.value) == (
+        f"pattern 'p': {where} keyword 'tel' has weight 0; give it a sign or remove it"
+    )
 
 
+@pytest.mark.parametrize("where", KEY_NAMES)
 @pytest.mark.parametrize(
-    "keys, message",
+    "value, message",
     [
-        ({"nearby": {"word": "high"}}, "nearby keyword 'word' needs a numeric weight"),
-        ({"nearby": ["word"]}, "nearby must be a map"),
-        ({"context": {"penalize": ["word"]}}, "context.penalize must be a map"),
-        ({"context": {"positive": "word"}}, "context.positive` must be a list"),
-        ({"context": {"positive": [True]}}, "context.positive keyword True must be a string"),
+        ({"word": "high"}, "keyword 'word' needs a numeric weight"),
+        ({"word": True}, "keyword 'word' needs a numeric weight"),
+        (["word"], "must be a map of word: weight"),
     ],
 )
 def test_malformed_keyword_keys_are_rejected(
-    tmp_path: Path, keys: dict[str, Any], message: str
+    tmp_path: Path, where: str, value: Any, message: str
 ) -> None:
-    with pytest.raises(ValueError, match=re.escape(message)):
-        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+    with pytest.raises(ValueError, match=re.escape(f"pattern 'p': {where} {message}")):
+        make_cfg(tmp_path, _one(**{where: value}))
 
 
 # Old-format configs fail with a message that says what to change.
-def test_old_positive_map_is_rejected(tmp_path: Path) -> None:
+OLD_CONTEXT_MSG = (
+    "Patterns no longer select or penalize; `context` is now a map of word: signed "
+    "weight added to the score when the word is in the context string "
+    "(e.g. context: {acct: 3, phone: -2}). Use `keywords` for words that "
+    "should count in both the text and the context."
+)
+
+
+@pytest.mark.parametrize(
+    "context, key",
+    [
+        ({"positive": ["phone"]}, "positive"),
+        ({"positive": {"phone": 3}}, "positive"),
+        ({"penalize": {"acct": -3}}, "penalize"),
+        ({"negative": {"acct": -3}}, "negative"),
+        ({"positive": None, "penalize": None}, "positive"),
+    ],
+)
+def test_old_context_shape_is_rejected(tmp_path: Path, context: Any, key: str) -> None:
     with pytest.raises(ValueError) as exc:
-        make_cfg(tmp_path, _one(context={"positive": {"phone": 3}}))
+        make_cfg(tmp_path, _one(context=context))
+    assert str(exc.value) == f"pattern 'p': `context.{key}` is the old format. {OLD_CONTEXT_MSG}"
+
+
+def test_old_key_names_are_fine_as_new_keywords(tmp_path: Path) -> None:
+    p = _pat(make_cfg(tmp_path, _one(context={"negative": -2, "positive": 1, "penalize": -1})))
+    assert p.context == {"negative": -2.0, "positive": 1.0, "penalize": -1.0}
+
+
+@pytest.mark.parametrize("name", ["context_penalty", "context_negative"])
+def test_old_tiebreak_names_are_rejected(tmp_path: Path, name: str) -> None:
+    with pytest.raises(ValueError) as exc:
+        make_cfg(tmp_path, _one(), overlap_tiebreak=["score", name])
     assert str(exc.value) == (
-        "pattern 'p': `context.positive` is now a list of words; "
-        "move weights for text scoring to `nearby`."
+        f"settings.overlap_tiebreak: `{name}` was removed; the context now adds to "
+        "`score` (pattern `context` / `keywords` weights). Remove it."
     )
 
 
-def test_old_negative_key_is_rejected(tmp_path: Path) -> None:
-    with pytest.raises(ValueError) as exc:
-        make_cfg(tmp_path, _one(context={"negative": {"acct": -3}}))
-    assert str(exc.value) == (
-        "pattern 'p': `context.negative` was renamed to `context.penalize`; "
-        "it no longer affects the text score (use `nearby`)."
-    )
-
-
-def test_old_context_negative_tiebreak_is_rejected(tmp_path: Path) -> None:
-    with pytest.raises(ValueError) as exc:
-        make_cfg(tmp_path, _one(), overlap_tiebreak=["score", "context_negative"])
-    assert str(exc.value) == "`context_negative` was renamed to `context_penalty`."
+def test_old_config_file_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "old.yaml"
+    raw = CONFIG_PATH.read_text(encoding="utf-8").replace(
+        "keywords: {phone: 3, tel: 3, call: 2, mobile: 2, fax: 1, invoice: -2, account: -2, order: -1}",
+        "context:\n      positive: [phone]\n      penalize: {acct: -3}")
+    assert raw != CONFIG_PATH.read_text(encoding="utf-8")
+    path.write_text(raw, encoding="utf-8")
+    with pytest.raises(ValueError, match=r"pattern 'phone_number': `context.positive` is the old format"):
+        load_config(path)
 
 
 def test_hyphenated_keyword_matches_like_context_words(tmp_path: Path) -> None:
     # words.py splits on hyphens, so "e-mail" must be the two words e + mail.
-    patterns = [{"label": "p", "priority": 1, "regex": r"\d+",
-                 "context": {"positive": ["e-mail"]}, "nearby": {"e-mail": 2}}]
+    patterns = [{"label": "p", "priority": 1, "regex": r"\d+", "keywords": {"e-mail": 2}}]
     cfg = make_cfg(tmp_path, patterns)
     assert matches_of("e-mail 42", cfg)[0].score == 2.0
-    assert _sel_in(cfg, "send e-mail") == ["p"]
-
-
-def _sel_in(cfg: Config, context: str) -> list[str]:
-    chosen, decision = select_patterns(context, cfg.patterns)
-    return [p.label for p in chosen] if decision["outcome"] == "patterns_restricted" else []
+    assert matches_of(("send e-mail", "42"), cfg)[0].score == 2.0
 
 
 # ---------------------------------------------------------------- CLI failure paths
-
-
-
 def test_cli_bad_config_is_a_clean_error(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -687,80 +691,9 @@ def test_cli_without_text_on_a_terminal_is_a_usage_error(
     assert "no text" in capsys.readouterr().err
 
 
-# ------------------------------------------------- context_penalty tie-break
-# Two patterns match the same span "abcd"; both have a positive hit in the
-# context. B has the higher priority number, so priority alone would pick A.
-CTX_PEN_PATTERNS = [
-    {"label": "A", "priority": 1, "regex": "abcd",
-     "context": {"positive": ["alpha"], "penalize": {"bad": -2, "very bad": -3}}},
-    {"label": "B", "priority": 2, "regex": "abcd",
-     "context": {"positive": ["beta"], "penalize": {}}},
-]
-CTX_PEN_ORDER = ["score", "context_penalty", "length", "priority"]
 
-
-def test_context_penalty_applies_when_context_selected_patterns(tmp_path: Path) -> None:
-    cfg = make_cfg(tmp_path, CTX_PEN_PATTERNS, overlap_tiebreak=CTX_PEN_ORDER)
-    matches, decisions = extract({"text": "abcd", "context": "alpha beta bad"}, cfg)
-    assert pairs(matches) == Counter({("B", "abcd"): 1})
-    overlap = [d for d in decisions if d["kind"] == "overlap"][0]
-    assert "context penalty 0 > -2" in overlap["reason"]
-
-
-def test_context_penalty_phrase(tmp_path: Path) -> None:
-    cfg = make_cfg(tmp_path, CTX_PEN_PATTERNS, overlap_tiebreak=CTX_PEN_ORDER)
-    matches, decisions = extract({"text": "abcd", "context": "alpha beta very bad"}, cfg)
-    assert pairs(matches) == Counter({("B", "abcd"): 1})
-    # "bad" (-2) and "very bad" (-3) both occur: sum is -5
-    assert "-5" in [d for d in decisions if d["kind"] == "overlap"][0]["reason"]
-
-
-def test_context_penalty_is_opt_in(tmp_path: Path) -> None:
-    with pytest.warns(UserWarning, match="never used"):
-        cfg = make_cfg(tmp_path, CTX_PEN_PATTERNS)  # default order, no context_penalty
-    matches, _ = extract({"text": "abcd", "context": "alpha beta bad"}, cfg)
-    assert pairs(matches) == Counter({("A", "abcd"): 1})  # priority decides
-
-
-def test_context_penalty_ties_without_context(tmp_path: Path) -> None:
-    cfg = make_cfg(tmp_path, CTX_PEN_PATTERNS, overlap_tiebreak=CTX_PEN_ORDER)
-    assert pairs(matches_of("abcd", cfg)) == Counter({("A", "abcd"): 1})
-
-
-def test_context_penalty_ties_when_context_selects_nothing(tmp_path: Path) -> None:
-    """Context with no positive hits runs all patterns: penalties must NOT apply."""
-    cfg = make_cfg(tmp_path, CTX_PEN_PATTERNS, overlap_tiebreak=CTX_PEN_ORDER)
-    matches, _ = extract({"text": "abcd", "context": "bad"}, cfg)
-    assert pairs(matches) == Counter({("A", "abcd"): 1})  # falls through to priority
-
-
-def test_penalize_never_lowers_score_or_selects(tmp_path: Path) -> None:
-    patterns = [{"label": "n", "priority": 1, "regex": r"\d+",
-                 "context": {"positive": ["num"], "penalize": {"bad": -5}}}]
-    cfg = make_cfg(tmp_path, patterns, overlap_tiebreak=CTX_PEN_ORDER)
-    for inp in ("bad 12", ("bad", "bad 12"), ("num bad", "bad 12")):
-        (m,) = matches_of(inp, cfg)
-        assert m.score == 0
-    assert _sel_in(cfg, "bad") == []
-
-
-def test_nearby_never_reads_context_and_positive_never_reads_text(tmp_path: Path) -> None:
-    patterns = [
-        {"label": "n", "priority": 1, "regex": r"\d+",
-         "context": {"positive": ["num"]}, "nearby": {"tel": 3}},
-        {"label": "w", "priority": 2, "regex": "zz", "context": {"positive": ["word"]}},
-    ]
-    cfg = make_cfg(tmp_path, patterns)
-    (m,) = matches_of(("num tel", "12"), cfg)          # tel only in the context
-    assert m.score == 0
-    _, decisions = extract(("tel", "num 12 zz"), cfg)  # num only in the text
-    assert decisions[0]["outcome"] == "all_patterns_used"
-    _, decisions = extract(("word", "num 12 zz"), cfg)
-    assert decisions[0]["patterns"] == "w"
-
-
-# Parity: `nearby` (no decay, window covering every word) and context_penalty
-# score the same keywords with the same rules.
+# Parity: the text score (no decay, window covering every word) and the
+# context score use the same matcher, so they score the same keywords alike.
 PARITY_CASES = [
     # (weights, words around the match / context string, expected sum)
     ({"bad": -2}, "bad", -2),
@@ -772,22 +705,34 @@ PARITY_CASES = [
     ({"bad": -2}, "bad Bad BAD", -2),                           # repeats count once
     ({"tel": -1}, "hotel", 0),                                  # whole words only
     ({"acct": -3, "call": -2}, "Acct: please CALL", -5),
+    ({"acct": 3, "call": 2}, "Acct: please CALL", 5),
 ]
 
 
 @pytest.mark.parametrize("weights, words, expected", PARITY_CASES)
-def test_nearby_and_context_penalty_parity(
+def test_text_and_context_score_parity(
     tmp_path: Path, weights: dict[str, float], words: str, expected: float
 ) -> None:
     patterns = [{"label": "n", "priority": 1, "regex": r"\d+",
-                 "context": {"penalize": weights}, "nearby": weights}]
+                 "context": weights, "nearby": weights}]
     cfg = make_cfg(tmp_path, patterns, distance_decay=False, min_score=-100,
-                   context_window_words=50, overlap_tiebreak=CTX_PEN_ORDER)
+                   context_window_words=50)
     pattern = cfg.patterns[0]
-    nearby_before = matches_of(f"{words} 12", cfg)[0].score
-    nearby_after = matches_of(f"12 {words}", cfg)[0].score
-    penalty, _ = _context_penalty(_context_words(words), pattern)
-    assert nearby_before == nearby_after == penalty == pytest.approx(expected)
+    text_before = matches_of(f"{words} 12", cfg)[0].text_score
+    text_after = matches_of(f"12 {words}", cfg)[0].text_score
+    ctx, _ = context_score(context_words(words), pattern, cfg.settings)
+    via_extract = matches_of((words, "12"), cfg)[0].context_score
+    assert text_before == text_after == ctx == via_extract == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("words", ["acct", "a acct", "a b c acct", "acct a b"])
+def test_context_decay_matches_text_before_window(tmp_path: Path, words: str) -> None:
+    """The context reads like an unbounded window right before the match."""
+    patterns = [{"label": "n", "priority": 1, "regex": r"\d+",
+                 "context": {"acct": 6}, "nearby": {"acct": 6}}]
+    cfg = make_cfg(tmp_path, patterns, context_window_words=50, context_direction="before")
+    assert matches_of((words, "12"), cfg)[0].context_score == pytest.approx(
+        matches_of(f"{words} 12", cfg)[0].text_score)
 
 
 @pytest.mark.parametrize("empty", [[], None])
@@ -809,13 +754,18 @@ def test_empty_tiebreak_uses_start_then_label(tmp_path: Path, empty: Any) -> Non
 
 def test_unknown_tiebreak_name_still_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unknown criterion 'nope'"):
-        make_cfg(tmp_path, CTX_PEN_PATTERNS, overlap_tiebreak=["nope"])
+        make_cfg(tmp_path, OVERLAP_PATTERNS, overlap_tiebreak=["nope"])
 
 
-# ------------------------------------------------- decided_by / penalty_skipped
-def test_report_fields_end_with_decided_by_and_penalty_skipped() -> None:
-    assert REPORT_FIELDS[-2:] == ("decided_by", "penalty_skipped")
-    assert REPORT_FIELDS[:5] == ("file", "kind", "outcome", "reason", "patterns")
+
+# ------------------------------------------------- decided_by
+def test_report_fields() -> None:
+    assert REPORT_FIELDS[-1] == "decided_by"
+    assert REPORT_FIELDS[:4] == ("file", "kind", "outcome", "reason")
+    for side in "ab":
+        assert REPORT_FIELDS.index(f"{side}_text_score") == REPORT_FIELDS.index(f"{side}_score") + 1
+        assert f"{side}_context_score" in REPORT_FIELDS
+    assert "penalty_skipped" not in REPORT_FIELDS and "patterns" not in REPORT_FIELDS
 
 
 def _overlap(decisions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -829,7 +779,9 @@ def _overlap(decisions: list[dict[str, Any]]) -> dict[str, Any]:
         ([{"label": "A", "priority": 1, "regex": "abcd", "nearby": {"go": 1}},
           {"label": "B", "priority": 2, "regex": "abcd"}],
          ["score", "length", "priority"], "go abcd", "score"),
-        (CTX_PEN_PATTERNS, CTX_PEN_ORDER, ("alpha beta bad", "abcd"), "context_penalty"),
+        ([{"label": "A", "priority": 2, "regex": "abcd", "context": {"go": 1}},
+          {"label": "B", "priority": 1, "regex": "abcd"}],
+         ["score", "length", "priority"], ("go", "abcd"), "score"),
         ([{"label": "short", "priority": 1, "regex": "ab"},
           {"label": "long", "priority": 9, "regex": "abcd"}],
          ["score", "length", "priority"], "abcd", "length"),
@@ -845,140 +797,48 @@ def test_overlap_decided_by(
     tmp_path: Path, patterns: Any, order: list[str], inp: Any, decided_by: str
 ) -> None:
     cfg = make_cfg(tmp_path, patterns, overlap_tiebreak=order)
-    assert _overlap(extract(inp, cfg)[1])["decided_by"] == decided_by
+    row = _overlap(extract(inp, cfg)[1])
+    assert row["decided_by"] == decided_by
+    if decided_by == "score":
+        assert row["a_label"] == "A"
 
 
 def test_other_decided_by_values(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, OVERLAP_PATTERNS, coexist=[["A", "B"]])
     rows = {d["kind"]: d for d in extract("abc12", cfg)[1]}
     assert rows["coexist"]["decided_by"] == "coexist"
-    assert rows["context"]["decided_by"] == ""
     patterns = [{"label": "n", "priority": 1, "regex": r"\d+",
-                 "context": {"positive": ["num"]}, "nearby": {"bad": -1}}]
+                 "context": {"num": 1}, "nearby": {"bad": -2}}]
     rows = {d["kind"]: d for d in extract(("num", "bad 12"), make_cfg(tmp_path, patterns))[1]}
     assert rows["below_min_score"]["decided_by"] == "min_score"
-    assert rows["context_miss"]["decided_by"] == ""
-    assert all(d["penalty_skipped"] is False for d in rows.values())
+    assert rows["miss"]["decided_by"] == ""
+    assert set(rows) == {"below_min_score", "miss"}
 
 
 def test_decided_by_written_to_csv(tmp_path: Path) -> None:
     cfg = make_cfg(tmp_path, OVERLAP_PATTERNS)
     write_report_csv(extract("abc12", cfg)[1])
     rows = read_report()
-    assert list(rows[0])[-2:] == ["decided_by", "penalty_skipped"]
+    assert list(rows[0])[-1] == "decided_by"
     assert [r["decided_by"] for r in rows if r["kind"] == "overlap"] == ["length"]
 
 
-# ------------------------------------------------- load warning
-PENALIZE_ONLY = [
-    {"label": "phone_number", "priority": 1, "regex": "a", "context": {"penalize": {"acct": -1}}},
-    {"label": "account_number", "priority": 2, "regex": "b", "context": {"penalize": {"tel": -1}}},
-    {"label": "plain", "priority": 3, "regex": "c"},
-]
-
-
-def test_load_warning_when_penalize_is_unused(tmp_path: Path) -> None:
-    with pytest.warns(UserWarning) as record:
-        make_cfg(tmp_path, PENALIZE_ONLY, overlap_tiebreak=["score", "length"])
-    assert len(record) == 1
-    assert str(record[0].message) == (
-        "context.penalize is set for phone_number, account_number but "
-        "`context_penalty` is not in settings.overlap_tiebreak, so it is never used."
-    )
-
-
-@pytest.mark.parametrize(
-    "patterns, order",
-    [(PENALIZE_ONLY, ["context_penalty"]), (PENALIZE_ONLY[2:], ["score"])],
-)
-def test_no_load_warning_otherwise(tmp_path: Path, patterns: Any, order: list[str]) -> None:
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        make_cfg(tmp_path, patterns, overlap_tiebreak=order)
-
-
 def test_real_config_loads_without_warning() -> None:
+    import warnings
+
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         load_config(CONFIG_PATH)
 
 
-def test_cli_shows_load_warning_on_stderr(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    import json
-
-    path = tmp_path / "warn.yaml"
-    raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    raw["settings"]["overlap_tiebreak"] = ["score", "length", "priority"]
-    raw["patterns"][0]["context"] = {"penalize": {"memo": -1}}   # explicit penalize warns
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    assert main(["--config", str(path), "--text", "call 555-123-4567"]) == 0
-    captured = capsys.readouterr()
-    assert captured.err.startswith("warning: context.penalize is set for invoice_number but ")
-    assert json.loads(captured.out)[0]["label"] == "phone_number"
-
-
-# ------------------------------------------------- skipped context_penalty note
-SKIP_NOTE = "; context_penalty skipped: context selected no patterns"
-
-
-@pytest.mark.parametrize(
-    "order, context, skipped",
-    [
-        (CTX_PEN_ORDER, "bad", True),                            # all three hold
-        (CTX_PEN_ORDER, "very bad", True),                       # phrase hit
-        (["score", "length", "priority"], "bad", False),         # criterion not listed
-        (CTX_PEN_ORDER, "alpha beta bad", False),                # gate on: it applied
-        (CTX_PEN_ORDER, None, False),                            # no context at all
-        (CTX_PEN_ORDER, "nothing relevant", False),              # gate off, no penalize words
-    ],
-)
-def test_penalty_skipped_note(
-    tmp_path: Path, order: list[str], context: str | None, skipped: bool
-) -> None:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")   # the "not in overlap_tiebreak" case warns
-        cfg = make_cfg(tmp_path, CTX_PEN_PATTERNS, overlap_tiebreak=order)
-    row = _overlap(extract({"text": "abcd", "context": context}, cfg)[1])
-    assert row["reason"].endswith(SKIP_NOTE) is skipped
-    assert row["penalty_skipped"] is skipped
-    assert SKIP_NOTE[2:] not in row["reason"] or skipped
-
-
-def test_penalty_skipped_note_for_either_candidate(tmp_path: Path) -> None:
-    patterns = [
-        {"label": "A", "priority": 1, "regex": "abcd", "context": {"positive": ["alpha"]}},
-        {"label": "B", "priority": 2, "regex": "abcd", "context": {"penalize": {"bad": -1}}},
-    ]
-    cfg = make_cfg(tmp_path, patterns, overlap_tiebreak=CTX_PEN_ORDER)
-    row = _overlap(extract(("bad", "abcd"), cfg)[1])
-    assert (row["a_label"], row["penalty_skipped"]) == ("A", True)   # B (loser) has the hit
-    assert row["decided_by"] == "priority"
-    assert row["reason"] == "score tied; context_penalty tied; length tied; " \
-        "priority 1 < 2 (lower number wins)" + SKIP_NOTE
-
-
-def test_penalty_skipped_note_changes_no_result(tmp_path: Path) -> None:
-    with_note = make_cfg(tmp_path, CTX_PEN_PATTERNS, overlap_tiebreak=CTX_PEN_ORDER)
-    texts = ["abcd", "abcd abcd", "x abcd y"]
-    for text in texts:
-        m1, d1 = extract(("bad", text), with_note)
-        m2, d2 = extract(("unrelated", text), with_note)   # same gate, no note
-        assert [c.to_dict() for c in m1] == [c.to_dict() for c in m2]
-        strip = lambda ds: [(d["kind"], d["a_label"], d["b_label"], d["decided_by"],
-                             d["reason"].replace(SKIP_NOTE, "")) for d in ds[1:]]
-        assert strip(d1) == strip(d2)
-        assert any(d["penalty_skipped"] for d in d1) and not any(d["penalty_skipped"] for d in d2)
-
-
 # ------------------------------------------------- summarize_overlaps
-def _row(a: str, b: str, by: str, file: str = "f", skipped: bool = False,
+def _row(a: str, b: str, by: str, file: str = "f",
          a_span: tuple[int, int] = (0, 4), b_span: tuple[int, int] = (0, 4),
-         a_text: str = "x", b_text: str = "y", kind: str = "overlap") -> dict[str, Any]:
+         a_text: str = "x", b_text: str = "y", kind: str = "overlap",
+         outcome: str = "") -> dict[str, Any]:
     row = dict.fromkeys(REPORT_FIELDS, "")
     row.update(file=file, kind=kind, a_label=a, b_label=b, decided_by=by,
-               penalty_skipped=skipped, a_start=a_span[0], a_end=a_span[1],
+               a_start=a_span[0], a_end=a_span[1], outcome=outcome,
                b_start=b_span[0], b_end=b_span[1], a_text=a_text, b_text=b_text)
     return row
 
@@ -996,27 +856,28 @@ def _by_pair(path: str = "extract_report.csv") -> dict[str, dict[str, Any]]:
 
 
 SUMMARY_KEYS = [
-    "pair", "overlaps", "by_score", "by_context_penalty", "by_length", "by_priority",
+    "pair", "overlaps", "by_score", "by_length", "by_priority",
     "by_start_label", "not_by_score", "not_by_score_pct", "no_evidence",
-    "penalty_skipped", "wins", "examples", "hint",
+    "wins", "examples", "hint",
 ]
 
 
 def test_summary_counts_and_wins() -> None:
     _report([
         _row("phone", "acct", "score"), _row("phone", "acct", "score"),
-        _row("acct", "phone", "length"), _row("phone", "acct", "context_penalty"),
-        _row("phone", "acct", "priority", skipped=True), _row("acct", "phone", "start_label"),
+        _row("acct", "phone", "length"), _row("phone", "acct", "length"),
+        _row("phone", "acct", "priority"), _row("acct", "phone", "start_label"),
         _row("phone", "acct", "coexist", kind="coexist"),       # not an overlap row
         _row("n", "", "min_score", kind="below_min_score"),
+        _row("n", "", "", kind="miss", outcome="no_candidates"),
     ])
     (row,) = summarize_overlaps()
     assert list(row) == SUMMARY_KEYS
     assert row["pair"] == "acct/phone"                            # sorted, joined by /
-    assert (row["overlaps"], row["by_score"], row["by_context_penalty"], row["by_length"],
-            row["by_priority"], row["by_start_label"]) == (6, 2, 1, 1, 1, 1)
+    assert (row["overlaps"], row["by_score"], row["by_length"],
+            row["by_priority"], row["by_start_label"]) == (6, 2, 2, 1, 1)
     assert (row["not_by_score"], row["not_by_score_pct"]) == (4, 66.7)
-    assert (row["no_evidence"], row["penalty_skipped"]) == (2, 1)
+    assert row["no_evidence"] == 2
     assert row["wins"] == "phone 4; acct 2"
 
 
@@ -1069,8 +930,7 @@ def test_summary_examples_empty_when_all_by_score() -> None:
     assert (row["examples"], row["hint"]) == ("", "ok")
 
 
-HINT_1 = "contexts mention penalize words but don't select these patterns; add context.positive words"
-HINT_2 = "add nearby words; if inputs come with a context, add penalize words"
+HINT_2 = "add nearby, context or keywords words"
 HINT_3 = "if both values are valid, add to coexist"
 PARTIAL = {"a_span": (0, 4), "b_span": (2, 6)}
 
@@ -1078,10 +938,9 @@ PARTIAL = {"a_span": (0, 4), "b_span": (2, 6)}
 @pytest.mark.parametrize(
     "rows, hint",
     [
-        ([_row("a", "b", "length", skipped=True)], HINT_1),
+        ([_row("a", "b", "length")], "ok"),
         ([_row("a", "b", "priority")], HINT_2),                                    # identical spans
         ([_row("a", "b", "priority", **PARTIAL)], f"{HINT_2}; {HINT_3}"),
-        ([_row("a", "b", "priority", skipped=True, **PARTIAL)], f"{HINT_1}; {HINT_2}; {HINT_3}"),
         # unsettled = 3, partial = 1 (not more than half): no rule 3
         ([_row("a", "b", "priority", **PARTIAL), _row("a", "b", "length"),
           _row("a", "b", "start_label")], HINT_2),
@@ -1096,6 +955,49 @@ PARTIAL = {"a_span": (0, 4), "b_span": (2, 6)}
 def test_summary_hint(rows: list[dict[str, Any]], hint: str) -> None:
     _report(rows)
     assert _by_pair()["a/b"]["hint"] == hint
+
+
+# ------------------------------------------------- summarize_misses
+MISS_KEYS = ["label", "misses", "no_candidates", "dropped", "examples", "hint"]
+HINT_REGEX = "the regex found nothing; check the regex against these inputs"
+HINT_TUNING = "candidates lost; raise their nearby/context weights or check min_score"
+
+
+def _miss(label: str, outcome: str, file: str = "f") -> dict[str, Any]:
+    return _row(label, "", "", file=file, kind="miss", outcome=outcome, a_text="")
+
+
+def test_summarize_misses_counts_per_label() -> None:
+    _report([
+        _miss("phone", "no_candidates", "d1"), _miss("phone", "no_candidates", "d2"),
+        _miss("phone", "candidates_dropped", "d3"), _miss("phone", "no_candidates", ""),
+        _miss("acct", "candidates_dropped", "d5"),
+        _row("a", "b", "priority"),                              # not a miss row
+    ])
+    rows = summarize_misses()
+    assert [list(r) for r in rows] == [MISS_KEYS] * 2
+    phone, acct = rows
+    assert (phone["label"], phone["misses"], phone["no_candidates"], phone["dropped"]) == (
+        "phone", 4, 3, 1)
+    assert phone["examples"] == "d1 | d2 | d3"
+    assert phone["hint"] == HINT_REGEX
+    assert (acct["label"], acct["misses"], acct["dropped"], acct["hint"]) == (
+        "acct", 1, 1, HINT_TUNING)
+
+
+def test_summarize_misses_of_real_report() -> None:
+    write_report_csv(extract(("call me", "Invoice INV-004521"), REAL_CFG, source="doc")[1])
+    (row,) = summarize_misses()
+    assert (row["label"], row["no_candidates"], row["examples"]) == ("phone_number", 1, "doc")
+
+
+def test_summarize_misses_empty_and_old_report() -> None:
+    _report([_row("a", "b", "score")])
+    assert summarize_misses() == []
+    with open("old.csv", "w", encoding="utf-8") as fh:
+        fh.write("file,kind\n,miss\n")
+    with pytest.raises(ValueError, match="regenerate it with --report"):
+        summarize_misses("old.csv")
 
 
 # ------------------------------------------------- --summarize CLI
@@ -1117,8 +1019,23 @@ def test_cli_summarize_explicit_path(capsys: pytest.CaptureFixture[str]) -> None
     assert "a/b" in capsys.readouterr().out
 
 
+
+def test_cli_summarize_prints_miss_table_under_overlaps(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _report([_row("a", "b", "length"), _miss("phone", "no_candidates", "d1")])
+    assert main(["--summarize"]) == 0
+    out = capsys.readouterr().out.split("\n\n")
+    assert out[0].splitlines()[0].split() == SUMMARY_KEYS
+    assert out[1].splitlines()[0].split() == MISS_KEYS
+    assert out[1].splitlines()[1].startswith("phone ")
+    _report([_row("a", "b", "length")])                         # no misses: no second table
+    assert main(["--summarize"]) == 0
+    assert "misses" not in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
-    "extra", [["--text", "x"], ["--context", "x"], ["--report"], ["--error-log"]]
+    "extra", [["--text", "x"], ["--context", "x"], ["--report"]]
 )
 def test_cli_summarize_usage_errors(
     extra: list[str], capsys: pytest.CaptureFixture[str]
@@ -1150,6 +1067,7 @@ def test_cli_summarize_bad_report_is_a_clean_error(
     assert captured.err.startswith("error:") and captured.out == ""
 
 
+
 # ------------------------------------------------- public API, as the README shows it
 def test_public_api_as_documented(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -1157,50 +1075,51 @@ def test_public_api_as_documented(
     import io
     import json
 
-    import extract as mod
     import summarize
-    from extract import (format_summary, open_report, reset_error_log, reset_report,
-                         summarize_overlaps)
+    from extract import (format_misses, format_summary, open_report, reset_report,
+                         summarize_misses, summarize_overlaps)
 
     cfg = load_config(str(CONFIG_PATH))
     assert isinstance(cfg, Config)
 
     # Library: the three input forms, (matches, decisions) shape.
-    for inp in ("Call 555-123-4567", {"text": "Call 555-123-4567", "context": "call"},
-                ("call", "Call 555-123-4567")):
+    for inp in ("Call 555-123-4567 acct 5551234567",
+                {"text": "Call 555-123-4567 acct 5551234567", "context": "call"},
+                ("call", "Call 555-123-4567 acct 5551234567")):
         matches, decisions = extract(inp, cfg, source="id-1")
-        assert [set(m.to_dict()) for m in matches] == [{"label", "text", "start", "end", "score"}]
-        assert all(list(d) == list(REPORT_FIELDS) for d in decisions)
+        assert [set(m.to_dict()) for m in matches] == [{"label", "text", "start", "end", "score"}] * 2
+        assert decisions and all(list(d) == list(REPORT_FIELDS) for d in decisions)
         assert {d["file"] for d in decisions} == {"id-1"}
     matches, _ = extract({"text": "some text", "context": "call"}, cfg)
     assert isinstance(matches, list)
+    m = matches_of(("call", "Call 555-123-4567"), cfg)[0]
+    assert m.score == m.text_score + m.context_score
 
-    # The README loop: reset, stream with open_report, log context misses.
+    # The README loop: reset, then stream with open_report.
     reset_report()
-    reset_error_log()
     items = [("id-1", "call", "Call 555-123-4567"), ("id-2", "tel", "Invoice INV-004521"),
              ("id-3", "", "Acct 5551234567 is overdue.")]
     with open_report() as write:
         for id, context, text in items:
             matches, decisions = extract((context, text), cfg, source=id)
             write(decisions)
-            for d in decisions:
-                if d["kind"] == "context_miss":
-                    log_context_miss(id, context, text, d)
     with open("extract_report.csv", encoding="utf-8", newline="") as fh:
         reader = csv.DictReader(fh)
         assert tuple(reader.fieldnames or ()) == REPORT_FIELDS
-        assert REPORT_FIELDS[-2:] == ("decided_by", "penalty_skipped")
-        assert {r["file"] for r in reader} == {"id-1", "id-2", "id-3"}
-    (miss,) = read_error_log()
-    assert list(miss) == list(mod.ERROR_LOG_FIELDS) and miss["file"] == "id-2"
+        rows = list(reader)
+    assert {r["file"] for r in rows} == {"id-2", "id-3"}       # id-1 had no decisions
+    assert [(r["file"], r["a_label"]) for r in rows if r["kind"] == "miss"] == [
+        ("id-2", "phone_number")]
     write_report_csv(extract("abc", cfg)[1])            # appends, no second header
 
-    # Summary from the library and its table.
+    # Summaries from the library and their tables.
     rows = summarize_overlaps()
     assert rows and all(list(r) == list(summarize.SUMMARY_FIELDS) for r in rows)
     assert rows[0]["pair"] == "account_number/phone_number"
     assert format_summary(rows).splitlines()[0].split() == list(summarize.SUMMARY_FIELDS)
+    misses = summarize_misses()
+    assert [r["label"] for r in misses] == ["phone_number"]
+    assert format_misses(misses).splitlines()[0].split() == list(summarize.MISS_FIELDS)
 
     # CLI, as in the README examples.
     config = str(CONFIG_PATH)
@@ -1209,6 +1128,11 @@ def test_public_api_as_documented(
     out = json.loads(capsys.readouterr().out)
     assert {m["label"] for m in out} == {"invoice_number", "date", "amount"}
     assert all(set(m) == {"label", "text", "start", "end", "score"} for m in out)
+    assert main(["--config", config, "--context", "Acct", "--text",
+                 "Acct 5551234567 call 555-123-4567"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert [(m["label"], m["score"]) for m in out] == [
+        ("account_number", 4.0), ("phone_number", 2.0)]
     monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"call 555-123-4567")))
     assert main(["--config", config, "--context", "phone"]) == 0
     assert json.loads(capsys.readouterr().out)[0]["label"] == "phone_number"
@@ -1217,19 +1141,13 @@ def test_public_api_as_documented(
 
 
 # ------------------------------------------------- YAML booleans/null as keywords
-@pytest.mark.parametrize(
-    "keys, where, shown",
-    [
-        ({"nearby": {True: 1}}, "nearby", "True"),                     # bare `on:` / `yes:`
-        ({"context": {"penalize": {False: -1}}}, "context.penalize", "False"),  # bare `no:`
-        ({"context": {"positive": [True]}}, "context.positive", "True"),
-    ],
-)
+@pytest.mark.parametrize("where", KEY_NAMES)
+@pytest.mark.parametrize("key, shown", [(True, "True"), (False, "False")])   # bare on / no
 def test_non_string_keyword_is_rejected(
-    tmp_path: Path, keys: dict[str, Any], where: str, shown: str
+    tmp_path: Path, where: str, key: Any, shown: str
 ) -> None:
     with pytest.raises(ValueError) as exc:
-        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+        make_cfg(tmp_path, _one(**{where: {key: 1}}))
     assert str(exc.value) == (
         f"pattern 'p': {where} keyword {shown} must be a string "
         '(quote it in the YAML, e.g. "on")'
@@ -1250,29 +1168,18 @@ def test_bare_yaml_on_in_a_file_is_rejected(tmp_path: Path) -> None:
     "keys, where, key, other",
     [
         ({"nearby": {"amount due": 2, "amount-due": 2}}, "nearby", "amount-due", "amount due"),
-        ({"context": {"positive": ["don't", "dont"]}}, "context.positive", "dont", "don't"),
-        ({"context": {"penalize": {"e mail": -1, "e-mail": -1}}}, "context.penalize",
-         "e-mail", "e mail"),
+        ({"context": {"don't": 1, "dont": 1}}, "context", "dont", "don't"),
+        ({"keywords": {"e mail": -1, "e-mail": -1}}, "keywords", "e-mail", "e mail"),
     ],
 )
 def test_duplicate_after_word_reduction_is_rejected(
     tmp_path: Path, keys: dict[str, Any], where: str, key: str, other: str
 ) -> None:
     with pytest.raises(ValueError) as exc:
-        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+        make_cfg(tmp_path, _one(**keys))
     assert str(exc.value) == (
         f"pattern 'p': {where} keyword '{key}' is listed more than once in this "
         f"pattern (same words as '{other}')"
-    )
-
-
-def test_positive_and_penalize_compare_reduced_words(tmp_path: Path) -> None:
-    keys = {"context": {"positive": ["don't"], "penalize": {"dont": -1}}}
-    with pytest.raises(ValueError) as exc:
-        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
-    assert str(exc.value) == (
-        "pattern 'p': keyword 'dont' is in both context.positive "
-        "and context.penalize (same words as 'don't')"
     )
 
 
@@ -1317,45 +1224,24 @@ def test_cli_summarize_malformed_csv_is_a_clean_error(
 
 
 # ------------------------------------------------- blank entries
-@pytest.mark.parametrize(
-    "keys, where",
-    [
-        ({"context": {"positive": ["tel", None]}}, "context.positive"),   # bare `-` item
-        ({"context": {"penalize": {None: -1}}}, "context.penalize"),     # blank / `~` key
-        ({"nearby": {None: 1}}, "nearby"),
-    ],
-)
-def test_blank_keyword_entry_is_rejected(
-    tmp_path: Path, keys: dict[str, Any], where: str
-) -> None:
+@pytest.mark.parametrize("where", KEY_NAMES)
+def test_blank_keyword_entry_is_rejected(tmp_path: Path, where: str) -> None:
     with pytest.raises(ValueError) as exc:
-        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+        make_cfg(tmp_path, _one(**{where: {None: 1}}))
     assert str(exc.value) == f"pattern 'p': {where} has an empty entry; remove it"
-
-
-def test_blank_list_item_in_a_file_is_rejected(tmp_path: Path) -> None:
-    path = tmp_path / "blank.yaml"
-    raw = CONFIG_PATH.read_text(encoding="utf-8").replace(
-        "keywords: {phone: 3, tel: 3, call: 2, mobile: 2, fax: 1, invoice: -2, account: -2, order: -1}",
-        "context:\n      positive:\n        - phone\n        -")
-    assert raw != CONFIG_PATH.read_text(encoding="utf-8")
-    path.write_text(raw, encoding="utf-8")
-    with pytest.raises(ValueError, match="pattern 'phone_number': context.positive has an empty entry"):
-        load_config(path)
 
 
 @pytest.mark.parametrize(
     "keys",
-    [{}, {"context": None}, {"context": {}}, {"context": {"positive": None, "penalize": None}},
-     {"context": {"positive": [], "penalize": {}}, "nearby": None}, {"nearby": {}}],
+    [{}, {"context": None}, {"context": {}}, {"nearby": None}, {"nearby": {}},
+     {"keywords": None, "nearby": {}, "context": None}],
 )
 def test_missing_or_blank_keyword_keys_load_as_empty(
     tmp_path: Path, keys: dict[str, Any]
 ) -> None:
-    cfg = make_cfg(tmp_path, [{"label": "n", "priority": 1, "regex": r"\d+", **keys}],
-                   overlap_tiebreak=["context_penalty"])
+    cfg = make_cfg(tmp_path, [{"label": "n", "priority": 1, "regex": r"\d+", **keys}])
     (p,) = cfg.patterns
-    assert (p.positive, p.penalize, p.nearby) == ([], {}, {})
+    assert (p.nearby, p.context) == ({}, {})
     for inp in ("tel 12", ("tel", "12")):
         (m,) = matches_of(inp, cfg)
         assert (m.text, m.score) == ("12", 0)
@@ -1366,8 +1252,9 @@ def test_summary_lives_in_summarize_and_extract_reexports_it() -> None:
     import extract
     import summarize
 
-    assert extract.summarize_overlaps is summarize.summarize_overlaps
-    assert extract.format_summary is summarize.format_summary
+    for name in ("summarize_overlaps", "format_summary", "summarize_misses", "format_misses"):
+        assert getattr(extract, name) is getattr(summarize, name)
+        assert getattr(summarize, name).__module__ == "summarize"
     assert extract.REPORT_PATH == summarize.DEFAULT_REPORT_PATH == "extract_report.csv"
     import ast
 
@@ -1377,7 +1264,6 @@ def test_summary_lives_in_summarize_and_extract_reexports_it() -> None:
     imported |= {(n.module or "").split(".")[0] for n in ast.walk(tree)
                  if isinstance(n, ast.ImportFrom)}
     assert not imported & {"extract", "words"}            # leaf module: stdlib only
-    assert summarize.summarize_overlaps.__module__ == "summarize"
 
 
 def test_summarize_reads_only_report_columns() -> None:
@@ -1385,15 +1271,16 @@ def test_summarize_reads_only_report_columns() -> None:
 
     assert set(summarize.COLUMNS_USED) <= set(REPORT_FIELDS)
     # A report with only those columns summarizes the same as a full one.
-    rows = [_row("a", "b", "priority", file="d"), _row("a", "b", "score")]
+    rows = [_row("a", "b", "priority", file="d"), _row("a", "b", "score"),
+            _miss("p", "no_candidates", "d2")]
     _report(rows)
-    full = summarize_overlaps()
+    full = (summarize_overlaps(), summarize_misses())
     with open("slim.csv", "w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=summarize.COLUMNS_USED, lineterminator="\n",
                                 extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
-    assert summarize_overlaps("slim.csv") == full
+    assert (summarize_overlaps("slim.csv"), summarize_misses("slim.csv")) == full
 
 
 # ------------------------------------------------- keywords shorthand
@@ -1402,126 +1289,53 @@ def _pat(cfg: Config) -> Any:
     return p
 
 
-def test_keywords_expand_by_sign(tmp_path: Path) -> None:
-    cfg = make_cfg(tmp_path, _one(keywords={"phone": 3, "Call": 2, "acct": -3}),
-                   overlap_tiebreak=["context_penalty"])
-    p = _pat(cfg)
-    assert sorted(p.positive) == ["call", "phone"]      # make_cfg's safe_dump sorts keys
-    assert p.nearby == {"phone": 3.0, "call": 2.0, "acct": -3.0}
-    assert p.penalize == {"acct": -3.0}
-
-
-def test_keywords_behave_like_the_explicit_keys(tmp_path: Path) -> None:
-    patterns = [
-        {"label": "A", "priority": 1, "regex": r"\d{4}", "keywords": {"alpha": 2, "bad": -1}},
-        {"label": "B", "priority": 2, "regex": r"\d{4}", "keywords": {"beta": 1}},
-    ]
-    cfg = make_cfg(tmp_path, patterns, overlap_tiebreak=CTX_PEN_ORDER)
-    (m,) = matches_of("alpha 1234", cfg)                         # nearby: alpha scores A
-    assert (m.label, m.score) == ("A", 2.0)
-    assert _sel_in(cfg, "beta") == ["B"]                         # positive: beta selects B
-    (m,) = matches_of(("alpha beta bad", "1234"), cfg)           # penalize: bad hits A
-    assert m.label == "B"
-
-
-def test_keywords_weight_zero_is_rejected(tmp_path: Path) -> None:
-    with pytest.raises(ValueError) as exc:
-        make_cfg(tmp_path, _one(keywords={"tel": 0}))
-    assert str(exc.value) == (
-        "pattern 'p': keywords word 'tel' has weight 0; give it a sign or remove it"
-    )
+def test_keywords_expand_into_nearby_and_context(tmp_path: Path) -> None:
+    p = _pat(make_cfg(tmp_path, _one(keywords={"phone": 3, "Call": 2, "acct": -3})))
+    expected = {"phone": 3.0, "call": 2.0, "acct": -3.0}
+    assert p.nearby == expected and p.context == expected
 
 
 def test_keywords_merge_with_explicit_keys(tmp_path: Path) -> None:
-    keys = {"keywords": {"phone": 3, "acct": -3},
-            "context": {"positive": ["mobile"], "penalize": {"order": -1}},
-            "nearby": {"cell": 1}}
-    p = _pat(make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"]))
-    assert p.positive == ["mobile", "phone"]            # explicit words first
-    assert p.penalize == {"order": -1.0, "acct": -3.0}
+    keys = {"keywords": {"phone": 3, "acct": -3}, "context": {"mobile": 1}, "nearby": {"cell": 1}}
+    p = _pat(make_cfg(tmp_path, _one(**keys)))
+    assert p.context == {"mobile": 1.0, "phone": 3.0, "acct": -3.0}     # explicit words first
     assert p.nearby == {"cell": 1.0, "phone": 3.0, "acct": -3.0}
 
 
 @pytest.mark.parametrize(
     "keys, where, word, same",
     [
-        ({"keywords": {"tel": 1}, "context": {"positive": ["tel"]}}, "context.positive", "tel", ""),
-        ({"keywords": {"bad": -1}, "context": {"penalize": {"bad": -1}}},
-         "context.penalize", "bad", ""),
+        ({"keywords": {"tel": 1}, "context": {"tel": 2}}, "context", "tel", ""),
         ({"keywords": {"tel": 1}, "nearby": {"Tel": 2}}, "nearby", "tel", ""),
         ({"keywords": {"e-mail": 1}, "nearby": {"e mail": 2}}, "nearby", "e-mail",
          " (same words as 'e mail')"),
-        ({"keywords": {"e-mail": 1}, "context": {"positive": ["e mail"]}}, "context.positive",
-         "e-mail", " (same words as 'e mail')"),
-        ({"keywords": {"e-mail": -1}, "context": {"penalize": {"e mail": -2}}},
-         "context.penalize", "e-mail", " (same words as 'e mail')"),
-        ({"keywords": {"bad": -1}, "context": {"positive": ["bad"]}}, "context.positive", "bad", ""),
+        ({"keywords": {"e-mail": -1}, "context": {"e mail": -2}}, "context", "e-mail",
+         " (same words as 'e mail')"),
     ],
 )
 def test_word_in_keywords_and_explicit_key_is_rejected(
     tmp_path: Path, keys: dict[str, Any], where: str, word: str, same: str
 ) -> None:
     with pytest.raises(ValueError) as exc:
-        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["context_penalty"])
+        make_cfg(tmp_path, _one(**keys))
     assert str(exc.value) == f"pattern 'p': keyword '{word}' is in both keywords and {where}{same}"
 
 
-@pytest.mark.parametrize(
-    "value, message",
-    [
-        ({"w2": 1}, "pattern 'p': keywords keyword 'w2' must contain only ASCII letters"),
-        ({"tel": 1, "TEL": 2}, "pattern 'p': keywords keyword 'tel' is listed more than once"),
-        ({True: 1}, "pattern 'p': keywords keyword True must be a string"),
-        ({None: 1}, "pattern 'p': keywords has an empty entry; remove it"),
-        ({"tel": "high"}, "pattern 'p': keywords keyword 'tel' needs a numeric weight"),
-        (["tel"], "pattern 'p': keywords must be a map of word: weight"),
-    ],
-)
-def test_keywords_validation_names_keywords(tmp_path: Path, value: Any, message: str) -> None:
-    with pytest.raises(ValueError, match=re.escape(message)):
-        make_cfg(tmp_path, _one(keywords=value))
-
-
-@pytest.mark.parametrize("value", [None, {}])
-def test_keywords_blank_loads_as_empty(tmp_path: Path, value: Any) -> None:
-    p = _pat(make_cfg(tmp_path, _one(keywords=value)))
-    assert (p.positive, p.penalize, p.nearby) == ([], {}, {})
-
-
-def test_shorthand_negatives_do_not_warn(tmp_path: Path) -> None:
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        p = _pat(make_cfg(tmp_path, _one(keywords={"tel": 2, "acct": -3}),
-                          overlap_tiebreak=["score"]))
-    assert p.penalize == {"acct": -3.0}
-
-
-def test_explicit_penalize_still_warns_alongside_keywords(tmp_path: Path) -> None:
-    keys = {"keywords": {"acct": -3}, "context": {"penalize": {"order": -1}}}
-    with pytest.warns(UserWarning, match="context.penalize is set for p but"):
-        make_cfg(tmp_path, _one(**keys), overlap_tiebreak=["score"])
-
-
-# ------------------------------------------------- example config uses keywords
-# How extraction_config.yaml loaded before it was rewritten with `keywords`:
-# the rewrite must not change any pattern.
-REAL_CFG_PATTERNS = {
-    'invoice_number': (['invoice', 'bill', 'amount due', 'ref'], {'phone': -3.0, 'tel': -3.0}, {'invoice': 3.0, 'bill': 2.0, 'amount due': 2.0, 'ref': 1.0, 'phone': -3.0, 'tel': -3.0}),
-    'phone_number': (['phone', 'tel', 'call', 'mobile', 'fax'], {'invoice': -2.0, 'account': -2.0, 'order': -1.0}, {'phone': 3.0, 'tel': 3.0, 'call': 2.0, 'mobile': 2.0, 'fax': 1.0, 'invoice': -2.0, 'account': -2.0, 'order': -1.0}),
-    'account_number': (['account', 'acct', 'routing'], {'phone': -3.0, 'call': -2.0}, {'account': 3.0, 'acct': 3.0, 'routing': 1.0, 'phone': -3.0, 'call': -2.0}),
-    'timestamp': (['at', 'logged', 'created'], {}, {'at': 1.0, 'logged': 2.0, 'created': 2.0}),
-    'date': (['date', 'due', 'dated', 'on'], {}, {'date': 2.0, 'due': 2.0, 'dated': 2.0, 'on': 1.0}),
-    'amount': (['total', 'due', 'amount', 'balance'], {}, {'total': 3.0, 'due': 2.0, 'amount': 2.0, 'balance': 2.0}),
+# ------------------------------------------------- example config
+REAL_CFG_KEYWORDS = {
+    'invoice_number': {'invoice': 3.0, 'bill': 2.0, 'amount due': 2.0, 'ref': 1.0, 'phone': -3.0, 'tel': -3.0},
+    'phone_number': {'phone': 3.0, 'tel': 3.0, 'call': 2.0, 'mobile': 2.0, 'fax': 1.0, 'invoice': -2.0, 'account': -2.0, 'order': -1.0},
+    'account_number': {'account': 3.0, 'acct': 3.0, 'routing': 1.0, 'phone': -3.0, 'call': -2.0},
+    'timestamp': {'at': 1.0, 'logged': 2.0, 'created': 2.0},
+    'date': {'date': 2.0, 'due': 2.0, 'dated': 2.0, 'on': 1.0},
+    'amount': {'total': 3.0, 'due': 2.0, 'amount': 2.0, 'balance': 2.0},
 }
 
 
-def test_example_config_patterns_unchanged_by_keywords_rewrite() -> None:
-    loaded = {p.label: (p.positive, p.penalize, p.nearby) for p in REAL_CFG.patterns}
-    assert loaded == REAL_CFG_PATTERNS
-    for p in REAL_CFG.patterns:                      # same order, too
-        positive, penalize, nearby = REAL_CFG_PATTERNS[p.label]
-        assert list(p.penalize) == list(penalize)
-        assert list(p.nearby) == list(nearby)
+def test_example_config_keywords_reach_both_sources() -> None:
+    for p in REAL_CFG.patterns:
+        assert p.nearby == p.context == REAL_CFG_KEYWORDS[p.label]
+        assert list(p.nearby) == list(REAL_CFG_KEYWORDS[p.label])     # same order, too
 
 
 def test_example_config_uses_keywords_shorthand() -> None:

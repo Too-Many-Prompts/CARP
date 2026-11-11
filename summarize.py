@@ -1,11 +1,15 @@
-"""Overlap summary of a CARP report CSV (extract_report.csv).
+"""Summaries of a CARP report CSV (extract_report.csv).
 
     rows = summarize_overlaps()            # list of dicts, worst pairs first
-    print(format_summary(rows))            # the table `extract.py --summarize` prints
+    print(format_summary(rows))            # the overlap table `extract.py --summarize` prints
+    misses = summarize_misses()            # list of dicts, most misses first
+    print(format_misses(misses))           # the miss table printed under it
 
-Shows which label pairs overlap most often without being resolved by score.
-This module only reads report columns by name (COLUMNS_USED); it imports
-nothing from extract.py, which re-exports summarize_overlaps/format_summary.
+The overlap table shows which label pairs overlap most often without being
+resolved by score. The miss table shows which labels the context pointed to
+but that produced no match. This module only reads report columns by name
+(COLUMNS_USED); it imports nothing from extract.py, which re-exports the four
+functions.
 """
 from __future__ import annotations
 
@@ -19,29 +23,28 @@ DEFAULT_REPORT_PATH = "extract_report.csv"
 # Report columns this module reads; all must be in extract.REPORT_FIELDS.
 COLUMNS_USED = (
     "file", "kind", "a_label", "a_text", "a_start", "a_end",
-    "b_label", "b_text", "b_start", "b_end", "decided_by", "penalty_skipped",
+    "b_label", "b_text", "b_start", "b_end", "decided_by", "outcome",
 )
 
-SUMMARY_CRITERIA = ("score", "context_penalty", "length", "priority", "start_label")
+SUMMARY_CRITERIA = ("score", "length", "priority", "start_label")
 SUMMARY_FIELDS = (
     ("pair", "overlaps")
     + tuple(f"by_{c}" for c in SUMMARY_CRITERIA)
-    + ("not_by_score", "not_by_score_pct", "no_evidence", "penalty_skipped",
-       "wins", "examples", "hint")
+    + ("not_by_score", "not_by_score_pct", "no_evidence", "wins", "examples", "hint")
 )
 _NO_EVIDENCE = ("priority", "start_label")   # fallback order, nothing in the input
 _MAX_EXAMPLES = 3
-HINT_SKIPPED = ("contexts mention penalize words but don't select these patterns; "
-                "add context.positive words")
-HINT_NO_EVIDENCE = "add nearby words; if inputs come with a context, add penalize words"
+HINT_NO_EVIDENCE = "add nearby, context or keywords words"
 HINT_PARTIAL = "if both values are valid, add to coexist"
+MISS_FIELDS = ("label", "misses", "no_candidates", "dropped", "examples", "hint")
+HINT_MISS_REGEX = "the regex found nothing; check the regex against these inputs"
+HINT_MISS_TUNING = "candidates lost; raise their nearby/context weights or check min_score"
 
 
 @dataclass
 class _PairStats:
     by: Counter = field(default_factory=Counter)        # decided_by -> count
     wins: Counter = field(default_factory=Counter)      # winning label -> count
-    penalty_skipped: int = 0
     unsettled: int = 0                                  # not decided by score
     partial: int = 0                                    # ...of which spans differ
     examples: list[str] = field(default_factory=list)   # at most _MAX_EXAMPLES
@@ -80,13 +83,8 @@ def summarize_overlaps(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]]:
     Raises ValueError if the report has no `decided_by` column.
     """
     stats: dict[str, _PairStats] = {}
-    with open(path, encoding="utf-8", errors="replace", newline="") as fh:
-        reader = csv.DictReader(fh)
-        if "decided_by" not in (reader.fieldnames or []):
-            raise ValueError(
-                f"{path}: no decided_by column; the report is from an older "
-                "version, regenerate it with --report"
-            )
+    fh, reader = _open_report(path)
+    with fh:
         for row in reader:
             if row.get("kind") != "overlap":
                 continue
@@ -95,8 +93,6 @@ def summarize_overlaps(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]]:
             by = row.get("decided_by", "")
             st.by[by] += 1
             st.wins[a] += 1
-            if str(row.get("penalty_skipped", "")).strip().lower() == "true":
-                st.penalty_skipped += 1
             if by == "score":
                 continue
             st.unsettled += 1
@@ -111,8 +107,6 @@ def summarize_overlaps(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]]:
         not_by_score = overlaps - st.by["score"]
         no_evidence = sum(st.by[c] for c in _NO_EVIDENCE)
         hints = []
-        if st.penalty_skipped > 0:
-            hints.append(HINT_SKIPPED)
         if no_evidence > 0:
             hints.append(HINT_NO_EVIDENCE)
             if st.partial * 2 > st.unsettled:
@@ -125,7 +119,6 @@ def summarize_overlaps(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]]:
             "not_by_score": not_by_score,
             "not_by_score_pct": _pct(not_by_score, overlaps),
             "no_evidence": no_evidence,
-            "penalty_skipped": st.penalty_skipped,
             "wins": "; ".join(f"{label} {n}" for label, n in wins),
             "examples": " | ".join(st.examples),
             "hint": "; ".join(hints) or "ok",
@@ -134,10 +127,71 @@ def summarize_overlaps(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]]:
     return out
 
 
-def format_summary(rows: list[dict[str, Any]]) -> str:
-    """The summary as an aligned plain-text table (header + one line per pair)."""
-    table = [list(SUMMARY_FIELDS)] + [[str(r[k]) for k in SUMMARY_FIELDS] for r in rows]
-    widths = [max(len(line[i]) for line in table) for i in range(len(SUMMARY_FIELDS))]
+def _format_table(fields: tuple[str, ...], rows: list[dict[str, Any]]) -> str:
+    """An aligned plain-text table: header + one line per row."""
+    table = [list(fields)] + [[str(r[k]) for k in fields] for r in rows]
+    widths = [max(len(line[i]) for line in table) for i in range(len(fields))]
     return "\n".join(
         "  ".join(cell.ljust(w) for cell, w in zip(line, widths)).rstrip() for line in table
     )
+
+
+def format_summary(rows: list[dict[str, Any]]) -> str:
+    """The overlap summary as an aligned plain-text table (one line per pair)."""
+    return _format_table(SUMMARY_FIELDS, rows)
+
+
+def _open_report(path: str) -> tuple[Any, csv.DictReader]:
+    """Open a report CSV; fail if it predates the decided_by column."""
+    fh = open(path, encoding="utf-8", errors="replace", newline="")
+    reader = csv.DictReader(fh)
+    if "decided_by" not in (reader.fieldnames or []):
+        fh.close()
+        raise ValueError(
+            f"{path}: no decided_by column; the report is from an older "
+            "version, regenerate it with --report"
+        )
+    return fh, reader
+
+
+def summarize_misses(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]]:
+    """Count a report CSV's `miss` rows per label.
+
+    A miss is a label the context scored above 0 that ended with no match.
+    `no_candidates`: its regex found nothing in the text (a regex gap);
+    `dropped`: it had candidates but all lost (min_score or overlap; tuning).
+    Sorted by misses (highest first), then label. Raises ValueError if the
+    report has no `decided_by` column.
+    """
+    counts: dict[str, Counter] = {}
+    examples: dict[str, list[str]] = {}
+    fh, reader = _open_report(path)
+    with fh:
+        for row in reader:
+            if row.get("kind") != "miss":
+                continue
+            label = row.get("a_label", "")
+            c = counts.setdefault(label, Counter())
+            kind = "no_candidates" if row.get("outcome") == "no_candidates" else "dropped"
+            c[kind] += 1
+            ex = examples.setdefault(label, [])
+            if len(ex) < _MAX_EXAMPLES:
+                ex.append(row.get("file") or "(no id)")
+    out = [
+        {
+            "label": label,
+            "misses": c["no_candidates"] + c["dropped"],
+            "no_candidates": c["no_candidates"],
+            "dropped": c["dropped"],
+            "examples": " | ".join(examples[label]),
+            "hint": HINT_MISS_REGEX if c["no_candidates"] >= c["dropped"] else HINT_MISS_TUNING,
+        }
+        for label, c in counts.items()
+    ]
+    out.sort(key=lambda r: (-r["misses"], r["label"]))
+    return out
+
+
+def format_misses(rows: list[dict[str, Any]]) -> str:
+    """The miss summary as an aligned plain-text table (one line per label)."""
+    return _format_table(MISS_FIELDS, rows)

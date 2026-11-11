@@ -10,10 +10,7 @@ settings:
   min_score: 0                   # drop candidates scoring below this
   case_sensitive: false
   overlap_tiebreak:              # applied in order when overlapping spans conflict
-    - score                      # higher `nearby` score wins
-    - context_penalty            # only when the passed context selected the patterns:
-                                 #   the penalty (sum of context.penalize weights found
-                                 #   in the context) closer to 0 wins
+    - score                      # higher score (text + context) wins
     - length                     # then longer match
     - priority                   # then lower priority number wins
                                  # Anything still tied (or an empty list) goes to the
@@ -25,16 +22,16 @@ normalize:
   smart_quotes_to_ascii: true
 
 patterns:
-  # keywords: word -> weight, written once. A word with weight > 0 selects the
-  # pattern from the context string and raises the score near a match in the
-  # text; a word with weight < 0 lowers the score and counts against the pattern
-  # in the context_penalty tie-break. To give a word different roles, use the
-  # explicit keys instead (a word may not be in both):
-  #
-  #   context:                          # read from the context string only
-  #     positive: [phone, call]         #   selects the pattern
-  #     penalize: {acct: -3}            #   context_penalty tie-break, weight <= 0
-  #   nearby: {phone: 3, order: -1}     # read from the text window only
+  # Every pattern runs on every text. A match's score is the sum of the weights
+  # of its pattern's words found around it:
+  #   keywords: {word: weight}   # in the text window AND in the context string
+  #   nearby:   {word: weight}   # in the text window only
+  #   context:  {word: weight}   # in the context string only
+  # Weights are signed (negative lowers the score; 0 is an error). A word in
+  # `keywords` may not also be in `nearby` or `context`.
+  # The text window is context_window_words words on each side of the match.
+  # The context string is read whole; its last word counts as the closest
+  # (distance 1) when distance_decay is on.
 
   - label: invoice_number
     priority: 1
@@ -97,23 +94,36 @@ tests:
       - {label: timestamp, text: "2026-03-14 09:30:00"}
       - {label: date, text: "2026-03-14"}
 
-  # Optional `context` per case: it is matched against each pattern's
-  # `context.positive` words; patterns with a hit are the only ones run on the text.
-  - name: context keyword narrows to its pattern (account_number only)
+  # Optional `context` per case: its words add to the score of every pattern
+  # that lists them. All patterns still run on the text.
+  - name: without context the 10-digit number reads as a phone (call is next to it)
+    text: "5551234567 call"
+    expect:
+      - {label: phone_number, text: "5551234567"}
+
+  - name: context "account" flips the same overlap (account +3, phone -2)
+    context: "account"
+    text: "5551234567 call"
+    expect:
+      - {label: account_number, text: "5551234567"}
+
+  - name: context wins the overlap; the separate phone number is still found
     context: "Acct"
     text: "Acct 5551234567 call 555-123-4567"
     expect:
       - {label: account_number, text: "5551234567"}
+      - {label: phone_number, text: "555-123-4567"}
 
-  - name: context phrase selects every pattern listing it (phone excluded)
+  - name: context phrase adds to every pattern listing it; nothing is excluded
     context: "amount due"
     text: "Invoice INV-004521 dated 03/14/2026, amount due $1,250.00 call 555-123-4567"
     expect:
       - {label: invoice_number, text: "INV-004521"}
       - {label: date, text: "03/14/2026"}
       - {label: amount, text: "$1,250.00"}
+      - {label: phone_number, text: "555-123-4567"}
 
-  - name: context with no keyword hits falls back to all patterns
+  - name: context with no keyword hits changes nothing
     context: "nothing relevant here"
     text: "Invoice INV-004521 dated 03/14/2026 on 2026-03-14"
     expect:
@@ -121,14 +131,15 @@ tests:
       - {label: date, text: "03/14/2026"}
       - {label: date, text: "2026-03-14"}
 
-  - name: '"on" in the context selects date (YAML used to read bare on as true)'
+  - name: '"on" in the context scores date (YAML used to read bare on as true)'
     context: "invoice on file"
     text: "Invoice INV-004521 dated 03/14/2026"
     expect:
       - {label: invoice_number, text: "INV-004521"}
       - {label: date, text: "03/14/2026"}
 
-  - name: context hits phone_number keywords but text has no phone number
+  - name: context points to phone_number but the text has none (a `miss` row)
     context: "call me"
     text: "Invoice INV-004521"
-    expect: []
+    expect:
+      - {label: invoice_number, text: "INV-004521"}
