@@ -210,4 +210,5 @@ and possible numbers sharing an area code, a sign that phonenumbers' data is sta
 | `extraction_config.yaml` | settings, patterns, coexist pairs, test cases |
 | `test_extract.py` | pytest suite |
 | `docs/REFERENCE.md` | the full rules: CLI flags, scoring, keywords, tie-breaks, output files, migration |
+| `releasenotes.md` | breaking changes per release, written so a downstream system (or Claude) can adjust its calling code |
 | `CLAUDE.md` | project instructions for Claude Code |
