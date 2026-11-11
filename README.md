@@ -314,5 +314,4 @@ See [CLI](docs/REFERENCE.md#cli), [Library](docs/REFERENCE.md#library),
 | `extraction_config.yaml` | settings, patterns, coexist pairs, test cases |
 | `test_extract.py` | pytest suite |
 | `docs/REFERENCE.md` | the full rules: CLI flags, decision flow, every config option, scoring, keywords, tie-breaks, output files |
-| `releasenotes.md` | breaking changes per release, written so a downstream system (or Claude) can adjust its calling code |
 | `CLAUDE.md` | project instructions for Claude Code |
