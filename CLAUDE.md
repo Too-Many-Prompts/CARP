@@ -45,9 +45,12 @@ string, and resolves overlapping matches.
    before step 5: `phone.readings_for()` returns every reading of the hit
    (no tie-breaking between regions). The steps, first that applies:
    - `+` number (or `00` as a last resort);
-   - the hinted regions only (valid readings, else possible ones;
-     `hint_conflict` all | nearest; if none fits, fall through with a note);
-   - the `regions` list, filtered by `readings`.
+   - the hinted regions (valid readings, else possible ones;
+     `hint_conflict` all | nearest);
+   - the `regions` list, filtered by `readings`. After a hint, it runs per
+     `hint_fallback`: not_valid (default; no valid hinted reading),
+     impossible (no hinted reading), always, never. Its readings are added
+     (source `list`); each reading keeps its own source.
    Each returned reading becomes a match labeled `{status}_{REGION}_number`,
    with `family` = the pattern label, a shared `hit` id, and `extra`
    {normalized, region, status, region_source, number_type, readings}.
@@ -92,6 +95,7 @@ string, and resolves overlapping matches.
   - `hints` ({REGION: {word: weight > 0}}, read like `keywords`);
   - `readings` (valid_and_home | all | valid_else_possible | valid);
   - `hint_conflict` (all | nearest);
+  - `hint_fallback` (not_valid | impossible | always | never);
   - `output_format` (E164).
 
   The earlier keys (`default_region`, `try_regions`, `possible_label`,
@@ -132,7 +136,7 @@ string, and resolves overlapping matches.
   `miss` rows, the score breakdown, every `decided_by` value,
   `summarize_overlaps`, `summarize_misses` and `--summarize`, and the public
   API as the README shows it. Phone: `validate` load and migration errors,
-  each status, every `readings` and `hint_conflict` mode, hints
+  each status, every `readings`, `hint_conflict` and `hint_fallback` mode, hints
   (including misfits), `+`/`00`/`011`, span refinement and back-to-back
   numbers, readings vs other patterns, coexist/misses via `family`, `extra`,
   report rows, `summarize_validation`.

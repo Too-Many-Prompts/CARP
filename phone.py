@@ -11,9 +11,11 @@ It never guesses a country. Every plausible reading of a number comes back
 `{status}_{REGION}_number`:
 
   1. "+" number (or a leading "00" when nothing else fits): the country code.
-  2. hinted regions: parsed in those regions only; valid readings, else
-     possible ones (hint_conflict: all | nearest). If none fits, fall
-     through to 3 with a note.
+  2. hinted regions: parsed in those regions; valid readings, else
+     possible ones (hint_conflict: all | nearest). hint_fallback decides
+     when 3 also runs: not_valid (no valid hinted reading; default),
+     impossible (no hinted reading at all), always, or never (a number
+     that fits no hinted region is then dropped).
   3. the `regions` list, filtered by `readings`.
   4. impossible everywhere: no reading; extract.py logs why.
 
@@ -27,13 +29,17 @@ import importlib
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-VALIDATE_KEYS = ("with", "regions", "hints", "readings", "hint_conflict", "output_format")
+VALIDATE_KEYS = ("with", "regions", "hints", "readings", "hint_conflict", "hint_fallback",
+                 "output_format")
 CHOICES = {
     "readings": ("valid_and_home", "all", "valid_else_possible", "valid"),
     "hint_conflict": ("all", "nearest"),
+    # When the `regions` list is also parsed after a hint matched:
+    "hint_fallback": ("not_valid", "impossible", "always", "never"),
     "output_format": ("E164", "INTERNATIONAL", "NATIONAL"),
 }
-DEFAULTS = {"readings": "valid_and_home", "hint_conflict": "all", "output_format": "E164"}
+DEFAULTS = {"readings": "valid_and_home", "hint_conflict": "all", "hint_fallback": "not_valid",
+            "output_format": "E164"}
 # Keys of the earlier validate design, with what replaces them.
 OLD_KEYS = {
     "default_region": "list the regions in `regions: [US, ...]` (the first is the home region)",
@@ -77,6 +83,7 @@ class PhoneSpec:
     hints: dict[str, dict[str, float]] = field(default_factory=dict)
     readings: str = "valid_and_home"
     hint_conflict: str = "all"
+    hint_fallback: str = "not_valid"
     output_format: str = "E164"
 
 
@@ -242,6 +249,7 @@ class Reading:
     key: str                    # E.164, or region:raw when there is none
     number_type: str = ""
     parsed_in: str | None = None  # the region it was parsed in (None: "+" number)
+    source: str = "list"        # number | hint | list
     returned: bool = True       # False: filtered out by readings / hint_conflict
     why: str = ""               # why not returned
 
@@ -253,7 +261,7 @@ class Reading:
 @dataclass
 class Outcome:
     readings: list[Reading]     # returned and not returned, in order
-    source: str                 # number | hint | list
+    source: str                 # where the search ended: number | hint | list
     notes: list[str] = field(default_factory=list)
     why: str = ""               # why there is no reading at all (impossible)
 
@@ -315,29 +323,49 @@ def readings_for(
         c = check(raw, None)
         if c.status == "impossible":
             return Outcome([], "number", why=c.why)
-        return Outcome([_reading(raw, c, spec)], "number")
+        return Outcome([_numbered(raw, c, spec)], "number")
 
     notes: list[str] = []
-
+    from_hints: list[Reading] = []
     hinted = [h for h in hints if h.score > 0]
     if hinted:
-        found = _hinted(raw, spec, hinted)
-        if found:
-            return Outcome(found, "hint", notes)
-        notes.append(f"hint {', '.join(h.region for h in hinted)} did not fit")
+        from_hints = _hinted(raw, spec, hinted)
+        live = [r for r in from_hints if r.returned]
+        names = ", ".join(h.region for h in hinted)
+        if spec.hint_fallback == "never":
+            if live:
+                return Outcome(from_hints, "hint")
+            return Outcome([], "hint", why=f"impossible in hinted {names}; hint_fallback: never")
+        if not live:
+            notes.append(f"hint {names} did not fit")
+        elif spec.hint_fallback == "impossible" or (
+                spec.hint_fallback == "not_valid" and any(r.status == "valid" for r in live)):
+            return Outcome(from_hints, "hint")
+        elif spec.hint_fallback == "not_valid":
+            notes.append(f"hint {names} not valid; hint_fallback: not_valid parsed the list too")
 
-    found, checks = _fitting(raw, spec.regions, spec)
-    if found:
-        _filter_list(found, spec)
-        return Outcome(found, "list", notes)
+    from_list, checks = _fitting(raw, spec.regions, spec)
+    known = {r.key for r in from_hints}
+    from_list = [r for r in from_list if r.key not in known]
+    _filter_list(from_list, spec)
+    readings = from_hints + from_list
+    if readings:
+        return Outcome(readings, "list", notes)
 
     stripped = raw.lstrip(" (")
     if stripped.startswith("00"):       # "00" is not an international prefix in NANP
         c = check("+" + stripped[2:], None)
         if c.status != "impossible":
-            return Outcome([_reading(raw, c, spec)], "number", notes + ["read the leading 00 as +"])
+            return Outcome([_numbered(raw, c, spec)], "number", notes + ["read the leading 00 as +"])
     home = checks[0]
     return Outcome([], "list", notes, why=f"impossible in {', '.join(spec.regions)} ({home.why})")
+
+
+def _numbered(raw: str, c: Check, spec: PhoneSpec) -> Reading:
+    """The reading of a number whose country code decides (source `number`)."""
+    r = _reading(raw, c, spec)
+    r.source = "number"
+    return r
 
 
 def _hinted(raw: str, spec: PhoneSpec, hinted: list[RegionHint]) -> list[Reading]:
@@ -353,6 +381,7 @@ def _hinted(raw: str, spec: PhoneSpec, hinted: list[RegionHint]) -> list[Reading
         if c.status == "impossible":
             continue
         r = _reading(raw, c, spec)
+        r.source = "hint"
         if r.key not in seen:
             seen.add(r.key)
             found.append(r)

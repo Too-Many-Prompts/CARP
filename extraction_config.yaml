@@ -51,10 +51,11 @@ patterns:
       # length, unknown range, e.g. a new area code), valid_GB_number ...
       # Impossible hits are dropped and logged in the report.
       # hints:                   # words that point to a region (text window + context);
-      #   GB: {uk: 3, britain: 3, british: 2, england: 2, london: 2}   # only those regions
-      #   IN: {india: 3, indian: 2, mumbai: 2, delhi: 2}                # are parsed then
+      #   GB: {uk: 3, britain: 3, british: 2, england: 2, london: 2}   # parsed first, then
+      #   IN: {india: 3, indian: 2, mumbai: 2, delhi: 2}                # see hint_fallback
       # readings: valid_and_home # with no hint: valid_and_home | all | valid_else_possible | valid
       # hint_conflict: all       # valid in several hinted regions: all | nearest
+      # hint_fallback: not_valid # after a hint, also parse `regions`: not_valid | impossible | always | never
       # output_format: E164      # extra.normalized: E164 | INTERNATIONAL | NATIONAL
 
   - label: account_number

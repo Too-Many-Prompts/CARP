@@ -254,6 +254,7 @@ library.
       IN: {india: 3}
     readings: valid_and_home    # what the list returns: valid_and_home | all | valid_else_possible | valid
     hint_conflict: all          # valid in several hinted regions: all | nearest
+    hint_fallback: not_valid    # after a hint, also parse `regions`: not_valid | impossible | always | never
     output_format: E164         # extra.normalized: E164 | INTERNATIONAL | NATIONAL
 ```
 
@@ -282,15 +283,28 @@ Readings that give the same number count as one. US and CA share +1, so
 
 1. **A `+` number** uses its country code: one reading. Source `number`.
 2. **Hint words.** If hint words for any region appear, the number is parsed
-   in those regions only.
+   in those regions first.
    - Valid readings are returned. If there are none, the possible ones are
      returned.
    - `hint_conflict: nearest` keeps only the region of the nearest hint
      word. A hint word in the text window is nearer than any word in the
      context; then the higher hint score wins; an exact tie keeps both.
    - Source `hint`.
-   - If the number fits none of those regions, the report notes e.g.
-     `hint FR did not fit` and step 3 runs.
+   - `hint_fallback` decides whether step 3 also runs. Its readings are
+     added, with source `list`, and the hinted readings stay:
+
+     | `hint_fallback` | The list is also parsed when |
+     | --- | --- |
+     | `not_valid` (default) | no hinted reading is valid |
+     | `impossible` | the number fits no hinted region at all |
+     | `always` | always |
+     | `never` | never: a number that fits no hinted region is dropped |
+
+     Example: "london" plus `212-555-0123` is only possible in GB but valid
+     in the US. The default gives `possible_GB_number` + `valid_US_number`;
+     `impossible` and `never` give only `possible_GB_number`.
+   - The report notes why the list ran, e.g. `hint FR did not fit` or
+     `hint GB not valid; hint_fallback: not_valid parsed the list too`.
 3. **The list:** parse in every `regions` entry. Source `list`.
    `readings` decides what is returned:
 
@@ -382,7 +396,8 @@ file is gitignored.
     - `outcome` is `kept`, or `not_returned` when `readings` / `hint_conflict`
       filtered it out;
     - an impossible hit gets a single `dropped` row;
-    - `decided_by` is the source (`number`, `hint`, `list`);
+    - `decided_by` is the reading's source (`number`, `hint`, `list`); one
+      hit can mix `hint` and `list` readings (see `hint_fallback`);
     - `reason` reads e.g. `possible in GB; readings: valid; phonenumbers 9.0.43`.
   - In an `overlap` row, `a` is the winner and `b` the dropped candidate.
   - `decided_by` is machine-readable: for `overlap`, the criterion that decided
@@ -483,8 +498,8 @@ parity), `keywords` reaching both sources, `context_direction`, `stop_at`,
 keyword validation and old-format errors, `decided_by`, `miss` rows, the
 report CSV and its score breakdown, the summaries, the CLI, and the public API
 as shown in the README and this reference. Phone tests cover the `validate`
-load and migration errors, each status, every `readings` and `hint_conflict`
-mode, hints (including a hint that does not fit), `+`, `00` and
+load and migration errors, each status, every `readings`, `hint_conflict`
+and `hint_fallback` mode, hints (including a hint that does not fit), `+`, `00` and
 `011`, span refinement and back-to-back numbers, readings competing with
 other patterns, `coexist` and misses through `family`, `extra`, the report
 rows and the validation summary.

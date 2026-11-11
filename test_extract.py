@@ -1605,11 +1605,64 @@ def test_hint_that_does_not_fit_falls_back_to_the_list(tmp_path: Path) -> None:
     assert row["outcome"] == "dropped" and "hint FR did not fit" in row["reason"]
 
 
-def test_possible_hint_still_wins_over_the_list(tmp_path: Path) -> None:
-    """Hints restrict parsing: with 'london', a number only possible in GB is
-    returned as possible_GB_number even though it is valid in the US."""
-    matches, _ = run_phone(tmp_path, ("london", "phone 212-555-0123"), hints=UK_INDIA)
-    assert got(matches) == [("possible_GB_number", "+442125550123")]
+@pytest.mark.parametrize("fallback, expected", [
+    ("impossible", [("possible_GB_number", "+442125550123")]),
+    ("not_valid", [("possible_GB_number", "+442125550123"), ("valid_US_number", "+12125550123")]),
+    ("always", [("possible_GB_number", "+442125550123"), ("valid_US_number", "+12125550123")]),
+    ("never", [("possible_GB_number", "+442125550123")]),
+])
+def test_hint_fallback_when_the_hint_is_only_possible(
+    tmp_path: Path, fallback: str, expected: list
+) -> None:
+    """'london' hints GB, where 212-555-0123 is only possible (it is valid in the US)."""
+    matches, decisions = run_phone(tmp_path, ("london", "phone 212-555-0123"),
+                                   hints=UK_INDIA, hint_fallback=fallback)
+    assert got(matches) == expected
+    sources = {r["region"]: r["decided_by"] for r in vrows(decisions)}
+    assert sources["GB"] == "hint"
+    if fallback not in ("impossible", "never"):
+        assert sources["US"] == "list"
+        assert {m.label: m.extra["region_source"] for m in matches} == {
+            "possible_GB_number": "hint", "valid_US_number": "list"}
+    if fallback == "not_valid":
+        assert "hint_fallback: not_valid parsed the list too" in vrows(decisions)[0]["reason"]
+
+
+@pytest.mark.parametrize("fallback, expected", [
+    ("impossible", [("valid_IN_number", "+919876543210")]),
+    ("not_valid", [("valid_IN_number", "+919876543210")]),
+    ("always", [("possible_US_number", "+19876543210"), ("valid_IN_number", "+919876543210")]),
+    ("never", [("valid_IN_number", "+919876543210")]),
+])
+def test_hint_fallback_when_the_hint_is_valid(tmp_path: Path, fallback: str, expected: list) -> None:
+    """A valid hinted reading stops the search unless hint_fallback: always."""
+    matches, _ = run_phone(tmp_path, "india office 98765 43210", hints=UK_INDIA,
+                           hint_fallback=fallback)
+    assert got(matches) == expected
+
+
+def test_hint_fallback_default_and_errors(tmp_path: Path) -> None:
+    (p,) = make_cfg(tmp_path, [phone_pattern()]).patterns
+    assert p.validate.hint_fallback == "not_valid"
+    with pytest.raises(ValueError, match="validate.hint_fallback: unknown value 'sometimes'"):
+        make_cfg(tmp_path, [phone_pattern(hint_fallback="sometimes")])
+
+
+@pytest.mark.parametrize("fallback, expected", [
+    ("never", []),
+    ("impossible", [("valid_US_number", "+12125550123")]),
+    ("not_valid", [("valid_US_number", "+12125550123")]),
+    ("always", [("valid_US_number", "+12125550123")]),
+])
+def test_hint_fallback_when_the_hint_does_not_fit(tmp_path: Path, fallback: str, expected: list) -> None:
+    """'paris' hints FR, where 212-555-0123 is impossible."""
+    matches, decisions = run_phone(tmp_path, ("paris", "call 212-555-0123"),
+                                   hints=FR_NL, hint_fallback=fallback)
+    assert got(matches) == expected
+    if fallback == "never":
+        (row,) = vrows(decisions)
+        assert (row["outcome"], row["decided_by"]) == ("dropped", "hint")
+        assert "impossible in hinted FR; hint_fallback: never" in row["reason"]
 
 
 FR_NUM, NL_NUM = ("valid_FR_number", "+33612345678"), ("valid_NL_number", "+31612345678")

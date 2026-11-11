@@ -722,14 +722,14 @@ def validate_candidates(
         for r in out.readings:
             m = replace(c, label=r.label, family=c.label, hit=hit_id, extra={
                 "normalized": r.normalized, "region": r.region, "status": r.status,
-                "region_source": out.source, "number_type": r.number_type,
+                "region_source": r.source, "number_type": r.number_type,
                 "readings": len(returned),
             })
             verdict = "kept" if r.returned else "not_returned"
             head = f"{r.status} in {r.region}" + (f"; {r.why}" if r.why else "")
             decisions.append(_decision(
                 "validation", verdict, "; ".join([head] + tail), a=m,
-                decided_by=out.source, status=r.status, region=r.region,
+                decided_by=r.source, status=r.status, region=r.region,
                 normalized=r.normalized,
             ))
             if r.returned:
