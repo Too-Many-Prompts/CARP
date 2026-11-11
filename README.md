@@ -79,13 +79,51 @@ result:     account_number wins, decided_by = score
 The context can tip the same overlap. With the text `"2125550123 call"`,
 phone wins on its own; add the context `"account"` and account_number wins.
 
+### Phone numbers
+
+A pattern can hand its matches to the
+[phonenumbers](https://github.com/daviddrysdale/python-phonenumbers) library
+with a `validate:` block:
+
+```yaml
+- label: phone_number
+  priority: 2
+  regex: '\+?\(?\d[\d\s().-]{6,18}\d'   # broad: catches anything phone-shaped
+  keywords: {phone: 3, call: 2}
+  validate: {with: phonenumbers, default_region: US, possible_label: possible_phone_number}
+```
+
+- A **valid** number keeps its label, and `extra.normalized` holds its E.164
+  form (`+12125550123`).
+- A number of the right length in an unknown range (a new area code, say) is
+  **possible**. It is kept by default, as `possible_phone_number`.
+- A **wrong-length** hit is dropped, but it is logged in the report.
+- The region comes from a leading `+`, a caller `region=` / `--region`, hint
+  words (`regions: {GB: {uk: 3}}`), or `try_regions`. When a number is valid
+  in two hinted regions, the nearer hint word wins and the other region is
+  logged.
+
+```text
+regions: {GB: {uk: 3}, IN: {india: 3}}
+text:    "our UK office called India at 98765 43210"
+match:   phone_number  extra.normalized +919876543210  region IN  (valid only in IN)
+```
+
+Without hint words, the same text gives `possible_phone_number` in the US
+(10 digits fit the US length). Add `regions` or `try_regions` for the
+countries in your data.
+
+Results can change when you upgrade phonenumbers, because its data changes;
+every report row records the version. See
+[Phone numbers](docs/REFERENCE.md#phone-numbers).
+
 ## Setup
 
 Python 3.10+.
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -r requirements.txt   # PyYAML, pytest
+.venv/bin/python -m pip install -r requirements.txt   # PyYAML, pytest, phonenumbers
 ```
 
 ## Quick start
@@ -96,6 +134,9 @@ CLI (one text per run; prints JSON):
 .venv/bin/python extract.py --config extraction_config.yaml \
     --text 'Invoice INV-004521 dated 03/14/2026, amount due $1,250.00'
 ```
+
+Phone matches also carry an `extra` object (normalized number, region,
+status, ...).
 
 ```json
 [
@@ -134,8 +175,9 @@ with open_report() as write:           # opens the file once, holds nothing in m
 To see why a match won, add `--report`. That writes every decision to
 `extract_report.csv`, with each score split into its text and context parts.
 Then run `extract.py --summarize` for a table of the overlaps worth tuning,
-and of the labels the context pointed to that produced no match (likely
-misses). See [CLI](docs/REFERENCE.md#cli),
+of the labels the context pointed to that produced no match (likely
+misses), and of the phone checks (statuses, regions, and possible numbers
+sharing an area code, a sign that phonenumbers' data is stale). See [CLI](docs/REFERENCE.md#cli),
 [Library](docs/REFERENCE.md#library) and
 [Summaries](docs/REFERENCE.md#summaries).
 
@@ -150,7 +192,8 @@ misses). See [CLI](docs/REFERENCE.md#cli),
 | File | Role |
 | --- | --- |
 | `extract.py` | the extractor and CLI |
-| `summarize.py` | `summarize_overlaps()` / `summarize_misses()` and their `format_*()` tables: the summaries of a report CSV (re-exported by `extract.py`) |
+| `summarize.py` | `summarize_overlaps()` / `summarize_misses()` / `summarize_validation()` and their `format_*()` tables: the summaries of a report CSV (re-exported by `extract.py`) |
+| `phone.py` | phone validation for `validate:` patterns (phonenumbers; imported only when used) |
 | `words.py` | `prev_words()` / `next_words()` word lookups around a match |
 | `extraction_config.yaml` | settings, patterns, coexist pairs, test cases |
 | `test_extract.py` | pytest suite |

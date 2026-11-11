@@ -83,6 +83,20 @@ coexist:
 
 # Test cases the program must pass (run with: pytest)
 tests:
+  - name: 555 is not a real area code, so the number is possible, not valid (kept)
+    text: "call 555-123-4567"
+    expect:
+      - {label: possible_phone_number, text: "555-123-4567"}
+
+  - name: a +country code sets the region; parsed as a valid UK number
+    text: "London office +44 20 7946 0018"
+    expect:
+      - {label: phone_number, text: "+44 20 7946 0018"}
+
+  - name: a ZIP+4 code is phone-shaped but impossible, so it is dropped (logged)
+    text: "ship to 94105-1234"
+    expect: []
+
   - text: "Please call 212-555-0123 about the order."
     expect:
       - {label: phone_number, text: "212-555-0123"}

@@ -10,7 +10,7 @@ Scans one text per run. For many texts, or a CSV of them, use the library.
 
 ```bash
 .venv/bin/python extract.py --config extraction_config.yaml \
-    [--text TEXT] [--context TEXT] [--report]
+    [--text TEXT] [--context TEXT] [--region CODE] [--report]
 .venv/bin/python extract.py --summarize [PATH]
 ```
 
@@ -18,12 +18,16 @@ Scans one text per run. For many texts, or a CSV of them, use the library.
   (UTF-8, `errors="replace"`).
 - `--context TEXT` is an optional context string. Its words add to the score
   of every pattern that lists them (see [Scoring](#scoring)).
+- `--region CODE` (e.g. `GB`) is the caller's region for
+  [phone patterns](#phone-numbers). An unknown code is an error (exit 2).
 - Prints the matches as a JSON list of `{label, text, start, end, score}`.
+  Matches of a pattern with `validate` also have `extra` (see
+  [Phone numbers](#phone-numbers)).
 - Writes nothing else unless asked: `--report` writes the decision log to
   `./extract_report.csv` (overwritten each time).
 - `--summarize [PATH]` prints the [overlap and miss summaries](#summaries) of
   a report (default `./extract_report.csv`) and exits. It needs no `--config`
-  and cannot be combined with `--text`, `--context` or `--report`.
+  and cannot be combined with `--text`, `--context`, `--region` or `--report`.
 - Config warnings go to stderr as `warning: ...` and do not change the exit code.
 - Exit codes: `0` success; `2` for a config or report error (`error: ...` on
   stderr, nothing printed) or a usage error.
@@ -47,12 +51,14 @@ cfg = load_config("extraction_config.yaml")
 matches, decisions = extract("some text", cfg)
 matches, _ = extract({"text": "some text", "context": "call"}, cfg)   # ignore the log
 matches, decisions = extract(("call", "some text"), cfg, source="id-1")  # (context, text)
+matches, _ = extract("office 020 7946 0018", cfg, region="GB")         # caller region for phones
 ```
 
 `extract()` returns `(matches, decisions)` and **writes no files**.
 `matches` are the candidates that survived scoring and overlap resolution; each
 has `label`, `text`, `start`, `end`, `score`, and the breakdown `text_score`
-and `context_score` (`score` is their sum). Offsets refer to the
+and `context_score` (`score` is their sum), and `extra` (a dict for matches
+of a pattern with `validate`, else `None`). Offsets refer to the
 **normalized** text. `decisions` is the flat decision log (see
 [Output files](#output-files)); ignore it, keep it, or write it with the helpers
 below. `source` fills its `file` column.
@@ -76,10 +82,12 @@ with open_report() as write:           # opens the file once, holds nothing in m
 Then summarize the report:
 
 ```python
-from extract import summarize_overlaps, format_summary, summarize_misses, format_misses
+from extract import (summarize_overlaps, format_summary, summarize_misses, format_misses,
+                     summarize_validation, format_validation)
 
-print(format_summary(summarize_overlaps()))   # the overlap table --summarize prints
-print(format_misses(summarize_misses()))      # the miss table printed under it
+print(format_summary(summarize_overlaps()))       # the overlap table --summarize prints
+print(format_misses(summarize_misses()))          # the miss table printed under it
+print(format_validation(summarize_validation()))  # phone validation, printed last
 ```
 
 ## How it works
@@ -94,7 +102,11 @@ print(format_misses(summarize_misses()))      # the miss table printed under it
    `finditer`. Patterns are never combined into one alternation, so overlaps
    stay visible. Zero-length matches (e.g. from `\d*`) are skipped. The
    context never decides which patterns run, and regexes never run on it.
+   A pattern with `validate` is scanned the same way, but each regex hit is
+   first trimmed or split by phonenumbers (see [Phone numbers](#phone-numbers)).
 4. **Score** each candidate: `score = text_score + context_score` (below).
+   **Validate** the candidates of `validate` patterns: they get a status and
+   region, and may be dropped or relabeled, before they compete.
 5. **Drop** candidates with `score < min_score`.
 6. **Resolve overlaps**, best first, using `overlap_tiebreak` (in order; any
    of `score`, `length`, `priority`). If every listed criterion ties, or the
@@ -193,7 +205,7 @@ the pattern simply has no keywords of that kind and scores 0 there.
 | --- | --- |
 | `settings` | `context_window_words`, `context_direction` (`before`/`after`/`both`, default `both`), `stop_at` (characters that end the text window scan, default `""`), `distance_decay`, `min_score`, `case_sensitive`, `overlap_tiebreak` (any of `score`, `length`, `priority`, in order; may be empty) |
 | `normalize` | `collapse_whitespace`, `unicode_dashes_to_hyphen`, `smart_quotes_to_ascii` |
-| `patterns` | `label`, `priority`, `regex`, `keywords`, `nearby`, `context` (each word -> signed weight) |
+| `patterns` | `label`, `priority`, `regex`, `keywords`, `nearby`, `context` (each word -> signed weight), optional `validate` ([Phone numbers](#phone-numbers)) |
 | `coexist` | label pairs that may both be kept when they overlap |
 | `tests` | cases `{text, expect: [{label, text}], context?, name?}` run by pytest |
 
@@ -219,6 +231,127 @@ so matches that do not overlap anything are kept whatever the context says.
 To drop a label from a context, give it a negative weight large enough to push
 its candidates below `min_score`.
 
+## Phone numbers
+
+A pattern with a `validate:` block checks its matches with the
+[phonenumbers](https://github.com/daviddrysdale/python-phonenumbers) library
+(Google's libphonenumber metadata). Its regex finds anything phone-shaped
+(recall), and validation sorts what it found (precision). Every regex hit
+ends up as a match or as a `validation` report row with a reason, so
+nothing is lost silently. Patterns without `validate` work exactly as before,
+and configs without it never import the library.
+
+```yaml
+- label: phone_number
+  priority: 2
+  regex: '\+?\(?\d[\d\s().-]{6,18}\d'   # broad on purpose; tighten it any time
+  keywords: {phone: 3, tel: 3, call: 2}
+  validate:
+    with: phonenumbers            # required; the only value
+    default_region: US            # required; region for numbers without +country code
+    try_regions: [US, GB]         # optional; default [default_region]; must include it
+    region_from: both             # optional; where hint words are read: text | context | both
+    regions:                      # optional; region hint words, weight > 0
+      GB: {uk: 3, london: 2, british: 2}
+      IN: {india: 3, mumbai: 2}
+    possible_label: possible_phone_number  # optional; label for numbers that are not valid
+    on_invalid: drop              # impossible numbers: drop | keep_flagged
+    on_possible: keep             # possible numbers: keep | drop | keep_if_score
+    possible_min_score: 1         # keep_if_score threshold on the total score
+    on_ambiguous: first           # exact region ties: first | drop | keep_flagged
+    output_format: E164           # extra.normalized: E164 | INTERNATIONAL | NATIONAL
+```
+
+The minimum is `validate: {with: phonenumbers, default_region: US}`. Region
+codes are ISO 3166 alpha-2 (`US`, `GB`, `IN`, ...). Region keywords follow
+the usual [keyword rules](#keywords). `load_config` names the pattern and
+key for an unknown key, region, value or keyword. It also fails if
+`possible_label` is another pattern's label, or if phonenumbers is not
+installed.
+
+### Steps
+
+1. **Refine.** Each regex hit goes to `PhoneNumberMatcher` (POSSIBLE
+   leniency) in the caller region, else the top hinted region, else
+   `default_region`. It trims a greedy hit (`212-555-0123 2026` becomes
+   `212-555-0123`) and splits two numbers in one hit. The regex scan
+   resumes after the last number found, so back-to-back numbers are all
+   kept. If the matcher finds nothing (`94105-1234`), the raw hit is kept
+   and validation decides.
+2. **Score** the refined candidates like any other.
+3. **Status** in a region, via `parse()`:
+   - `valid`: a known number range.
+   - `possible`: the right length, but not a known range. A new area code
+     the library doesn't know yet lands here. A local-only number (7
+     digits, no area code) is also `possible`, and its value stays raw.
+   - `impossible`: it doesn't parse, or it is the wrong length.
+4. **Region** (`decided_by` in the report; the first step that decides wins):
+
+   | Source | When |
+   | --- | --- |
+   | `number` | the number starts with `+` (the country code decides; hints are ignored) |
+   | `caller` | `extract(region=...)` / `--region`, and the number is valid there |
+   | `keyword` | a hinted region; valid beats possible, then the nearest hint word |
+   | `proximity` | valid in two hinted regions with different numbers: the nearer hint word won (`ambiguous`, `runner_up` set) |
+   | `trial` | a single valid reading among `try_regions` (US/CA/+1 regions giving the same number count as one) |
+   | `format` | several readings, and the input's digit grouping matches one region's national format (`ambiguous`) |
+   | `fallback` | an exact tie: equally near hint words, or readings the format cue can't split. `on_ambiguous` applies; `first` keeps the first by rank or `try_regions` order |
+   | `default` | none of the above: `default_region` (or the first try region where it is possible) |
+
+   - **Hint words** (`regions`) are scored with the same matcher as
+     keywords: the text window (window, direction, `stop_at`, decay) and the
+     whole context (last word = distance 1), per `region_from`.
+   - **Nearness:** any hint word in the text window is nearer than every
+     context-only one. Example: "our UK office called India at 98765
+     43210" is valid only in IN, so IN wins (`keyword`). A number valid in
+     both regions goes to the nearer hint word (`proximity`), with the other
+     region logged as `runner_up`.
+   - **Possible hints wait.** A caller region or hint where the number is
+     only `possible` yields to a valid `trial` reading. The hint is then
+     logged as the runner-up.
+   - **Home numbers are protected.** The `default_region`'s `possible`
+     reading competes in `trial`. So a new home area code is not silently
+     replaced by a coincidental valid number abroad: `555-123-4567` is
+     possible in US and valid in GB, and the 3-3-4 grouping keeps it US.
+5. **Outcome:**
+   - `impossible` follows `on_invalid`.
+   - `possible` follows `on_possible`. `keep_if_score` keeps it when the
+     total score is at least `possible_min_score`.
+   - An exact tie follows `on_ambiguous`.
+   - Validation runs before `min_score` and overlaps, so a dropped number
+     never competes. A non-valid number kept gets `possible_label`, if set.
+
+### `extra`
+
+Kept matches carry `extra`:
+`{normalized, region, region_source, status, number_type, ambiguous, runner_up}`.
+- `normalized` is the number in `output_format`. It is the raw text when the
+  number is impossible or local-only.
+- `number_type` is the library's type name (`MOBILE`, `FIXED_LINE`, ...).
+  It is empty unless the number is valid.
+
+### Labels
+
+- **`coexist`.** A pair naming the pattern's `label` also covers its
+  `possible_label`.
+- **Misses.** A match relabeled to `possible_label` counts as found. A
+  candidate dropped by validation counts as "dropped".
+
+### Limits
+
+- Validation can't tell an account number from a phone number when the
+  account number fits an assigned range. Keywords still decide that.
+- **Metadata goes stale.** Results can change when you upgrade phonenumbers
+  (`pip install -U phonenumbers`). Every `validation` row records the
+  version in its `reason`. A cluster of `possible` numbers sharing an area
+  code in the [validation summary](#validation-summary) is the sign to
+  upgrade.
+- **Hint words are plain words.** No grammar: "our UK team called a client
+  in India" counts both words. They are ASCII only (no `£`, `€` or accents).
+- **Extensions** (`x204`) are not captured.
+- **Back-to-back regex hits.** The rescan only continues after a refined
+  number. A raw hit the matcher rejects is skipped whole.
+
 ## Output files
 
 `extract()` writes nothing. The CLI writes `extract_report.csv` to the working
@@ -227,13 +360,19 @@ file is gitignored.
 
 - `extract_report.csv`: the decision log, one row per decision. Columns:
   `file, kind, outcome, reason`, the `a_*` and `b_*` candidate columns
-  (`label, text, start, end, score, text_score, context_score`), then
+  (`label, text, start, end, score, text_score, context_score`), the phone
+  columns `status, region, normalized` (blank except on `validation` rows), then
   `decided_by`.
-  - `kind` is `below_min_score`, `overlap`, `coexist` or `miss`.
+  - `kind` is `below_min_score`, `overlap`, `coexist`, `miss` or `validation`.
+  - A `validation` row has one per phone candidate (`a` = the candidate):
+    - `outcome` is `kept`, `kept_flagged` or `dropped`;
+    - `decided_by` is the region source;
+    - `reason` reads e.g. `possible in US; kept: on_possible: keep; phonenumbers 9.0.43`.
   - In an `overlap` row, `a` is the winner and `b` the dropped candidate.
   - `decided_by` is machine-readable: for `overlap`, the criterion that decided
     (`score`, `length`, `priority`, or `start_label` when everything tied);
-    `coexist` for `coexist`; `min_score` for `below_min_score`; empty for `miss`.
+    `coexist` for `coexist`; `min_score` for `below_min_score`; empty for `miss`;
+    the region source for `validation`.
 - Library helpers (all optional, none called by `extract()`): `write_report_csv(decisions)`
   appends rows; `reset_report()` starts a fresh file; `open_report()` opens the
   report once for many calls (see the loop above).
@@ -250,7 +389,7 @@ row per such label, with `a_label` and `a_context_score` filled in:
 | `outcome` | Meaning | Usually fix |
 | --- | --- | --- |
 | `no_candidates` | the regex found nothing in the text | the regex |
-| `candidates_dropped` | it matched, but every candidate lost (min_score or overlap) | weights or `min_score` |
+| `candidates_dropped` | it matched, but every candidate lost (min_score, overlap or validation) | weights, `min_score` or `on_*` |
 
 The `reason` names the context words, e.g.
 `context scored phone_number +1.00 (call); no candidates in text`.
@@ -261,7 +400,8 @@ context gives no hint of can only be caught with labeled examples (the
 ## Summaries
 
 `extract.py --summarize [PATH]` prints the overlap table, then (if the report
-has any `miss` rows) the miss table. A report without a `decided_by` column
+has any `miss` rows) the miss table, then (if it has `validation` rows) the
+validation table. A report without a `decided_by` column
 is rejected: regenerate it with `--report`.
 
 ### Overlap summary
@@ -288,6 +428,23 @@ not_by_score, not_by_score_pct, no_evidence, wins, examples, hint`.
 `examples` lists up to three `file` ids; `hint` points at the regex when
 `no_candidates` dominates, otherwise at the weights.
 
+### Validation summary
+
+`summarize_validation(path="extract_report.csv")` returns one row per label
+(final label, so `possible_label` gets its own row):
+`label, checked, valid, possible, impossible, dropped, ambiguous, sources,
+clusters, examples, hint`.
+
+- `ambiguous` counts regions chosen by `proximity`, `format` or `fallback`.
+- `sources` counts each region source.
+- `clusters` groups `possible` numbers by leading digits (the area code for +1).
+- `examples` gives up to three ambiguous or dropped inputs.
+- Hints:
+  - "phonenumbers metadata may be stale, upgrade it": 3+ possible numbers
+    share leading digits.
+  - "add region hint words or pass region=": some regions were ambiguous.
+  - "tighten the regex or add try_regions": most hits were impossible.
+
 ### Tuning workflow
 
 1. Run your inputs with the report on (`--report`, or `open_report()` in a loop).
@@ -306,5 +463,9 @@ and non-coexist overlaps, tie-breaks (including an empty list), text and
 context scoring (decay, phrases, no window on the context, text/context
 parity), `keywords` reaching both sources, `context_direction`, `stop_at`,
 keyword validation and old-format errors, `decided_by`, `miss` rows, the
-report CSV and its score breakdown, both summaries, the CLI, and the public API
-as shown in the README and this reference.
+report CSV and its score breakdown, the summaries, the CLI, and the public API
+as shown in the README and this reference. Phone tests cover the `validate`
+load errors, each status and `on_*` setting, every region source (including
+the proximity tie-break), span refinement and back-to-back numbers,
+`possible_label` with coexist and misses, `extra`, the report columns and the
+validation summary.
