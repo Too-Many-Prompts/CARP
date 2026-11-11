@@ -299,6 +299,50 @@ The same text without the context scores `account_number` 1.0 against the
 first phone reading's 2.0, so the phone reading wins instead. That flip is the
 context doing its job.
 
+### Worked example: account or phone, two regions
+
+The example config with `regions: [US, GB]`. Context `customer phone`, text
+`Acct 2125550123 on file`. The number is real in the US and only the right
+shape in GB, and the context points to a phone.
+
+| Step | What happens |
+| --- | --- |
+| Find | `account_number` and `phone_number` both hit `2125550123` (5-15). The phone library confirms the span, so nothing is trimmed. |
+| Score | `account_number`: text `acct` +3 (1 word away); context `phone` -3 (the context's last word, distance 1); total **0.0**. Phone hit: no phone words in the text; context `phone` +3; total **3.0**. |
+| Validate | No `+`, no hint words, so it is parsed in each region of `regions`. US: `+12125550123` **valid**. GB: `+442125550123` only **possible**. `readings: valid_and_home` returns the valid reading and the home region's possible one; the home region (US) is already valid, so GB is not returned. |
+| `min_score` | 0.0 and 3.0 are both at or above 0. |
+| Overlap | `valid_US_number` and `account_number` share a span and are not a coexist pair. Score 3.00 > 0.00: the phone reading wins. |
+| Result | `valid_US_number`, `text` `+12125550123`, `start` 5, `end` 15, score 3.0. |
+
+The report has three rows:
+
+| kind | outcome | a_label | a_text | normalized | decided_by | reason |
+| --- | --- | --- | --- | --- | --- | --- |
+| validation | kept | valid_US_number | 2125550123 | +12125550123 | list | valid in US |
+| validation | not_returned | possible_GB_number | 2125550123 | +442125550123 | list | possible in GB; readings: valid_and_home |
+| overlap | a_wins_b_dropped | valid_US_number (b: account_number) | 2125550123 | | score | score 3.00 > 0.00 |
+
+The overlap row also has `b_text_score` 3.0 and `b_context_score` -3.0, which
+shows the context cancelling the `Acct`.
+
+What changes the outcome:
+
+- **No context:** `account_number` wins 3.0 to 0.0. Both validation rows are
+  still written; the phone reading is the loser in the overlap row.
+- **`readings: all`:** `possible_GB_number` (`+442125550123`) and
+  `valid_US_number` both come back on the span, score 3.0 each. They do not
+  compete with each other, and both beat `account_number`.
+- **A GB hint** (`hints: {GB: {london: 2}}`, text `Acct 2125550123 london
+  office`): GB is parsed first, and the number is only possible there. With the
+  default `hint_fallback: not_valid` the list is parsed too, so both readings
+  come back; the reason says `hint GB not valid; hint_fallback: not_valid
+  parsed the list too`.
+- **The same hint with `hint_fallback: never`:** only `possible_GB_number`
+  comes back. The US reading is never tried.
+- **`acct` does not lower the phone score,** because the phone pattern lists
+  `account`, not `acct`. Keywords are exact words; add `acct: -2` to the phone
+  keywords to make it count.
+
 ## Reading the report
 
 Each row of `extract_report.csv` is one decision. `kind` says which step wrote
@@ -407,6 +451,10 @@ Each pattern has up to three maps of `word: signed weight`:
   pattern (load error), so there are no precedence rules. The same word in both
   `nearby` and `context` is fine.
 - A negative weight lowers the score. Weight 0 is a load error.
+
+**Keywords match whole words exactly.** There is no stemming, no
+abbreviation and no partial match: `account` does not match `acct` or
+`accounts`. List each spelling your data uses (`account: 3, acct: 3`).
 
 Keywords are ASCII letters only. Apostrophes join a word (`don't` -> `dont`);
 spaces, hyphens, digits and everything else separate words, so the keyword

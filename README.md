@@ -14,6 +14,10 @@ CARP finds things in text with regular expressions, then decides which finds
 to trust by reading the words around them. Everything it knows lives in one
 YAML file, and every decision it makes can be written to a report.
 
+**In one sentence:** CARP finds every possible match, scores each by the words
+around it (and in the context you pass), and when two matches claim the same
+text, the higher score wins.
+
 **The full rules and the decision flow are in
 [docs/REFERENCE.md](docs/REFERENCE.md).** This page is the overview.
 
@@ -119,7 +123,9 @@ Where it is looked for depends on the key:
 | `nearby` | the text around the match only |
 | `context` | the context only |
 
-You normally write just `keywords`. See [Scoring](docs/REFERENCE.md#scoring)
+You normally write just `keywords`. **Keywords match whole words exactly:**
+there is no stemming and no abbreviation, so `account` does not match `acct`.
+List each spelling your data uses. See [Scoring](docs/REFERENCE.md#scoring)
 and [Keywords](docs/REFERENCE.md#keywords).
 
 ### Example: an overlap
@@ -139,10 +145,14 @@ phone wins on its own; add the context `"account"` and account_number wins.
 
 ## Phone numbers
 
-A pattern can hand its matches to the
-[phonenumbers](https://github.com/daviddrysdale/python-phonenumbers) library
-with a `validate:` block. CARP doesn't guess the country: each plausible
-reading of a number comes back as its own match.
+**In one sentence:** a phone match is checked in each country you list, and
+every country where it makes sense comes back as its own match, labeled with
+the country and whether it is a real number (`valid`) or just the right shape
+(`possible`).
+
+Add a `validate:` block to a pattern. It uses the
+[phonenumbers](https://github.com/daviddrysdale/python-phonenumbers) library.
+This is all most configs need:
 
 ```yaml
 - label: phone_number
@@ -151,43 +161,69 @@ reading of a number comes back as its own match.
   keywords: {phone: 3, call: 2}
   validate:
     with: phonenumbers
-    regions: [US]                        # parsed in order; the first is home
-    hints: {GB: {uk: 3}, IN: {india: 3}} # optional: words that point to a region
+    regions: [US, GB]                    # your countries; the first is home
 ```
 
-- **Labels** are `{status}_{REGION}_number`. A **valid** number in a known
-  range becomes `valid_US_number`, and its `text` is the number in E.164
-  form (`+12125550123`). Set `output_format` to `INTERNATIONAL`, `NATIONAL` or
-  `RAW` (the text as written) to change that. The right length in an unknown range (a new area
-  code, say) becomes `possible_US_number`. Nothing is lost.
-- **Impossible hits** (wrong length everywhere) are dropped and logged in the
-  report.
-- **Where a number is parsed**, in order:
-  1. A leading `+`: the country code decides.
-  2. The regions whose hint words appear. `hint_fallback` decides whether
-     the list is also parsed: by default only when no hinted reading is
-     valid (`not_valid`); or `impossible`, `always`, `never`.
-  3. Every region in `regions`. `readings` chooses what comes back; by
-     default, every valid reading plus the home region's possible one.
-- **Several valid readings.** When a number is valid in several hinted
-  regions, all of them are returned. Set `hint_conflict: nearest` to keep
-  only the one whose hint word is nearest.
-- `coexist` and the summaries use the pattern label (`phone_number`), so a
-  rule written for it covers every reading.
+What comes back:
 
-```text
-text:    "our UK office called India at 98765 43210"
-match:   valid_IN_number  text +919876543210  (fits IN, not GB)
+- **The label says what was found:** `valid_US_number` is a real US number;
+  `possible_GB_number` has the right length for GB but is in a range the
+  library doesn't know (a new area code, say). Nothing is lost for being new.
+- **`text` is the number, cleaned up:** `+12125550123`. `start`/`end` still
+  point at the number as written.
+- **A number that fits nowhere** (wrong length everywhere) is dropped, and the
+  report says why.
+
+### The settings, as questions
+
+Every setting except `regions` has a default you can leave alone.
+
+| Your question | Setting | Default |
+| --- | --- | --- |
+| Which countries are my numbers from? | `regions` | required |
+| Are there words that say which country (`uk`, `london`)? | `hints` | none |
+| Do I want maybe-numbers, or only real ones? | `readings` | real ones, plus maybe-numbers for the home country |
+| Should a country word replace my list? | `hint_fallback` | only if the hinted country gives a real number |
+| A number is real in two hinted countries: keep both? | `hint_conflict` | both |
+| How should `text` be written? | `output_format` | `+12125550123` (`INTERNATIONAL`, `NATIONAL`, `RAW` = as written) |
+
+The exact rule, with every branch, is the
+[phone decision flow](docs/REFERENCE.md#phone-decision-flow).
+
+### Example: account number or phone number?
+
+With `regions: [US, GB]`, context `"customer phone"`, text
+`"Acct 2125550123 on file"`:
+
+| Step | `account_number` | phone hit |
+| --- | --- | --- |
+| Find | `2125550123` | the same `2125550123` |
+| Text score | `acct` next to it: **+3** | none of its words nearby: **0** |
+| Context score | `phone` (the context's last word): **-3** | `phone`: **+3** |
+| Total | **0.0** | **3.0** |
+| Check | | real in the US (`valid_US_number`); only the right shape in GB, so not returned, but logged |
+| Overlap | loses, 0.0 < 3.0 | **wins** |
+
+```json
+[{"label": "valid_US_number", "text": "+12125550123", "start": 5, "end": 15, "score": 3.0}]
 ```
 
-Without `hints`, the same text gives `possible_US_number`, since 10 digits
-fit the US length. Add `hints` or `regions` for the countries in your data;
-every listed region also adds readings, though, junk included.
+- **Without the context,** `account_number` wins 3.0 to 0.0. The context alone
+  flips the answer.
+- **With `readings: all`,** both `valid_US_number` and `possible_GB_number`
+  come back on the same span. Readings of one number never compete with each
+  other.
+- **`acct` didn't count against the phone hit,** because the phone pattern
+  lists `account`, not `acct`. Keywords are exact words.
+
+The report has a row for each of these decisions, including the GB reading
+that wasn't returned. The full walk-through, row by row, is in
+[the reference](docs/REFERENCE.md#worked-example-account-or-phone-two-regions).
 
 Results can change when you upgrade phonenumbers, because its data changes;
-every report row records the version. See
-[Phone numbers](docs/REFERENCE.md#phone-numbers) and the
-[phone decision flow](docs/REFERENCE.md#phone-decision-flow).
+every report row records the version. `coexist` and the summaries use the
+pattern label (`phone_number`), so a rule written for it covers every reading.
+See [Phone numbers](docs/REFERENCE.md#phone-numbers).
 
 ## Setup
 
@@ -231,6 +267,10 @@ with open_report() as write:           # opens the file once, holds nothing in m
 ```
 
 ## Seeing why
+
+**When a result surprises you, read its row in the report.** That is the normal
+way to tune CARP: run, look at the row that explains the surprise, change a
+weight, run again.
 
 Add `--report` to the CLI, or write `decisions` from the library. That
 produces `extract_report.csv` with one row per decision and each score split
