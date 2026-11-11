@@ -91,9 +91,46 @@ print(format_validation(summarize_validation()))  # phone validation, printed la
 ## Decision flow
 
 What happens to every piece of text, and which report row each decision
-leaves. Read the diagrams top to bottom.
+leaves. Read the steps top to bottom; each flow also has a diagram you can
+expand.
 
 ### From text to matches
+
+Each candidate goes through these steps in order. The tag after an arrow is the
+report row the step writes.
+
+1. **Normalize.** Text and context: whitespace, dashes, quotes (only the
+   options you enabled).
+2. **Run every pattern's regex on its own.**
+   - **no hit** → nothing to decide for that pattern.
+3. **Is it a phone pattern (has `validate`)?**
+   - **yes** → trim or split the hit with PhoneNumberMatcher. If it finds
+     nothing, the raw hit stays.
+   - **no** → use the hit as it is.
+4. **Score: text score + context score.** A phone reading keeps the score of
+   the hit it came from.
+5. **Phone pattern?**
+   - **yes** → run the [phone flow](#phone-decision-flow). It returns zero or
+     more readings.
+     - **no reading** → the hit is dropped and logged. → `row: validation, dropped`
+   - **no** → go to step 6.
+6. **Score at least `min_score`?**
+   - **no** → the candidate is dropped. → `row: below_min_score`
+   - **yes** → continue.
+7. **Overlaps a candidate already accepted?** Candidates are taken best first,
+   in `overlap_tiebreak` order.
+   - **no** → the candidate is kept. → *no row*
+   - **yes** → go to step 8.
+8. **Coexist pair, or readings of one phone number?**
+   - **yes** → both are kept. Readings of one number never compete with each
+     other. → `row: coexist` (pairs only)
+   - **no** → run the [tie-break chain](#tie-break-chain). The loser is
+     dropped. → `row: overlap`
+9. **Misses, at the end.** Each label the context scored above 0 that has no
+   match gets a `miss` row.
+
+<details>
+<summary>Same flow as a diagram</summary>
 
 ```mermaid
 flowchart TD
@@ -119,6 +156,8 @@ flowchart TD
     M --> X3["loser dropped<br/>row: overlap"]
 ```
 
+</details>
+
 - **Scoring comes before the phone check**, so a phone reading keeps the score
   of the hit it came from.
 - **Candidates are taken best first**, in `overlap_tiebreak` order, and each
@@ -126,13 +165,44 @@ flowchart TD
   the lower-ranked one.
 - **A candidate that survives with no overlap writes no row.** Rows record
   decisions; nothing was decided.
-- **Misses are added at the end:** each label the context scored above 0 that
-  has no match gets a `miss` row (see [Misses](#misses)).
+- **Misses** are explained in [Misses](#misses).
 
 ### Phone decision flow
 
-For one phone-shaped hit, in a pattern with a `validate:` block. The result is
-zero or more readings; each reading becomes a match.
+For one phone-shaped hit in a pattern with a `validate:` block. The result is
+zero or more readings, and each reading becomes a match.
+
+1. **Does the number start with `+`?**
+   - **yes, possible** → parse it with its own country code: one reading,
+     source `number`. **Done.**
+   - **yes, not possible** → the hit is dropped. → `row: validation, dropped`
+   - **no** → go to step 2.
+2. **Are there hint words for any region?**
+   - **no** → go to step 5.
+   - **yes** → parse in the hinted regions: valid readings, else possible
+     ones. `hint_conflict` (`all` or `nearest`) picks among regions.
+3. **Did any hinted region give a reading?**
+   - **none** → with `hint_fallback: never` the hit is dropped; otherwise go
+     to step 5.
+   - **some** → go to step 4.
+4. **What does `hint_fallback` say?**
+   - **`never`, `impossible`** → return the hinted readings only, source
+     `hint`. **Done.**
+   - **`not_valid`** → is any hinted reading valid? Yes: return the hinted
+     readings only (**done**). No: go to step 5.
+   - **`always`** → go to step 5. The hinted readings stay.
+5. **Parse in each region of `regions`.** Keep what `readings` allows, and add
+   the readings you already have from the hints, if any.
+   - **some readings** → return them, sources `hint` and `list`. **Done.**
+   - **none** → go to step 6.
+6. **Does it start with `00`?**
+   - **yes, and possible when `00` is read as `+`** → one reading, source
+     `number`. **Done.**
+   - **otherwise** → the hit is dropped, with the reason in the report.
+     → `row: validation, dropped`
+
+<details>
+<summary>Same flow as a diagram</summary>
 
 ```mermaid
 flowchart TD
@@ -161,6 +231,8 @@ flowchart TD
     N -- "no" --> X
 ```
 
+</details>
+
 - **Never a guess about the country.** Every reading that survives is
   returned, labeled with its status and region (`valid_US_number`,
   `possible_GB_number`).
@@ -175,7 +247,23 @@ flowchart TD
 ### Tie-break chain
 
 When two candidates overlap and are not a `coexist` pair, `overlap_tiebreak`
-is applied in the order you list it. This is the default order:
+runs these in order. A criterion you leave out is skipped.
+
+1. **Does the score differ?**
+   - **yes** → the higher score wins. → `decided_by: score`
+   - **no** → next criterion.
+2. **Does the length differ?**
+   - **yes** → the longer match wins. → `decided_by: length`
+   - **no** → next criterion.
+3. **Does the priority differ?**
+   - **yes** → the lower number wins. → `decided_by: priority`
+   - **no** → last resort.
+4. **Still tied.** The earlier start wins, then the label.
+   → `decided_by: start_label` (nothing in your input decided it; add
+   keywords)
+
+<details>
+<summary>Same flow as a diagram</summary>
 
 ```mermaid
 flowchart TD
@@ -188,8 +276,9 @@ flowchart TD
     D -- "no" --> W4["earlier start, then label<br/>decided_by: start_label"]
 ```
 
-A criterion you leave out of `overlap_tiebreak` is skipped. An empty list goes
-straight to `start_label`. A `start_label` result in the summary means nothing
+</details>
+
+An empty `overlap_tiebreak` goes straight to `start_label`. A `start_label` result in the summary means nothing
 in your input decided it, which is the cue to add keywords.
 
 ### Worked example
