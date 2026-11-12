@@ -790,6 +790,7 @@ def _row(a: str, b: str, by: str, file: str = "f",
          outcome: str = "") -> dict[str, Any]:
     row = dict.fromkeys(REPORT_FIELDS, "")
     row.update(file=file, kind=kind, a_label=a, b_label=b, decided_by=by,
+               a_pattern=a, b_pattern=b,
                a_start=a_span[0], a_end=a_span[1], outcome=outcome,
                b_start=b_span[0], b_end=b_span[1], a_text=a_text, b_text=b_text)
     return row
@@ -844,11 +845,11 @@ def test_summary_sort_order() -> None:
     assert [r["pair"] for r in summarize_overlaps()] == ["e/f", "g/h", "c/d", "a/b", "i/j"]
 
 
-def test_summary_needs_decided_by_column() -> None:
-    with open("old.csv", "w", encoding="utf-8") as fh:
+def test_summary_rejects_a_csv_without_the_report_columns() -> None:
+    with open("other.csv", "w", encoding="utf-8") as fh:
         fh.write("file,kind,outcome,reason\n,overlap,a_wins_b_dropped,x\n")
-    with pytest.raises(ValueError, match="regenerate it with --report"):
-        summarize_overlaps("old.csv")
+    with pytest.raises(ValueError, match=r"not a CARP report \(missing columns: a_label"):
+        summarize_overlaps("other.csv")
 
 
 def test_summary_of_real_report(tmp_path: Path) -> None:
@@ -943,13 +944,13 @@ def test_summarize_misses_of_real_report() -> None:
     assert (row["label"], row["no_candidates"], row["examples"]) == ("phone_number", 1, "doc")
 
 
-def test_summarize_misses_empty_and_old_report() -> None:
+def test_summarize_misses_empty_and_non_report() -> None:
     _report([_row("a", "b", "score")])
     assert summarize_misses() == []
-    with open("old.csv", "w", encoding="utf-8") as fh:
+    with open("other.csv", "w", encoding="utf-8") as fh:
         fh.write("file,kind\n,miss\n")
-    with pytest.raises(ValueError, match="regenerate it with --report"):
-        summarize_misses("old.csv")
+    with pytest.raises(ValueError, match="not a CARP report"):
+        summarize_misses("other.csv")
 
 
 # ------------------------------------------------- --summarize CLI

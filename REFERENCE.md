@@ -59,7 +59,10 @@ and `context_score` (`score` is their sum). Offsets refer to the
 number (see [Phone numbers](#phone-numbers)); `text[start:end]` of the input
 gives the written form. `decisions` is the flat decision log (see
 [Output files](#output-files)); ignore it, keep it, or write it with the helpers
-below. `source` fills its `file` column.
+below. `source` fills its `file` column. When one report holds many texts,
+give each call its own `source` (as below): the validation summary tells phone
+hits apart by `file`, offsets and written text, so two texts with the same or
+a blank `source` can have their hits counted as one.
 
 Looping over many inputs, writing the report as you go:
 
@@ -731,8 +734,8 @@ context gives no hint of can only be caught with labeled examples (the
 
 `extract.py --summarize [PATH]` prints the overlap table, then (if the report
 has any `miss` rows) the miss table, then (if it has `validation` rows) the
-validation table. A report without a `decided_by` column
-is rejected: regenerate it with `--report`.
+validation table. A CSV missing any report column the summaries read is
+rejected ("not a CARP report").
 
 ### Overlap summary
 

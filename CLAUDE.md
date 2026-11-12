@@ -138,6 +138,10 @@ string, and resolves overlapping matches.
 - With `--report`, `main()` writes the decisions as CSV, one row per decision,
   to `./extract_report.csv` (`write_report_csv()` / `open_report()`),
   overwriting it. Library callers may use the same helpers.
+  When one report holds many texts, each `extract()` call needs its own
+  `source`: `summarize_validation` tells hits apart by `file`, offsets and
+  written text (no hit id in the report). A report missing a column the
+  summaries read fails ("not a CARP report"); there is no older-format handling.
 
 ## Tests
 - `test_extract.py` (pytest) loads the `tests` section of the config and checks

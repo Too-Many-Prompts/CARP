@@ -26,7 +26,7 @@ DEFAULT_REPORT_PATH = "extract_report.csv"
 COLUMNS_USED = (
     "file", "kind", "a_label", "a_text", "a_start", "a_end",
     "b_label", "b_text", "b_start", "b_end", "decided_by", "outcome",
-    "status", "region", "normalized", "a_pattern",
+    "status", "region", "normalized", "a_pattern", "b_pattern",
 )
 
 SUMMARY_CRITERIA = ("score", "length", "priority", "start_label")
@@ -85,14 +85,14 @@ def _example(row: dict[str, str]) -> str:
 
 
 def summarize_overlaps(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]]:
-    """Summarize a report CSV's `overlap` rows by pattern pair (`a_pattern`; the label in older reports).
+    """Summarize a report CSV's `overlap` rows by pattern pair (`a_pattern` / `b_pattern`).
 
     Shows which pairs overlap most often without being resolved by score:
     counts per deciding criterion, `no_evidence` (decided by priority or
     start/label, i.e. nothing in the input), up to three example inputs and
     a hint. Rows are streamed; memory stays bounded per pair. Sorted by
     no_evidence, not_by_score, overlaps (highest first), then pair.
-    Raises ValueError if the report has no `decided_by` column.
+    Raises ValueError if the CSV lacks a report column (COLUMNS_USED).
     """
     stats: dict[str, _PairStats] = {}
     fh, reader = _open_report(path)
@@ -101,9 +101,9 @@ def summarize_overlaps(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]]:
             if row.get("kind") != "overlap":
                 continue
             # By pattern, so every phone reading counts for its pattern and the
-            # pair can go straight into `coexist`. Older reports: the label.
-            a = row.get("a_pattern") or row.get("a_label", "")
-            b = row.get("b_pattern") or row.get("b_label", "")
+            # pair can go straight into `coexist`.
+            a = row.get("a_pattern", "")
+            b = row.get("b_pattern", "")
             st = stats.setdefault("/".join(sorted((a, b))), _PairStats())
             by = row.get("decided_by", "")
             st.by[by] += 1
@@ -157,15 +157,13 @@ def format_summary(rows: list[dict[str, Any]]) -> str:
 
 
 def _open_report(path: str) -> tuple[Any, csv.DictReader]:
-    """Open a report CSV; fail if it predates the decided_by column."""
+    """Open a report CSV; fail if it lacks a column this module reads."""
     fh = open(path, encoding="utf-8", errors="replace", newline="")
     reader = csv.DictReader(fh)
-    if "decided_by" not in (reader.fieldnames or []):
+    missing = [c for c in COLUMNS_USED if c not in (reader.fieldnames or [])]
+    if missing:
         fh.close()
-        raise ValueError(
-            f"{path}: no decided_by column; the report is from an older "
-            "version, regenerate it with --report"
-        )
+        raise ValueError(f"{path}: not a CARP report (missing columns: {', '.join(missing)})")
     return fh, reader
 
 
@@ -176,7 +174,7 @@ def summarize_misses(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]]:
     `no_candidates`: its regex found nothing in the text (a regex gap);
     `dropped`: it had candidates but all lost (min_score or overlap; tuning).
     Sorted by misses (highest first), then label. Raises ValueError if the
-    report has no `decided_by` column.
+    CSV lacks a report column (COLUMNS_USED).
     """
     counts: dict[str, Counter] = {}
     examples: dict[str, list[str]] = {}
@@ -236,8 +234,10 @@ def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]
     first), then pattern.
 
     A hit's rows are written together, so hits are told apart by row order
-    (_HitCounter), not by offsets alone: two texts scanned with a blank
-    `file` (source) can have a hit at the same offsets.
+    (_HitCounter), not by offsets alone. When one report holds many texts,
+    give each extract() call its own `source`: two texts with the same (or a
+    blank) source, a hit at the same offsets and the same written text but
+    different readings, written back to back, count as one hit.
     """
     stats: dict[str, dict[str, Any]] = {}
     hit_of = _HitCounter()
@@ -247,7 +247,7 @@ def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]
             if row.get("kind") != "validation":
                 hit_of.gap()
                 continue
-            pattern = row.get("a_pattern") or row.get("a_label", "")
+            pattern = row.get("a_pattern", "")
             st = stats.setdefault(pattern, {
                 "out": Counter(), "status": Counter(), "sources": Counter(),
                 "regions": Counter(), "clusters": Counter(), "hits": Counter(),
