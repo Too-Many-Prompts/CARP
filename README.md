@@ -19,7 +19,7 @@ around it (and in the context you pass), and when two matches claim the same
 text, the higher score wins.
 
 **The full rules and the decision flow are in
-[docs/REFERENCE.md](docs/REFERENCE.md).** This page is the overview.
+[REFERENCE.md](REFERENCE.md).** This page is the overview.
 
 ## Why CARP
 
@@ -42,10 +42,6 @@ CARP adds that missing step:
   phone metadata, and a number in a range the library doesn't know yet is kept
   as `possible`, not thrown away. Labels the context pointed to that produced
   nothing are flagged as likely misses.
-
-Good fit: extracting IDs, dates, amounts and phone numbers from invoices,
-emails, tickets and logs, where several patterns can match the same digits.
-Not a fit: free-form language understanding. CARP only scores words you list.
 
 ## How to use it
 
@@ -88,17 +84,6 @@ The shipped `extraction_config.yaml` has these two patterns and several more.
 
 ## How it decides
 
-```mermaid
-flowchart LR
-    T["text"] --> N["1. normalize"]
-    N --> F["2. find candidates<br/>every regex, separately"]
-    F --> SC["3. score = text score + context score"]
-    C["context string, optional"] --> SC
-    SC --> D["4. drop below min_score"]
-    D --> O["5. resolve overlaps<br/>coexist or tie-break"]
-    O --> R["matches + decisions"]
-```
-
 1. **Normalize** the text: whitespace, dashes, quotes.
 2. **Find candidates.** Every regex runs on the text on its own, so
    overlaps stay visible.
@@ -110,7 +95,7 @@ flowchart LR
    Otherwise apply `overlap_tiebreak` in order: score, length, priority.
 
 Phone patterns add a check between steps 3 and 4. The
-[decision flow](docs/REFERENCE.md#decision-flow) in the reference shows every
+[decision flow](REFERENCE.md#decision-flow) in the reference shows every
 branch as a diagram.
 
 ### Keywords
@@ -126,23 +111,8 @@ Where it is looked for depends on the key:
 
 You normally write just `keywords`. **Keywords match whole words exactly:**
 there is no stemming and no abbreviation, so `account` does not match `acct`.
-List each spelling your data uses. See [Scoring](docs/REFERENCE.md#scoring)
-and [Keywords](docs/REFERENCE.md#keywords).
-
-### Example: an overlap
-
-`2125550123` matches both `phone_number` and `account_number`:
-
-```text
-text:     "acct 2125550123"
-                ^^^^^^^^^^
-candidates: account_number  score 3.0   ("acct" is next to it, weight 3)
-            phone_number    score 0.0   (no phone words nearby)
-result:     account_number wins, decided_by = score
-```
-
-The context can tip the same overlap. With the text `"2125550123 call"`,
-phone wins on its own; add the context `"account"` and account_number wins.
+List each spelling your data uses. See [Scoring](REFERENCE.md#scoring)
+and [Keywords](REFERENCE.md#keywords).
 
 ## Phone numbers
 
@@ -175,59 +145,12 @@ What comes back:
 - **A number that fits nowhere** (wrong length everywhere) is dropped, and the
   report says why.
 
-### The settings, as questions
-
-Every setting except `regions` has a default you can leave alone.
-
-| Your question | Setting | Default |
-| --- | --- | --- |
-| Which countries are my numbers from? | `regions` | required |
-| Are there words that say which country (`uk`, `london`)? | `hints` | none |
-| Do I want maybe-numbers, or only real ones? | `keep` | real ones, plus maybe-numbers for the home country |
-| Should a country word replace my list? | `hint_fallback` | only if the hinted country gives a real number |
-| A number is real in two hinted countries: keep both? | `hint_conflict` | both |
-| How should `text` be written? | `output_format` | `+12125550123` (`INTERNATIONAL`, `NATIONAL`, `RAW` = as written) |
-| Should a real number survive a low score? | `valid_ignores_min_score` | yes: a valid number is never dropped by `min_score` (it can still lose an overlap) |
+### YAML Config
 
 Each option's values are listed in
-[Config options](docs/REFERENCE.md#validate-inside-a-pattern). The exact rule,
+[Config options](REFERENCE.md#validate-inside-a-pattern). The exact rule,
 with every branch, is the
-[phone decision flow](docs/REFERENCE.md#phone-decision-flow).
-
-### Example: account number or phone number?
-
-With `regions: [US, GB]`, context `"customer phone"`, text
-`"Acct 2125550123 on file"`:
-
-| Step | `account_number` | phone hit |
-| --- | --- | --- |
-| Find | `2125550123` | the same `2125550123` |
-| Text score | `acct` next to it: **+3** | none of its words nearby: **0** |
-| Context score | `phone` (the context's last word): **-3** | `phone`: **+3** |
-| Total | **0.0** | **3.0** |
-| Check | | real in the US (`valid_US_number`); only the right shape in GB, so not kept (`keep`), but logged |
-| Overlap | loses, 0.0 < 3.0 | **wins** |
-
-```json
-[{"label": "valid_US_number", "text": "+12125550123", "start": 5, "end": 15, "score": 3.0}]
-```
-
-- **Without the context,** `account_number` wins 3.0 to 0.0. The context alone
-  flips the answer.
-- **With `keep: all`,** both `valid_US_number` and `possible_GB_number`
-  come back on the same span. Readings of one number never compete with each
-  other.
-- **`acct` didn't count against the phone hit,** because the phone pattern
-  lists `account`, not `acct`. Keywords are exact words.
-
-The report has a row for each of these decisions, including the GB reading
-that wasn't kept. The full walk-through, row by row, is in
-[the reference](docs/REFERENCE.md#worked-example-account-or-phone-two-regions).
-
-Results can change when you upgrade phonenumbers, because its data changes;
-every report row records the version. `coexist` and the summaries use the
-pattern label (`phone_number`), so a rule written for it covers every reading.
-See [Phone numbers](docs/REFERENCE.md#phone-numbers).
+[phone decision flow](REFERENCE.md#phone-decision-flow).
 
 ## Setup
 
