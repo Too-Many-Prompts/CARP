@@ -1413,7 +1413,7 @@ def test_impossible_hit_is_dropped_and_logged(tmp_path: Path) -> None:
     assert matches == []
     (row,) = vrows(decisions)
     assert (row["outcome"], row["status"], row["normalized"], row["a_text"]) == (
-        "dropped", "impossible", "94105-1234", "94105-1234")
+        "dropped", "impossible", "", "94105-1234")
     assert "impossible in US" in row["reason"] and "TOO_SHORT" in row["reason"]
 
 
@@ -1844,3 +1844,113 @@ def test_summarize_cli_prints_validation_table(
 def test_report_phone_columns_sit_before_decided_by() -> None:
     assert REPORT_FIELDS[-4:] == ("status", "region", "normalized", "decided_by")
     assert "a_pattern" in REPORT_FIELDS and "b_pattern" in REPORT_FIELDS
+
+
+# ---- code-review fixes
+def test_idd_number_is_labeled_by_its_country(tmp_path: Path) -> None:
+    """011 44 parsed in US is a UK number: its label and region say GB, not US."""
+    matches, decisions = run_phone(tmp_path, "call 011 44 20 7946 095")
+    assert got(matches) == [("possible_GB_number", "+44207946095")]
+    (row,) = vrows(decisions)
+    assert (row["region"], row["normalized"]) == ("GB", "+44207946095")
+    assert "possible in GB" in row["reason"]
+
+
+def test_plus_number_too_short_for_a_full_number_is_dropped(tmp_path: Path) -> None:
+    matches, decisions = run_phone(tmp_path, "tel +1 555 0123")
+    assert matches == []
+    (row,) = vrows(decisions)
+    assert (row["outcome"], row["decided_by"], row["normalized"]) == ("dropped", "number", "")
+    assert "possible only as a local number" in row["reason"]
+
+
+def test_non_geographic_number_gets_region_001(tmp_path: Path) -> None:
+    matches, decisions = run_phone(tmp_path, "free +800 1234 5678")
+    assert got(matches) == [("valid_001_number", "+80012345678")]
+    assert vrows(decisions)[0]["region"] == "001"
+
+
+def test_local_only_reading_has_blank_normalized(tmp_path: Path) -> None:
+    matches, decisions = run_phone(tmp_path, "dial 555-1234")
+    assert got(matches) == [("possible_US_number", "555-1234")]
+    (row,) = vrows(decisions)
+    assert (row["status"], row["normalized"], row["a_text"]) == ("possible", "", "555-1234")
+
+
+def test_normalized_column_is_e164_or_blank(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, [phone_pattern(regions=["US", "GB"], keep="all")])
+    texts = ["call 212-555-0123", "dial 555-1234", "zip 94105-1234", "tel +1 555 0123",
+             "call 011 44 20 7946 095", "+44 20 7946 0958"]
+    for text in texts:
+        for row in vrows(extract(text, cfg)[1]):
+            assert row["normalized"] == "" or re.fullmatch(r"\+\d{6,15}", row["normalized"]), row
+
+
+@pytest.mark.parametrize("where, raw, message", [
+    ("top", {"setings": {}}, r"config: unknown key 'setings' \(expected one of settings, "),
+    ("settings", {"min_scor": 1}, r"settings: unknown key 'min_scor' \(expected one of .*stop_at"),
+    ("normalize", {"collapse_space": True}, r"normalize: unknown key 'collapse_space'"),
+    ("pattern", {"neaby": {"call": 1}}, r"pattern 'p': unknown key 'neaby' \(expected one of .*validate"),
+    ("pattern", {"validat": {"with": "phonenumbers"}}, r"pattern 'p': unknown key 'validat'"),
+])
+def test_unknown_config_keys_fail(tmp_path: Path, where: str, raw: dict, message: str) -> None:
+    settings = {"context_window_words": 8, "distance_decay": True, "min_score": 0,
+                "case_sensitive": False, "overlap_tiebreak": []}
+    pattern = {"label": "p", "priority": 1, "regex": r"\d+"}
+    cfg: dict[str, Any] = {"settings": settings, "normalize": {}, "patterns": [pattern]}
+    if where == "top":
+        cfg.update(raw)
+    elif where == "settings":
+        settings.update(raw)
+    elif where == "normalize":
+        cfg["normalize"] = raw
+    else:
+        pattern.update(raw)
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        load_config(path)
+
+
+def test_blank_validate_block_fails(tmp_path: Path) -> None:
+    pattern = {"label": "ph", "priority": 1, "regex": PHONE_RE, "validate": None}
+    with pytest.raises(ValueError, match=r"pattern 'ph': validate is empty"):
+        make_cfg(tmp_path, [pattern])
+
+
+def test_summarize_validation_separates_hits_at_same_offsets(tmp_path: Path) -> None:
+    """Hits from different texts with a blank source and equal offsets stay apart."""
+    cfg = make_cfg(tmp_path, [phone_pattern()])
+    reset_report()
+    with open_report() as write:
+        for text in ["call 212-555-0123", "call 212-555-0123", "call 415-555-0123"]:
+            write(extract(text, cfg)[1])
+    (row,) = summarize_validation()
+    assert (row["hits"], row["kept"], row["multi"]) == (3, 3, 0)
+    assert summarize.HINT_MULTI not in row["hint"]
+
+
+def test_summarize_validation_still_counts_multi_reading_hits(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path, [phone_pattern(regions=["US", "GB"], keep="all")])
+    reset_report()
+    with open_report() as write:
+        for _ in range(2):
+            write(extract("call 221-234-5678", cfg)[1])
+    (row,) = summarize_validation()
+    assert (row["hits"], row["multi"]) == (2, 2)
+
+
+def test_region_hints_are_computed_once_for_unrefined_spans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import extract as ex
+    cfg = make_cfg(tmp_path, [phone_pattern(regions=["US", "GB"], hints={"GB": {"london": 1}})])
+    calls: list[tuple[int, int]] = []
+    real = ex._region_hints
+    def spy(text: str, start: int, end: int, *a: Any) -> Any:
+        calls.append((start, end))
+        return real(text, start, end, *a)
+    monkeypatch.setattr(ex, "_region_hints", spy)
+    matches, _ = ex.extract("london office 020 7946 0958", cfg)
+    assert got(matches) == [("valid_GB_number", "+442079460958")]
+    assert len(calls) == 1

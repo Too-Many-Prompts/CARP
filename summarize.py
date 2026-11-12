@@ -234,12 +234,18 @@ def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]
     an area code suggests the library's metadata is stale), up to three
     examples of multi or dropped hits, and a hint. Sorted by hits (highest
     first), then pattern.
+
+    A hit's rows are written together, so hits are told apart by row order
+    (_HitCounter), not by offsets alone: two texts scanned with a blank
+    `file` (source) can have a hit at the same offsets.
     """
     stats: dict[str, dict[str, Any]] = {}
+    hit_of = _HitCounter()
     fh, reader = _open_report(path)
     with fh:
         for row in reader:
             if row.get("kind") != "validation":
+                hit_of.gap()
                 continue
             pattern = row.get("a_pattern") or row.get("a_label", "")
             st = stats.setdefault(pattern, {
@@ -247,7 +253,7 @@ def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]
                 "regions": Counter(), "clusters": Counter(), "hits": Counter(),
                 "texts": {},
             })
-            hit = (row.get("file", ""), row.get("a_start", ""), row.get("a_end", ""))
+            hit = hit_of(row)
             outcome = row.get("outcome", "")
             st["out"][outcome] += 1
             st["texts"].setdefault(hit, row.get("a_text", ""))
@@ -298,6 +304,37 @@ def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]
         })
     out.sort(key=lambda r: (-r["hits"], r["pattern"]))
     return out
+
+
+class _HitCounter:
+    """Give each validation row the id of its hit: (file, serial number).
+
+    One hit's rows are consecutive and share file, pattern, offsets and the
+    written text (a_text), and no two of its readings share (region,
+    normalized). So a new hit starts when any of those differ from the
+    previous row, a non-validation row came between (gap()), the previous
+    row was a `dropped` one (a hit's only row), or a reading repeats.
+    """
+
+    def __init__(self) -> None:
+        self.serial = 0
+        self.last: tuple[str, ...] | None = None
+        self.readings: set[tuple[str, str]] = set()
+        self.closed = True
+
+    def gap(self) -> None:
+        self.closed = True
+
+    def __call__(self, row: dict[str, str]) -> tuple[str, int]:
+        same = tuple(row.get(k, "") or "" for k in ("file", "a_pattern", "a_start", "a_end", "a_text"))
+        reading = (row.get("region", "") or "", row.get("normalized", "") or "")
+        if self.closed or same != self.last or reading in self.readings:
+            self.serial += 1
+            self.readings = set()
+        self.last = same
+        self.readings.add(reading)
+        self.closed = row.get("outcome") == "dropped"
+        return (same[0], self.serial)
 
 
 def _top(counter: Counter, n: int = 3) -> list[tuple[str, int]]:

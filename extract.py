@@ -78,7 +78,8 @@ REPORT_FIELDS = (
 )
 # decided_by: overlap -> score | length | priority | start_label;
 # coexist -> coexist; below_min_score -> min_score; miss -> "";
-# validation -> the region source (phone.SOURCES: number | hint | list).
+# validation -> the region source (phone.SOURCES: number | hint | regions).
+# normalized: always E.164; blank when there is none (dropped hit, local-only reading).
 # miss outcome: no_candidates (regex gap) | candidates_dropped (tuning).
 # validation outcome: kept | not_kept (a reading filtered out) | dropped (impossible).
 REQUIRED_SETTINGS = (
@@ -88,6 +89,11 @@ REQUIRED_SETTINGS = (
     "case_sensitive",
     "overlap_tiebreak",
 )
+# Every key load_config accepts; anything else fails, naming these.
+CONFIG_KEYS = ("settings", "normalize", "patterns", "coexist", "tests")
+SETTINGS_KEYS = REQUIRED_SETTINGS + ("context_direction", "stop_at")
+NORMALIZE_KEYS = ("unicode_dashes_to_hyphen", "smart_quotes_to_ascii", "collapse_whitespace")
+PATTERN_KEYS = ("label", "regex", "priority", "keywords", "nearby", "context", "validate")
 
 # extract() accepts: plain text, {"text": ..., "context": ...}, or (context, text).
 ExtractInput = Union[str, dict, tuple]
@@ -307,12 +313,30 @@ def _load_keywords(
     return nearby, context
 
 
+def _check_keys(mapping: Any, allowed: Sequence[str], where: str) -> None:
+    """Fail on the first key of `mapping` not in `allowed`, naming the allowed
+    ones. A non-map is left to _require, which names the missing key."""
+    if not isinstance(mapping, dict):
+        return
+    for key in mapping:
+        if key not in allowed:
+            raise ValueError(
+                f"{where}: unknown key '{key}' (expected one of {', '.join(allowed)})"
+            )
+
+
 def load_config(path: str | Path) -> Config:
     """Read the YAML config and compile every regex once."""
     with open(path, encoding="utf-8", errors="replace") as fh:
         raw = yaml.safe_load(fh)
 
+    _check_keys(raw, CONFIG_KEYS, "config")
     settings = _require(raw, "settings", "config")
+    _check_keys(settings, SETTINGS_KEYS, "settings")
+    norm = raw.get("normalize") or {}
+    if not isinstance(norm, dict):
+        raise ValueError(f"normalize: expected a map of option: true/false, got {type(norm).__name__}")
+    _check_keys(norm, NORMALIZE_KEYS, "normalize")
     for key in REQUIRED_SETTINGS:
         _require(settings, key, "settings")
     # A blank `overlap_tiebreak:` (None) means "no criteria", same as [].
@@ -345,6 +369,7 @@ def load_config(path: str | Path) -> Config:
     seen: set[str] = set()
     for entry in _require(raw, "patterns", "config"):
         label = str(_require(entry, "label", "pattern"))
+        _check_keys(entry, PATTERN_KEYS, f"pattern '{label}'")
         if label in seen:
             raise ValueError(f"pattern '{label}': duplicate label")
         seen.add(label)
@@ -354,10 +379,14 @@ def load_config(path: str | Path) -> Config:
             raise ValueError(f"pattern '{label}': invalid regex: {exc}") from exc
 
         nearby, context = _load_keywords(label, entry)
-        spec = (
-            phone.load_validate(label, entry["validate"], _weight_map)
-            if entry.get("validate") is not None else None
-        )
+        spec = None
+        if "validate" in entry:
+            if entry["validate"] is None:
+                raise ValueError(
+                    f"pattern '{label}': validate is empty; give it keys "
+                    f"({', '.join(phone.VALIDATE_KEYS)}) or remove it"
+                )
+            spec = phone.load_validate(label, entry["validate"], _weight_map)
         patterns.append(
             Pattern(
                 label=label,
@@ -468,16 +497,17 @@ DistanceFinder = Callable[[list[str]], Union[int, None]]
 
 def _sum_keywords(
     weights: dict[str, float], find: DistanceFinder, decay: bool
-) -> tuple[float, list[str]]:
+) -> tuple[float, list[tuple[str, int]]]:
     """The one keyword matcher behind the text score and the context score.
 
     Each keyword/phrase is reduced with _keyword_words and handed to `find`,
     which returns the word distance of its nearest occurrence (or None).
-    Every keyword counts once. Returns (sum of weights found, keywords found);
-    with `decay`, each weight is divided by its distance.
+    Every keyword counts once. Returns (sum of weights found, [(keyword,
+    distance)] for the keywords found); with `decay`, each weight is divided
+    by its distance.
     """
     total = 0.0
-    hits: list[str] = []
+    hits: list[tuple[str, int]] = []
     for keyword, weight in weights.items():
         kw = _keyword_words(keyword)
         if not kw:
@@ -485,7 +515,7 @@ def _sum_keywords(
         dist = find(kw)
         if dist is None:
             continue
-        hits.append(keyword)
+        hits.append((keyword, dist))
         total += weight / dist if decay else weight
     return total, hits
 
@@ -574,9 +604,10 @@ def context_score(
     It does not depend on any one match.
     """
     decay = bool(settings["distance_decay"])
-    return _sum_keywords(
+    total, hits = _sum_keywords(
         pattern.context, lambda kw: _nearest_distance(words, [], kw), decay
     )
+    return total, [k for k, _ in hits]
 
 
 # --------------------------------------------------------------------------
@@ -584,12 +615,15 @@ def context_score(
 # --------------------------------------------------------------------------
 # One side's region evidence: (score, nearest distance, hit words nearest first).
 _Side = tuple[float, Union[int, None], list[str]]
+# Region hints already computed for a span, keyed by (pattern label, start, end):
+# _find_validated fills it, validate_candidates reuses it for unrefined spans.
+_HintCache = dict[tuple[str, int, int], list[phone.RegionHint]]
 
 
 def _hint_side(weights: dict[str, float], find: DistanceFinder, decay: bool) -> _Side:
     """Score a region's keywords with the shared matcher, plus the nearest hit."""
     total, hits = _sum_keywords(weights, find, decay)
-    dists = sorted((find(_keyword_words(k)) or 0, k) for k in hits)
+    dists = sorted((d, k) for k, d in hits)
     return total, (dists[0][0] if dists else None), [k for _, k in dists]
 
 
@@ -626,7 +660,7 @@ def _region_hints(
 
 def _find_validated(
     text: str, pattern: Pattern, ctx: dict[str, _Side],
-    settings: dict[str, Any],
+    settings: dict[str, Any], cache: _HintCache | None = None,
 ) -> list[Candidate]:
     """Candidates of a pattern with `validate`: its regex hits, each trimmed
     or split by PhoneNumberMatcher (POSSIBLE leniency).
@@ -638,7 +672,8 @@ def _find_validated(
     ended: a greedy hit that ran into the next number ("212-555-0123
     212-555") would otherwise lose it. If neither finds a number, the raw hit
     is kept as it is, so validation (not this step) decides its fate and
-    logs it.
+    logs it. Each regex hit's region hints go into `cache`, so validation
+    does not compute them again for a span that refinement left as it was.
     """
     spec = pattern.validate
     assert spec is not None
@@ -652,6 +687,8 @@ def _find_validated(
             pos = m.end() + 1          # empty matches carry no text to extract
             continue
         hints = _region_hints(text, m.start(), m.end(), spec, ctx, settings)
+        if cache is not None:
+            cache[(pattern.label, m.start(), m.end())] = hints
         top = max((h for h in hints if h.score > 0), key=lambda h: h.score, default=None)
         region = top.region if top else spec.regions[0]
         spans = phone.refine_spans(m.group(0), region)
@@ -675,7 +712,7 @@ def _find_validated(
 
 def validate_candidates(
     text: str, cands: list[Candidate], cfg: Config,
-    ctx_hints: dict[str, dict[str, _Side]],
+    ctx_hints: dict[str, dict[str, _Side]], cache: _HintCache | None = None,
 ) -> tuple[list[Candidate], list[Decision]]:
     """Turn each phone hit (a candidate of a pattern with `validate`) into one
     match per returned reading, labeled valid_US_number, possible_GB_number...
@@ -683,7 +720,8 @@ def validate_candidates(
     never conflict with each other. Logs one `validation` row per reading
     (kept / not_kept), or one `dropped` row when the hit is impossible
     everywhere. Runs after scoring and before min_score/overlaps; other
-    candidates pass through."""
+    candidates pass through. `cache` holds hints _find_validated already
+    computed for a span."""
     by_label = {p.label: p for p in cfg.patterns}
     kept: list[Candidate] = []
     decisions: list[Decision] = []
@@ -694,13 +732,15 @@ def validate_candidates(
             kept.append(c)
             continue
         version = version or phone.pn_version()
-        hints = _region_hints(text, c.start, c.end, spec, ctx_hints[c.label], cfg.settings)
+        hints = (cache or {}).get((c.label, c.start, c.end))
+        if hints is None:
+            hints = _region_hints(text, c.start, c.end, spec, ctx_hints[c.label], cfg.settings)
         out = phone.readings_for(c.text, spec, hints)
         tail = out.notes + [f"phonenumbers {version}"]
         if not out.readings:
             decisions.append(_decision(
                 "validation", "dropped", "; ".join([out.why] + tail), a=c,
-                decided_by=out.source, status="impossible", normalized=c.text,
+                decided_by=out.source, status="impossible",
             ))
             continue
         for r in out.readings:
@@ -902,9 +942,10 @@ def extract(
     }
 
     cands = find_candidates(text, [p for p in cfg.patterns if not p.validate])
+    hint_cache: _HintCache = {}
     for p in cfg.patterns:
         if p.validate:
-            cands += _find_validated(text, p, ctx_hints[p.label], cfg.settings)
+            cands += _find_validated(text, p, ctx_hints[p.label], cfg.settings, hint_cache)
     cands.sort(key=lambda c: (c.start, c.end, c.label))
     for c in cands:
         c.text_score = score_candidate(text, c, by_label[c.label], cfg.settings)
@@ -914,7 +955,7 @@ def extract(
     found = list(cands)              # before validation drops any, for the miss rows
     checked: list[Decision] = []
     if ctx_hints:
-        cands, checked = validate_candidates(text, cands, cfg, ctx_hints)
+        cands, checked = validate_candidates(text, cands, cfg, ctx_hints, hint_cache)
     matches, decisions = resolve_overlaps(cands, cfg)
     decisions = checked + decisions + _miss_decisions(cfg, ctx_scores, found, matches)
     return matches, [{**d, "file": source} for d in decisions]
@@ -937,7 +978,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help=f"write the decision log to ./{REPORT_PATH} (overwritten)")
     parser.add_argument("--summarize", nargs="?", const=REPORT_PATH, default=None,
                         metavar="PATH",
-                        help=f"print the overlap and miss summaries of a report CSV "
+                        help=f"print the overlap, miss and validation summaries of a report CSV "
                              f"(default ./{REPORT_PATH}) and exit")
     args = parser.parse_args(argv)
 

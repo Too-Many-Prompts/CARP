@@ -58,7 +58,8 @@ string, and resolves overlapping matches.
    with `pattern` = the pattern label, a shared `hit` id, `text` = the
    number in `output_format` (E164 | INTERNATIONAL | NATIONAL | RAW; RAW keeps
    the input slice) and `raw` = the written form (report `a_text` only; never
-   in `to_dict()`). The report's `normalized` column is always E.164.
+   in `to_dict()`). The report's `normalized` column is always E.164 (blank when there is
+   none: local-only readings, dropped hits).
    Validation rows: one per reading (kept / not_kept), or one `dropped`
    row when the hit is impossible everywhere.
 5. `resolve_overlaps(...)`: drop below `min_score` (valid phone readings are

@@ -1,6 +1,6 @@
 # CARP reference
 
-The full rules. For an overview, see the [README](../README.md).
+The full rules. For an overview, see the [README](README.md).
 
 ## Usage
 
@@ -23,7 +23,7 @@ Scans one text per run. For many texts, or a CSV of them, use the library.
   (E.164 by default), not the input slice (see [Phone numbers](#phone-numbers)).
 - Writes nothing else unless asked: `--report` writes the decision log to
   `./extract_report.csv` (overwritten each time).
-- `--summarize [PATH]` prints the [overlap and miss summaries](#summaries) of
+- `--summarize [PATH]` prints the [overlap, miss and validation summaries](#summaries) of
   a report (default `./extract_report.csv`) and exits. It needs no `--config`
   and cannot be combined with `--text`, `--context` or `--report`.
 - Config warnings go to stderr as `warning: ...` and do not change the exit code.
@@ -91,8 +91,7 @@ print(format_validation(summarize_validation()))  # phone validation, printed la
 ## Decision flow
 
 What happens to every piece of text, and which report row each decision
-leaves. Read the steps top to bottom; each flow also has a diagram you can
-expand.
+leaves. Read the steps top to bottom.
 
 ### From text to matches
 
@@ -324,6 +323,47 @@ Questions the report answers:
 7. **Misses**: each label the context scored above 0 that ended with no match
    gets a `miss` decision (see [Misses](#misses)).
 
+
+## Scoring
+
+A candidate's score is two independent sums, added:
+
+| Part | Reads | Keyword keys |
+| --- | --- | --- |
+| `text_score` | the words around the match in the text | `keywords` + `nearby` |
+| `context_score` | every word of the context string | `keywords` + `context` |
+
+Both use the same matcher: whole words or phrases, case-insensitive, each
+keyword counted once at its nearest occurrence. With `distance_decay`, a
+keyword's weight is divided by its word distance (nearest word = 1).
+
+- **Text window:** up to `context_window_words` words before and/or after the
+  match (`context_direction`: `before`, `after` or `both`), stopping early at
+  any `stop_at` character. Before the match a phrase's last word sets its
+  distance; after it, its first word.
+- **Context string:** read whole, as if it came right before the match. Its
+  **last** word is distance 1, the one before it 2, and so on; a phrase's last
+  word sets its distance. `context_window_words`, `context_direction` and
+  `stop_at` do not apply.
+- A `keywords` word found in both places counts in both: with
+  `keywords: {phone: 3}`, context `phone` and text `phone 212-555-0123`, the
+  score is 3 + 3 = 6.
+- The context has no position relative to any one match, so it adds the same
+  amount to every candidate of a pattern.
+- With no context (or an empty one), `context_score` is 0 and nothing else
+  changes.
+
+Example (from `extraction_config.yaml`, decay on):
+
+```text
+context:  "Acct"
+text:     "Acct 2125550123 call 212-555-0123"
+account_number 2125550123:  text acct +3, call -2  -> 1;  context acct +3  -> 4.0
+phone_number   2125550123:  text call +2           -> 2;  context          -> 2.0
+  -> overlap, account_number wins by score
+phone_number   212-555-0123: text call +2          -> 2.0, no overlap, kept
+                                                      (as valid_US_number)
+```
 
 ## Keywords
 
@@ -672,7 +712,7 @@ row per such label, with `a_label` and `a_context_score` filled in:
 | `outcome` | Meaning | Usually fix |
 | --- | --- | --- |
 | `no_candidates` | the regex found nothing in the text | the regex |
-| `candidates_dropped` | it matched, but every candidate lost (min_score, overlap or validation) | weights, `min_score` or `on_*` |
+| `candidates_dropped` | it matched, but every candidate lost (min_score, overlap or validation) | weights, `min_score` or the `validate` settings |
 
 The `reason` names the context words, e.g.
 `context scored phone_number +1.00 (call); no candidates in text`.
@@ -700,7 +740,7 @@ not_by_score, not_by_score_pct, no_evidence, wins, examples, hint`.
 - `hint` says what to try, and `examples` gives up to three inputs to look at
   (`<file>: "<a_text>" vs "<b_text>"`, fallback-decided ones first).
   - "add nearby, context or keywords words": the fallback order decided.
-  - "add to coexist": most unsettled overlaps are partial (different spans),
+  - "if both values are valid, add to coexist": most unsettled overlaps are partial (different spans),
     which often means two distinct values that may both belong in the output.
   - `ok`: nothing to fix.
 
@@ -726,7 +766,7 @@ regions, clusters, examples, hint`.
 - Hints:
   - "phonenumbers metadata may be stale, upgrade it": 3+ possible readings
     share leading digits.
-  - "add hints, or set readings / hint_conflict": some numbers fit several
+  - "add hints, or set keep / hint_conflict": some numbers fit several
     regions.
   - "tighten the regex or add regions": most hits were impossible.
 

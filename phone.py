@@ -61,7 +61,9 @@ def pn_version() -> str:
 
 
 def label_for(status: str, region: str | None) -> str:
-    """The match label of a reading: valid_US_number, possible_GB_number."""
+    """The match label of a reading: valid_US_number, possible_GB_number.
+    Numbers that belong to no country (+800, +808, +870...) get region "001",
+    phonenumbers' code for them: valid_001_number."""
     return f"{status}_{region or 'ZZ'}_number"
 
 
@@ -262,7 +264,8 @@ class RegionHint:
 class Reading:
     """One interpretation of a number in one region."""
     status: str                 # valid | possible
-    region: str | None          # the number's region (416 -> CA)
+    region: str | None          # the number's region (416 -> CA; 011 44... -> GB;
+                                # 001: no country, e.g. +800)
     normalized: str             # the match text: in output_format (RAW: as written);
                                 # raw text if local-only
     key: str                    # E.164, or region:raw when there is none
@@ -271,8 +274,8 @@ class Reading:
     source: str = "regions"     # number | hint | regions
     returned: bool = True       # False: filtered out by keep / hint_conflict
     why: str = ""               # why not returned
-    e164: str = ""              # always E.164 (raw text if local-only): the report's
-                                # `normalized` column, whatever output_format says
+    e164: str = ""              # always E.164 ("" if local-only: there is none): the
+                                # report's `normalized` column, whatever output_format says
 
     @property
     def label(self) -> str:
@@ -295,18 +298,21 @@ def _reading(raw: str, c: Check, spec: PhoneSpec) -> Reading:
     lib = pn()
     region = c.region
     number_type = ""
-    normalized = e164 = raw
+    normalized, e164 = raw, ""
     key = f"{region}:{raw}"
     if c.full:
         e164 = key = lib.format_number(c.number, lib.PhoneNumberFormat.E164)
         if spec.output_format != "RAW":
             fmt = getattr(lib.PhoneNumberFormat, spec.output_format)
             normalized = lib.format_number(c.number, fmt)
+        code = c.number.country_code
         if c.status == "valid":
             region = lib.region_code_for_number(c.number) or region
             number_type = _type_name(lib.number_type(c.number))
-        elif region is None:
-            region = lib.region_code_for_country_code(c.number.country_code)
+        elif region is None or code != lib.country_code_for_region(region):
+            # "+44 ..." or an IDD ("011 44 ..." parsed in US): the country
+            # code, not the region parsed in, says whose number it is.
+            region = lib.region_code_for_country_code(code)
     return Reading(c.status, region, normalized, key, number_type, parsed_in=c.region,
                    e164=e164)
 
@@ -346,6 +352,8 @@ def readings_for(
         c = check(raw, None)
         if c.status == "impossible":
             return Outcome([], "number", why=c.why)
+        if not c.full:
+            return Outcome([], "number", why=_LOCAL_WITH_CODE)
         return Outcome([_numbered(raw, c, spec)], "number")
 
     notes: list[str] = []
@@ -378,10 +386,15 @@ def readings_for(
     stripped = raw.lstrip(" (")
     if stripped.startswith("00"):       # "00" is not an international prefix in NANP
         c = check("+" + stripped[2:], None)
-        if c.status != "impossible":
+        if c.status != "impossible" and c.full:
             return Outcome([_numbered(raw, c, spec)], "number", notes + ["read the leading 00 as +"])
     home = checks[0]
     return Outcome([], "regions", notes, why=f"impossible in {', '.join(spec.regions)} ({home.why})")
+
+
+# A "+" number too short to be a full number: possible only as a local
+# number, which a country code rules out. It is dropped.
+_LOCAL_WITH_CODE = "has a country code but is possible only as a local number (too short)"
 
 
 def _numbered(raw: str, c: Check, spec: PhoneSpec) -> Reading:
