@@ -287,7 +287,10 @@ class Outcome:
     readings: list[Reading]     # returned and not returned, in order
     source: str                 # where the search ended: number | hint | regions
     notes: list[str] = field(default_factory=list)
-    why: str = ""               # why there is no reading at all (impossible)
+    why: str = ""               # why there is no reading at all
+    # The dropped hit's status: impossible, or possible for a "+" number that
+    # is possible only as a local number (a country code rules that out).
+    status: str = "impossible"
 
     @property
     def returned(self) -> list[Reading]:
@@ -353,7 +356,7 @@ def readings_for(
         if c.status == "impossible":
             return Outcome([], "number", why=c.why)
         if not c.full:
-            return Outcome([], "number", why=_LOCAL_WITH_CODE)
+            return Outcome([], "number", why=_LOCAL_WITH_CODE, status="possible")
         return Outcome([_numbered(raw, c, spec)], "number")
 
     notes: list[str] = []
@@ -378,7 +381,8 @@ def readings_for(
     from_list, checks = _fitting(raw, spec.regions, spec)
     known = {r.key for r in from_hints}
     from_list = [r for r in from_list if r.key not in known]
-    _filter_list(from_list, spec)
+    _filter_list(from_list, spec, hinted_valid=any(
+        r.returned and r.status == "valid" for r in from_hints))
     readings = from_hints + from_list
     if readings:
         return Outcome(readings, "regions", notes)
@@ -433,9 +437,11 @@ def _hinted(raw: str, spec: PhoneSpec, hinted: list[RegionHint]) -> list[Reading
     return found
 
 
-def _filter_list(found: list[Reading], spec: PhoneSpec) -> None:
-    """Apply `keep` to the list readings (in region order)."""
-    has_valid = any(r.status == "valid" for r in found)
+def _filter_list(found: list[Reading], spec: PhoneSpec, hinted_valid: bool = False) -> None:
+    """Apply `keep` to the list readings (in region order). A valid hinted
+    reading (hint_fallback: always) counts as a valid reading here, so
+    valid_else_possible drops the possible list readings next to it."""
+    has_valid = hinted_valid or any(r.status == "valid" for r in found)
     home = next((r for r in found if r.parsed_in == spec.regions[0]), None)
     mode = spec.keep
     if mode == "valid":

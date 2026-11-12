@@ -260,6 +260,7 @@ def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]
             st["hits"][hit] += outcome == "kept"
             if outcome == "dropped":
                 st.setdefault("dropped_hits", []).append(hit)
+                st["impossible"] = st.get("impossible", 0) + (row.get("status") == "impossible")
                 continue
             if outcome != "kept":
                 continue
@@ -285,7 +286,7 @@ def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]
             hints.append(HINT_STALE)
         if multi_hits:
             hints.append(HINT_MULTI)
-        if st["out"]["dropped"] * 2 > hits:
+        if st.get("impossible", 0) * 2 > hits:   # not local-only "+" numbers
             hints.append(HINT_IMPOSSIBLE)
         out.append({
             "pattern": pattern,

@@ -94,6 +94,10 @@ CONFIG_KEYS = ("settings", "normalize", "patterns", "coexist", "tests")
 SETTINGS_KEYS = REQUIRED_SETTINGS + ("context_direction", "stop_at")
 NORMALIZE_KEYS = ("unicode_dashes_to_hyphen", "smart_quotes_to_ascii", "collapse_whitespace")
 PATTERN_KEYS = ("label", "regex", "priority", "keywords", "nearby", "context", "validate")
+TEST_KEYS = ("name", "text", "context", "expect")
+# A generated phone reading label ({status}_{REGION}_number; phone.label_for).
+# Pattern labels may not take this form, and coexist may name one.
+_READING_LABEL = re.compile(r"(valid|possible)_([A-Z]{2}|\d{3})_number")
 
 # extract() accepts: plain text, {"text": ..., "context": ...}, or (context, text).
 ExtractInput = Union[str, dict, tuple]
@@ -325,28 +329,53 @@ def _check_keys(mapping: Any, allowed: Sequence[str], where: str) -> None:
             )
 
 
-def load_config(path: str | Path) -> Config:
-    """Read the YAML config and compile every regex once."""
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        raw = yaml.safe_load(fh)
+def _require_bool(value: Any, where: str) -> bool:
+    """YAML true/false only: a quoted "false" or a bare `no` string is truthy."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{where}: expected true or false, got {value!r}")
+    return value
 
-    _check_keys(raw, CONFIG_KEYS, "config")
+
+def _require_int(value: Any, where: str, minimum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or (
+            minimum is not None and value < minimum):
+        floor = f" >= {minimum}" if minimum is not None else ""
+        raise ValueError(f"{where}: expected a whole number{floor}, got {value!r}")
+    return value
+
+
+def _require_text(value: Any, where: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{where}: expected a non-empty string, got {value!r}")
+    return value
+
+
+def _load_settings(raw: dict[str, Any]) -> dict[str, Any]:
+    """Check `settings` and fill in the optional keys' defaults."""
     settings = _require(raw, "settings", "config")
+    if not isinstance(settings, dict):
+        raise ValueError(f"settings: expected a map, got {type(settings).__name__}")
     _check_keys(settings, SETTINGS_KEYS, "settings")
-    norm = raw.get("normalize") or {}
-    if not isinstance(norm, dict):
-        raise ValueError(f"normalize: expected a map of option: true/false, got {type(norm).__name__}")
-    _check_keys(norm, NORMALIZE_KEYS, "normalize")
     for key in REQUIRED_SETTINGS:
         _require(settings, key, "settings")
+    _require_int(settings["context_window_words"], "settings.context_window_words", minimum=0)
+    for key in ("distance_decay", "case_sensitive"):
+        _require_bool(settings[key], f"settings.{key}")
+    min_score = settings["min_score"]
+    if isinstance(min_score, bool) or not isinstance(min_score, (int, float)):
+        raise ValueError(f"settings.min_score: expected a number, got {min_score!r}")
+
     # A blank `overlap_tiebreak:` (None) means "no criteria", same as [].
-    settings["overlap_tiebreak"] = settings["overlap_tiebreak"] or []
-    for name in settings["overlap_tiebreak"]:
+    order = settings["overlap_tiebreak"] or []
+    if not isinstance(order, list):
+        raise ValueError(f"settings.overlap_tiebreak: expected a list, got {order!r}")
+    for name in order:
         if name not in TIEBREAK_NAMES:
             raise ValueError(
                 f"settings.overlap_tiebreak: unknown criterion '{name}' "
                 f"(expected one of {', '.join(TIEBREAK_NAMES)})"
             )
+    settings["overlap_tiebreak"] = order
 
     direction = settings.get("context_direction", "both")
     if direction not in CONTEXT_DIRECTIONS:
@@ -363,48 +392,140 @@ def load_config(path: str | Path) -> Config:
             f"got {type(stop_at).__name__}"
         )
     settings["stop_at"] = stop_at
+    return settings
 
-    flags = 0 if settings["case_sensitive"] else re.IGNORECASE
-    patterns: list[Pattern] = []
-    seen: set[str] = set()
-    for entry in _require(raw, "patterns", "config"):
-        label = str(_require(entry, "label", "pattern"))
-        _check_keys(entry, PATTERN_KEYS, f"pattern '{label}'")
-        if label in seen:
-            raise ValueError(f"pattern '{label}': duplicate label")
-        seen.add(label)
-        try:
-            compiled = re.compile(str(_require(entry, "regex", f"pattern '{label}'")), flags)
-        except re.error as exc:
-            raise ValueError(f"pattern '{label}': invalid regex: {exc}") from exc
 
-        nearby, context = _load_keywords(label, entry)
-        spec = None
-        if "validate" in entry:
-            if entry["validate"] is None:
-                raise ValueError(
-                    f"pattern '{label}': validate is empty; give it keys "
-                    f"({', '.join(phone.VALIDATE_KEYS)}) or remove it"
-                )
-            spec = phone.load_validate(label, entry["validate"], _weight_map)
-        patterns.append(
-            Pattern(
-                label=label,
-                priority=int(_require(entry, "priority", f"pattern '{label}'")),
-                regex=compiled,
-                nearby=nearby,
-                context=context,
-                validate=spec,
-            )
+def _load_normalize(raw: dict[str, Any]) -> dict[str, bool]:
+    """Check `normalize`: a map of option: true/false (blank or absent: none)."""
+    norm = raw.get("normalize")
+    if norm is None:
+        return {}
+    if not isinstance(norm, dict):
+        raise ValueError(f"normalize: expected a map of option: true/false, got {type(norm).__name__}")
+    _check_keys(norm, NORMALIZE_KEYS, "normalize")
+    for key, value in norm.items():
+        _require_bool(value, f"normalize.{key}")
+    return norm
+
+
+def _load_pattern(entry: Any, flags: int, seen: set[str]) -> Pattern:
+    """Check one `patterns` entry and compile its regex."""
+    if not isinstance(entry, dict):
+        raise ValueError(f"config: patterns: entry {entry!r} must be a map")
+    label = _require_text(_require(entry, "label", "pattern"), "pattern: label")
+    _check_keys(entry, PATTERN_KEYS, f"pattern '{label}'")
+    if label in seen:
+        raise ValueError(f"pattern '{label}': duplicate label")
+    if _READING_LABEL.fullmatch(label):
+        raise ValueError(
+            f"pattern '{label}': label is the form of a phone reading label "
+            "({status}_{REGION}_number); rename it"
         )
+    seen.add(label)
+    where = f"pattern '{label}'"
+    regex = _require_text(_require(entry, "regex", where), f"{where}: regex")
+    try:
+        compiled = re.compile(regex, flags)
+    except re.error as exc:
+        raise ValueError(f"{where}: invalid regex: {exc}") from exc
+    priority = _require_int(_require(entry, "priority", where), f"{where}: priority")
 
-    coexist = {frozenset(pair) for pair in (raw.get("coexist") or [])}
+    nearby, context = _load_keywords(label, entry)
+    spec = None
+    if "validate" in entry:
+        if entry["validate"] is None:
+            raise ValueError(
+                f"{where}: validate is empty; give it keys "
+                f"({', '.join(phone.VALIDATE_KEYS)}) or remove it"
+            )
+        spec = phone.load_validate(label, entry["validate"], _weight_map)
+    return Pattern(label=label, priority=priority, regex=compiled,
+                   nearby=nearby, context=context, validate=spec)
+
+
+def _load_coexist(raw: dict[str, Any], patterns: list[Pattern]) -> set[frozenset[str]]:
+    """Check `coexist`: a list of [label, label] pairs. A label is a pattern
+    label or, when a pattern has `validate`, a reading label (valid_US_number)."""
+    entries = raw.get("coexist")
+    if entries is None:
+        return set()
+    if not isinstance(entries, list):
+        raise ValueError(f"coexist: expected a list of label pairs, got {type(entries).__name__}")
+    known = [p.label for p in patterns]
+    readings = any(p.validate for p in patterns)
+    allowed = ", ".join(known + (["{status}_{REGION}_number"] if readings else []))
+    out: set[frozenset[str]] = set()
+    for entry in entries:
+        if not isinstance(entry, list) or len(entry) != 2:
+            raise ValueError(
+                f"coexist: entry {entry!r} must be a pair of labels, e.g. - [timestamp, date]"
+            )
+        for name in entry:
+            if not isinstance(name, str) or not (
+                    name in known or (readings and _READING_LABEL.fullmatch(name))):
+                raise ValueError(f"coexist: unknown label {name!r} (expected one of {allowed})")
+        if entry[0] == entry[1]:
+            raise ValueError(f"coexist: entry {entry!r} names '{entry[0]}' twice")
+        out.add(frozenset(entry))
+    return out
+
+
+def _load_tests(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """Check `tests`: a list of {name?, text, context?, expect: [{label, text}]}."""
+    cases = raw.get("tests")
+    if cases is None:
+        return []
+    if not isinstance(cases, list):
+        raise ValueError(f"tests: expected a list of test cases, got {type(cases).__name__}")
+    for i, case in enumerate(cases):
+        where = f"tests[{i}]"
+        if not isinstance(case, dict):
+            raise ValueError(f"{where}: expected a map with text and expect, got {case!r}")
+        _check_keys(case, TEST_KEYS, where)
+        for key in ("text", "expect"):
+            _require(case, key, where)
+        for key in ("name", "text", "context"):
+            value = case.get(key)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"{where}.{key}: expected a string, got {value!r}")
+        if case["text"] is None:
+            raise ValueError(f"{where}.text: expected a string, got None")
+        expect = case["expect"]
+        if expect is not None and not isinstance(expect, list):
+            raise ValueError(f"{where}.expect: expected a list of {{label, text}}, got {expect!r}")
+        for j, item in enumerate(expect or []):
+            if not (isinstance(item, dict) and set(item) == {"label", "text"}
+                    and all(isinstance(v, str) for v in item.values())):
+                raise ValueError(
+                    f"{where}.expect[{j}]: expected a map with label and text, got {item!r}"
+                )
+    return cases
+
+
+def load_config(path: str | Path) -> Config:
+    """Read the YAML config, check every value and compile every regex once."""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        raw = yaml.safe_load(fh)
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"config: expected a map with keys {', '.join(CONFIG_KEYS)}")
+    _check_keys(raw, CONFIG_KEYS, "config")
+    settings = _load_settings(raw)
+    norm = _load_normalize(raw)
+
+    entries = _require(raw, "patterns", "config")
+    if not isinstance(entries, list):
+        raise ValueError(f"config: patterns: expected a list of patterns, got {entries!r}")
+    flags = 0 if settings["case_sensitive"] else re.IGNORECASE
+    seen: set[str] = set()
+    patterns = [_load_pattern(entry, flags, seen) for entry in entries]
+
     return Config(
         settings=settings,
-        normalize=raw.get("normalize") or {},
+        normalize=norm,
         patterns=patterns,
-        coexist=coexist,
-        tests=raw.get("tests") or [],
+        coexist=_load_coexist(raw, patterns),
+        tests=_load_tests(raw),
     )
 
 
@@ -718,8 +839,9 @@ def validate_candidates(
     match per returned reading, labeled valid_US_number, possible_GB_number...
     (phone.readings_for). The readings share the hit's span and score and
     never conflict with each other. Logs one `validation` row per reading
-    (kept / not_kept), or one `dropped` row when the hit is impossible
-    everywhere. Runs after scoring and before min_score/overlaps; other
+    (kept / not_kept), or one `dropped` row when the hit has no reading
+    (impossible everywhere, or a local-only "+" number). Runs after scoring
+    and before min_score/overlaps; other
     candidates pass through. `cache` holds hints _find_validated already
     computed for a span."""
     by_label = {p.label: p for p in cfg.patterns}
@@ -740,7 +862,7 @@ def validate_candidates(
         if not out.readings:
             decisions.append(_decision(
                 "validation", "dropped", "; ".join([out.why] + tail), a=c,
-                decided_by=out.source, status="impossible",
+                decided_by=out.source, status=out.status,
             ))
             continue
         for r in out.readings:
@@ -984,8 +1106,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.summarize is not None:
         clashes = [flag for flag, used in (
-            ("--text", args.text is not None), ("--context", args.context is not None),
-            ("--report", args.report),
+            ("--config", args.config is not None), ("--text", args.text is not None),
+            ("--context", args.context is not None), ("--report", args.report),
         ) if used]
         if clashes:
             parser.error(f"--summarize cannot be combined with {', '.join(clashes)}")

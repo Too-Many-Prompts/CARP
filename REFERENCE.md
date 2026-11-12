@@ -279,7 +279,7 @@ it, `outcome` what happened, and `decided_by` the rule that decided.
 
 | `kind` | Written when | `outcome` | `decided_by` |
 | --- | --- | --- | --- |
-| `validation` | a phone hit was checked: one row per reading, or one for an impossible hit | `kept`, `not_kept`, `dropped` | `number`, `hint`, `regions` |
+| `validation` | a phone hit was checked: one row per reading, or one for a dropped hit | `kept`, `not_kept`, `dropped` | `number`, `hint`, `regions` |
 | `below_min_score` | a candidate scored under `min_score` | `dropped` | `min_score` |
 | `overlap` | two candidates overlapped and one lost | `a_wins_b_dropped` | `score`, `length`, `priority`, `start_label` |
 | `coexist` | two candidates overlapped but their labels are a coexist pair | `both_kept` | `coexist` |
@@ -312,7 +312,7 @@ Questions the report answers:
    first trimmed or split by phonenumbers (see [Phone numbers](#phone-numbers)).
 4. **Score** each candidate: `score = text_score + context_score` (below).
    **Validate** the candidates of `validate` patterns: each becomes one match
-   per reading (`valid_US_number`, ...) or is dropped as impossible, before
+   per reading (`valid_US_number`, ...) or is dropped (impossible, or a local-only `+` number), before
    they compete.
 5. **Drop** candidates with `score < min_score`.
 6. **Resolve overlaps**, best first, using `overlap_tiebreak` (in order; any
@@ -414,8 +414,9 @@ the pattern simply has no keywords of that kind and scores 0 there.
 
 Everything lives in `extraction_config.yaml`, in five sections: `settings`,
 `normalize`, `patterns`, `coexist` and `tests`. Every option is listed below.
-"Required" means `load_config` fails without it; an unknown value fails with a
-message naming the section and key.
+"Required" means `load_config` fails without it; an unknown key or a value of
+the wrong type (a quoted `"false"`, a blank `regex:` or `priority:`) fails with
+a message naming the section and key.
 
 ### `settings`
 
@@ -446,7 +447,7 @@ A list; each entry is one thing to find.
 
 | Option | Required / default | Values | What it does |
 | --- | --- | --- | --- |
-| `label` | required, unique | text, e.g. `phone_number` | The name a match is reported under. For a pattern with `validate`, matches get generated labels (`valid_US_number`) and this name is their `pattern`. |
+| `label` | required, unique | text, e.g. `phone_number` | The name a match is reported under. For a pattern with `validate`, matches get generated labels (`valid_US_number`) and this name is their `pattern`. A label of that generated form (`{valid,possible}_{REGION}_number`) is an error. |
 | `priority` | required | a whole number | Breaks ties in `overlap_tiebreak`: the lower number wins. |
 | `regex` | required | a regular expression (quote it in single quotes) | What to find. Each pattern's regex runs on its own, so overlaps stay visible. |
 | `keywords` | optional | `{word: weight}` | Words that raise (positive weight) or lower (negative weight) the score, looked for in the text window **and** the context string. |
@@ -465,7 +466,7 @@ of 0 is an error, and a word in `keywords` may not also be in `nearby` or
 | `with` | required | `phonenumbers` | The checking library. It is the only value. |
 | `regions` | required | a list of country codes, e.g. `[US, GB]` | The countries a number is checked in, in order. The first is the home country. |
 | `hints` | optional | `{COUNTRY: {word: weight}}`, weights above 0 | Words that point to a country (`GB: {uk: 3, london: 2}`). When one appears near the number or in the context, that country is checked first. The country need not be in `regions`. |
-| `keep` | default `valid_plus_home` | `valid_plus_home`, `all`, `valid_else_possible`, `valid` | Which readings from `regions` are kept. `valid_plus_home`: every valid one, plus the home country's even if only possible. `all`: every valid and possible one. `valid_else_possible`: the valid ones, or every possible one if none is valid. `valid`: valid ones only. |
+| `keep` | default `valid_plus_home` | `valid_plus_home`, `all`, `valid_else_possible`, `valid` | Which readings from `regions` are kept. `valid_plus_home`: every valid one, plus the home country's even if only possible. `all`: every valid and possible one. `valid_else_possible`: the valid ones, or every possible one if none is valid (a valid hinted reading counts, with `hint_fallback: always`). `valid`: valid ones only. |
 | `hint_conflict` | default `all` | `all`, `nearest` | When a number is valid in several hinted countries: `all` keeps every one; `nearest` keeps only the country whose hint word is nearest. |
 | `hint_fallback` | default `if_not_valid` | `if_not_valid`, `if_nothing`, `always`, `never` | After a hint, whether `regions` is checked too. `if_not_valid`: when no hinted reading is valid. `if_nothing`: only when the hinted countries gave no reading at all. `always`: every time. `never`: never, so a number that fits no hinted country is dropped. |
 | `output_format` | default `E164` | `E164`, `INTERNATIONAL`, `NATIONAL`, `RAW` | How a match's `text` is written: `+12125550123`, `+1 212-555-0123`, `(212) 555-0123`, or `RAW`, the number exactly as written in the input. |
@@ -478,7 +479,10 @@ The full rule and examples are in [Phone numbers](#phone-numbers).
 A list of label pairs, e.g. `- [timestamp, date]`. When two overlapping
 matches form a listed pair, both are kept instead of tie-breaking (a
 `coexist` row). Order within a pair doesn't matter. A pattern label such as
-`phone_number` covers all of its generated labels.
+`phone_number` covers all of its generated labels. Each entry must be a pair
+of two different labels, each a pattern label or (when a pattern has
+`validate`) a generated label such as `valid_US_number`; anything else fails
+at load time.
 
 ### `tests`
 
@@ -490,6 +494,8 @@ A list of cases that `pytest` runs against the config:
 | `text` | required | The text to scan. |
 | `context` | optional | The context string passed with the text. |
 | `expect` | required | The exact matches, each `{label, text}`, in any order. An empty list means "no matches". |
+
+Any other key in a case (e.g. a misspelled `contxt`) fails at load time.
 
 ## Phone numbers
 
@@ -580,7 +586,7 @@ Readings that give the same number count as one. US and CA share +1, so
    | --- | --- |
    | `valid_plus_home` (default) | every valid reading, plus the home (first) region's reading when it is only possible |
    | `all` | every valid and possible reading |
-   | `valid_else_possible` | the valid readings if any, else every possible one |
+   | `valid_else_possible` | the valid readings if any (a valid hinted reading counts), else every possible one |
    | `valid` | valid readings only |
 
 4. **Impossible everywhere** (it doesn't parse, or it has the wrong length):
@@ -687,7 +693,8 @@ file is gitignored.
   - `validation` rows: one per reading of a phone hit (`a` = the reading):
     - `outcome` is `kept`, or `not_kept` when `keep` / `hint_conflict`
       filtered it out;
-    - an impossible hit gets a single `dropped` row;
+    - an impossible hit gets a single `dropped` row (`status` impossible; a
+      `+` number possible only as a local number gets `status` possible);
     - `decided_by` is the reading's source (`number`, `hint`, `regions`); one
       hit can mix `hint` and `regions` readings (see `hint_fallback`);
     - `reason` reads e.g. `possible in GB; keep: valid; phonenumbers 9.0.43`.
@@ -768,7 +775,8 @@ regions, clusters, examples, hint`.
     share leading digits.
   - "add hints, or set keep / hint_conflict": some numbers fit several
     regions.
-  - "tighten the regex or add regions": most hits were impossible.
+  - "tighten the regex or add regions": most hits were impossible (local-only
+    `+` numbers don't count).
 
 ### Tuning workflow
 

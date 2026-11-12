@@ -1954,3 +1954,147 @@ def test_region_hints_are_computed_once_for_unrefined_spans(
     matches, _ = ex.extract("london office 020 7946 0958", cfg)
     assert got(matches) == [("valid_GB_number", "+442079460958")]
     assert len(calls) == 1
+
+
+# ---- review fixes: load-time validation of every config value
+def _write_raw(tmp_path: Path, raw: dict[str, Any]) -> Path:
+    path = tmp_path / "raw.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    return path
+
+
+def _base_raw(**over: Any) -> dict[str, Any]:
+    raw: dict[str, Any] = {
+        "settings": {
+            "context_window_words": 8, "distance_decay": True, "min_score": 0,
+            "case_sensitive": False, "overlap_tiebreak": ["score"],
+        },
+        "patterns": [
+            {"label": "A", "priority": 1, "regex": r"\d+"},
+            {"label": "B", "priority": 2, "regex": r"[a-z]+"},
+        ],
+    }
+    raw.update(over)
+    return raw
+
+
+def _with(path: str, value: Any) -> dict[str, Any]:
+    """_base_raw() with one value replaced; path like 'settings.min_score' or 'patterns.0.priority'."""
+    raw = _base_raw()
+    *parents, last = path.split(".")
+    node: Any = raw
+    for p in parents:
+        node = node[int(p)] if p.isdigit() else node[p]
+    node[int(last) if last.isdigit() else last] = value
+    return raw
+
+
+@pytest.mark.parametrize("raw, message", [
+    (_base_raw(coexist=["A", "B"]), "coexist: entry 'A' must be a pair of labels"),
+    (_base_raw(coexist=[["A", "B", "A"]]), "must be a pair of labels"),
+    (_base_raw(coexist=[["A", "A"]]), "names 'A' twice"),
+    (_base_raw(coexist=[["A", "C"]]), "coexist: unknown label 'C' (expected one of A, B"),
+    (_base_raw(coexist=[["A", "valid_US_number"]]), "unknown label 'valid_US_number'"),
+    (_base_raw(coexist={"A": "B"}), "coexist: expected a list of label pairs"),
+    (_with("settings.case_sensitive", "false"), "settings.case_sensitive: expected true or false"),
+    (_with("settings.distance_decay", "no"), "settings.distance_decay: expected true or false"),
+    (_base_raw(normalize={"collapse_whitespace": "no"}),
+     "normalize.collapse_whitespace: expected true or false"),
+    (_base_raw(normalize=[]), "normalize: expected a map"),
+    (_base_raw(normalize=False), "normalize: expected a map"),
+    (_with("settings.min_score", "x"), "settings.min_score: expected a number"),
+    (_with("settings.min_score", True), "settings.min_score: expected a number"),
+    (_with("settings.context_window_words", 2.5), "settings.context_window_words: expected a whole number"),
+    (_with("settings.context_window_words", -1), "settings.context_window_words: expected a whole number"),
+    (_with("patterns.0.priority", None), "pattern 'A': priority: expected a whole number"),
+    (_with("patterns.0.priority", "high"), "pattern 'A': priority: expected a whole number"),
+    (_with("patterns.0.regex", None), "pattern 'A': regex: expected a non-empty string"),
+    (_with("patterns.0.regex", ""), "pattern 'A': regex: expected a non-empty string"),
+    (_with("patterns.0.label", None), "pattern: label: expected a non-empty string"),
+    (_with("patterns.0.label", 5), "pattern: label: expected a non-empty string"),
+    (_base_raw(patterns=None), "config: patterns: expected a list of patterns"),
+    (_base_raw(patterns=["A"]), "config: patterns: entry 'A' must be a map"),
+    (_with("patterns.0.label", "valid_US_number"), "is the form of a phone reading label"),
+    (_with("patterns.0.label", "possible_001_number"), "is the form of a phone reading label"),
+    (_base_raw(tests={"text": "x"}), "tests: expected a list of test cases"),
+    (_base_raw(tests=[{"txt": "x", "expect": []}]), "tests[0]: unknown key 'txt'"),
+    (_base_raw(tests=[{"text": "x", "contxt": "uk", "expect": []}]), "tests[0]: unknown key 'contxt'"),
+    (_base_raw(tests=[{"expect": []}]), "tests[0]: missing required key 'text'"),
+    (_base_raw(tests=[{"text": "x"}]), "tests[0]: missing required key 'expect'"),
+    (_base_raw(tests=[{"text": 5, "expect": []}]), "tests[0].text: expected a string"),
+    (_base_raw(tests=[{"text": "x", "context": 5, "expect": []}]), "tests[0].context: expected a string"),
+    (_base_raw(tests=[{"text": "x", "expect": {"label": "A"}}]), "tests[0].expect: expected a list"),
+    (_base_raw(tests=[{"text": "x", "expect": [{"label": "A"}]}]),
+     "tests[0].expect[0]: expected a map with label and text"),
+    (_base_raw(tests=[{"text": "x", "expect": [{"label": "A", "text": "1", "x": 1}]}]),
+     "tests[0].expect[0]: expected a map with label and text"),
+])
+def test_load_rejects_bad_values(tmp_path: Path, raw: dict[str, Any], message: str) -> None:
+    with pytest.raises(ValueError) as exc:
+        load_config(_write_raw(tmp_path, raw))
+    assert message in str(exc.value)
+
+
+def test_load_accepts_valid_tests_and_coexist(tmp_path: Path) -> None:
+    raw = _base_raw(
+        coexist=[["A", "B"]],
+        normalize=None,
+        tests=[
+            {"name": "n", "text": "x", "context": "c", "expect": [{"label": "B", "text": "x"}]},
+            {"text": "y", "context": None, "expect": None},
+        ],
+    )
+    cfg = load_config(_write_raw(tmp_path, raw))
+    assert cfg.coexist == {frozenset(("A", "B"))}
+    assert cfg.normalize == {}
+    assert len(cfg.tests) == 2
+
+
+def test_coexist_accepts_reading_labels_with_a_validate_pattern(tmp_path: Path) -> None:
+    raw = _base_raw(coexist=[["valid_US_number", "A"], ["possible_001_number", "B"]])
+    raw["patterns"].append(phone_pattern())
+    cfg = load_config(_write_raw(tmp_path, raw))
+    assert frozenset(("valid_US_number", "A")) in cfg.coexist
+
+
+def test_blank_priority_is_an_error_line_not_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _write_raw(tmp_path, _with("patterns.0.priority", None))
+    assert main(["--config", str(path), "--text", "x"]) == 2
+    assert "error: pattern 'A': priority" in capsys.readouterr().err
+
+
+def test_summarize_rejects_config(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["--summarize", "--config", "x.yaml"])
+    assert exc.value.code == 2
+
+
+def test_plus_number_local_only_drop_is_logged_as_possible(tmp_path: Path) -> None:
+    matches, decisions = run_phone(tmp_path, "Call +1 555 1234")
+    assert matches == []
+    (row,) = vrows(decisions)
+    assert (row["outcome"], row["status"]) == ("dropped", "possible")
+    assert "possible only as a local number" in row["reason"]
+
+
+def test_local_only_drops_do_not_trigger_the_impossible_hint(tmp_path: Path) -> None:
+    import summarize
+    cfg = make_cfg(tmp_path, [phone_pattern()])
+    reset_report()
+    write_report_csv(extract("Call +1 555 1234", cfg)[1])
+    (row,) = summarize_validation()
+    assert row["dropped"] == 1
+    assert summarize.HINT_IMPOSSIBLE not in row["hint"]
+
+
+def test_keep_counts_valid_hinted_readings_with_hint_fallback_always(tmp_path: Path) -> None:
+    validate = {"regions": ["GB", "US"], "hints": {"US": {"usa": 1}},
+                "keep": "valid_else_possible", "hint_fallback": "always"}
+    plain, _ = run_phone(tmp_path, "call 212 555 0100", **validate)
+    hinted, decisions = run_phone(tmp_path, "usa call 212 555 0100", **validate)
+    assert got(plain) == got(hinted) == [("valid_US_number", "+12125550100")]
+    gb = [r for r in vrows(decisions) if r["region"] == "GB"]
+    assert [(r["outcome"], r["status"]) for r in gb] == [("not_kept", "possible")]
+    assert "keep: valid_else_possible" in gb[0]["reason"]

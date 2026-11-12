@@ -50,7 +50,8 @@ string, and resolves overlapping matches.
    - `+` number (or `00` as a last resort);
    - the hinted regions (valid readings, else possible ones;
      `hint_conflict` all | nearest);
-   - the `regions` list, filtered by `keep`. After a hint, it runs per
+   - the `regions` list, filtered by `keep` (a valid hinted reading counts
+     as valid for `keep`). After a hint, it runs per
      `hint_fallback`: if_not_valid (default; no valid hinted reading),
      if_nothing (no hinted reading), always, never. Its readings are added
      (source `regions`); each reading keeps its own source.
@@ -61,7 +62,8 @@ string, and resolves overlapping matches.
    in `to_dict()`). The report's `normalized` column is always E.164 (blank when there is
    none: local-only readings, dropped hits).
    Validation rows: one per reading (kept / not_kept), or one `dropped`
-   row when the hit is impossible everywhere.
+   row when the hit is impossible everywhere (status `impossible`; `possible`
+   for a `+` number that is possible only as a local number).
 5. `resolve_overlaps(...)`: drop below `min_score` (valid phone readings are
    exempt when `validate.valid_ignores_min_score`, the default; internal
    `Candidate.status`); for overlapping spans keep
@@ -94,7 +96,12 @@ string, and resolves overlapping matches.
   differently, e.g. "amount-due" / "amount due") and non-numeric weights.
 - Only the current config format is supported (single user): no checks or
   messages for earlier formats. Unknown keys and values fail with the list of
-  allowed ones.
+  allowed ones; so do values of the wrong type (booleans must be YAML
+  true/false, `priority` / `context_window_words` whole numbers, `regex` and
+  `label` non-empty strings), every `coexist` entry (a pair of two different
+  known labels; reading labels allowed when a pattern has `validate`) and
+  every `tests` case (keys name, text, context, expect). A pattern label may
+  not take the reading form `{valid,possible}_{REGION}_number`.
 
 ## Phone validation (`validate:` block)
 - Keys:

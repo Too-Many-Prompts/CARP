@@ -11,7 +11,7 @@ def _is_letter(c: str) -> bool:
     return c in _LETTERS
 
 
-def prev_words(text, pos, n=3, join="'’", stop_at=""):
+def prev_words(text: str, pos: int, n: int = 3, join: str = "'’", stop_at: str = "") -> list[str]:
     """
     Return up to n words that come before position `pos` in `text`,
     scanning backward as far as needed.
@@ -73,7 +73,7 @@ def prev_words(text, pos, n=3, join="'’", stop_at=""):
     return words[::-1]
 
 
-def next_words(text, pos, n=3, join="'’", stop_at=""):
+def next_words(text: str, pos: int, n: int = 3, join: str = "'’", stop_at: str = "") -> list[str]:
     """
     Mirror of prev_words: return up to n words that come after position
     `pos` in `text`, scanning forward as far as needed.
