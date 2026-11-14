@@ -6,18 +6,27 @@ configs without it never need the library. extract.py does all word
 scoring and hands the region hints in (RegionHint); this module never reads
 words, so there is no second copy of the keyword matcher.
 
-It never guesses a country. Every plausible reading of a number comes back
-(readings_for), each later becoming its own match labeled
-`{status}_{REGION}_number`:
+Each phone-shaped hit is read in one or more regions. Each reading is graded:
+  - valid: a real number in that region;
+  - possible: the right length, but the range isn't known (e.g. a new area code);
+  - impossible: it fits nowhere.
 
-  1. "+" number (or a leading "00" when nothing else fits): the country code.
-  2. hinted regions: parsed in those regions; valid readings, else
-     possible ones (hint_conflict: all | nearest). hint_fallback decides
-     when 3 also runs: if_not_valid (no valid hinted reading; default),
-     if_nothing (no hinted reading at all), always, or never (a number
-     that fits no hinted region is then dropped).
-  3. the `regions` list, filtered by `keep`.
-  4. impossible everywhere: no reading; extract.py logs why.
+Where to look, in order (readings_for):
+  1. A "+" number's country code decides. Nothing else is consulted.
+     (A leading "00" is read as "+" when nothing else fits.)
+  2. Otherwise, regions named by hint words near the number are tried first:
+     valid readings, else possible ones; when_hints_disagree: all | nearest.
+  3. Then the `regions` list, if also_try_regions allows it: never,
+     if_hint_fails (no hinted reading), if_hint_not_valid (no valid hinted
+     reading; default) or always.
+
+What comes back: valid readings always. keep_possible decides possible
+readings from the `regions` list (never | if_no_valid | home | always).
+Impossible hits have no reading: extract.py drops and logs them, unless
+keep_unknown: true keeps them as `unknown_number`.
+
+Every reading becomes its own match labeled `{status}_{REGION}_number`; it
+never guesses one country.
 
     spec = load_validate(label, raw_block, weight_map)     # at load time
     spans = refine_spans(span_text, region)                # trim / split a regex hit
@@ -28,20 +37,36 @@ from __future__ import annotations
 
 import importlib
 import re
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-VALIDATE_KEYS = ("with", "regions", "hints", "keep", "hint_conflict", "hint_fallback",
-                 "output_format", "valid_ignores_min_score")
+VALIDATE_KEYS = ("with", "regions", "hints", "keep_possible", "when_hints_disagree",
+                 "also_try_regions", "output_format", "valid_ignores_min_score",
+                 "keep_unknown")
 CHOICES = {
-    "keep": ("valid_plus_home", "all", "valid_else_possible", "valid"),
-    "hint_conflict": ("all", "nearest"),
-    # When the `regions` list is also parsed after a hint matched:
-    "hint_fallback": ("if_not_valid", "if_nothing", "always", "never"),
+    # Possible readings from the `regions` list: which come back.
+    "keep_possible": ("never", "if_no_valid", "home", "always"),
+    # Several hinted regions give a reading: keep all, or the nearest hint's.
+    "when_hints_disagree": ("all", "nearest"),
+    # After a hint, also parse the `regions` list: from never to always, by
+    # how good the hinted result had to be to stop the search.
+    "also_try_regions": ("never", "if_hint_fails", "if_hint_not_valid", "always"),
     "output_format": ("E164", "INTERNATIONAL", "NATIONAL", "RAW"),
 }
-DEFAULTS = {"keep": "valid_plus_home", "hint_conflict": "all", "hint_fallback": "if_not_valid",
-            "output_format": "E164"}
+DEFAULTS = {"keep_possible": "home", "when_hints_disagree": "all",
+            "also_try_regions": "if_hint_not_valid", "output_format": "E164"}
+BOOLS = {"valid_ignores_min_score": True, "keep_unknown": False}
+
+# Temporary aliases: remove with the next config change. Old key ->
+# (new key, {old value: new value}); values not listed keep their name.
+ALIASES: dict[str, tuple[str, dict[str, str]]] = {
+    "keep": ("keep_possible", {"valid": "never", "valid_else_possible": "if_no_valid",
+                               "valid_plus_home": "home", "all": "always"}),
+    "hint_fallback": ("also_try_regions", {"if_nothing": "if_hint_fails",
+                                           "if_not_valid": "if_hint_not_valid"}),
+    "hint_conflict": ("when_hints_disagree", {}),
+}
 STATUSES = ("valid", "possible", "impossible")
 SOURCES = ("number", "hint", "regions")   # decided_by of a validation row
 
@@ -74,13 +99,16 @@ def label_for(status: str, region: str | None) -> str:
 class PhoneSpec:
     regions: list[str]
     hints: dict[str, dict[str, float]] = field(default_factory=dict)
-    keep: str = "valid_plus_home"
-    hint_conflict: str = "all"
-    hint_fallback: str = "if_not_valid"
+    keep_possible: str = "home"
+    when_hints_disagree: str = "all"
+    also_try_regions: str = "if_hint_not_valid"
     output_format: str = "E164"
     # A valid reading is never dropped for scoring below settings.min_score
     # (it still competes in overlaps).
     valid_ignores_min_score: bool = True
+    # A hit with no reading (fits no region tried) becomes an `unknown_number`
+    # match instead of being dropped.
+    keep_unknown: bool = False
 
 
 WeightMap = Callable[[str, str, Any], dict[str, float]]
@@ -96,6 +124,42 @@ def _region(label: str, key: str, value: Any) -> str:
     return code
 
 
+def _renamed(label: str, raw: dict[str, Any]) -> dict[str, Any]:
+    """The block with old key names and values (ALIASES) rewritten to the new
+    ones, warning once per old key. Old and new form of one key: an error."""
+    where = f"pattern '{label}': validate"
+    out = dict(raw)
+    for old, (new, values) in ALIASES.items():
+        if old not in raw:
+            continue
+        if new in raw:
+            raise ValueError(f"{where}: both '{old}' and '{new}' are given; "
+                             f"'{old}' is the old name of '{new}', keep only '{new}'")
+        value = out.pop(old)
+        renamed = values.get(value, value) if isinstance(value, str) else value
+        out[new] = renamed
+        warnings.warn(f"pattern '{label}': validate.{old} is renamed {new}; "
+                      f"{old}: {value} -> {new}: {renamed}", stacklevel=2)
+    return out
+
+
+def _warn_inert(label: str, raw: dict[str, Any], spec: PhoneSpec) -> None:
+    """Warn about settings the user wrote that cannot change anything."""
+    where = f"pattern '{label}': validate"
+    if not spec.hints:
+        for key in ("also_try_regions", "when_hints_disagree"):
+            if key in raw:
+                warnings.warn(f"{where}.{key} has no effect without hints", stacklevel=3)
+    # With one region there is at most one list reading, and it is the home
+    # one, so if_no_valid, home and always keep the same readings. Except:
+    # with also_try_regions: always a valid hinted reading makes if_no_valid
+    # drop a possible list reading.
+    if ("keep_possible" in raw and spec.keep_possible != "never" and len(spec.regions) == 1
+            and not (spec.hints and spec.also_try_regions == "always")):
+        warnings.warn(f"{where}.keep_possible: with one region, if_no_valid, home and "
+                      "always behave the same", stacklevel=3)
+
+
 def load_validate(label: str, raw: Any, weight_map: WeightMap) -> PhoneSpec:
     """Check one pattern's `validate` block and return its PhoneSpec.
 
@@ -105,6 +169,7 @@ def load_validate(label: str, raw: Any, weight_map: WeightMap) -> PhoneSpec:
     where = f"pattern '{label}': validate"
     if not isinstance(raw, dict):
         raise ValueError(f"{where} must be a map, got {type(raw).__name__}")
+    raw = _renamed(label, raw)
     unknown = [k for k in raw if k not in VALIDATE_KEYS]
     if unknown:
         raise ValueError(f"{where}: unknown key '{unknown[0]}' (expected one of {', '.join(VALIDATE_KEYS)})")
@@ -134,10 +199,11 @@ def load_validate(label: str, raw: Any, weight_map: WeightMap) -> PhoneSpec:
         if value not in choices:
             raise ValueError(f"{where}.{key}: unknown value {value!r} (expected one of {', '.join(choices)})")
         opts[key] = value
-    ignores = raw.get("valid_ignores_min_score", True)
-    if not isinstance(ignores, bool):
-        raise ValueError(f"{where}.valid_ignores_min_score: expected true or false, got {ignores!r}")
-    opts["valid_ignores_min_score"] = ignores
+    for key, default in BOOLS.items():
+        value = raw.get(key, default)
+        if not isinstance(value, bool):
+            raise ValueError(f"{where}.{key}: expected true or false, got {value!r}")
+        opts[key] = value
 
     hints_raw = raw.get("hints") or {}
     if not isinstance(hints_raw, dict):
@@ -153,7 +219,9 @@ def load_validate(label: str, raw: Any, weight_map: WeightMap) -> PhoneSpec:
             raise ValueError(f"{where}.hints.{code}: keyword '{bad[0]}' needs a weight > 0")
         hints[code] = weights
 
-    return PhoneSpec(regions=regions, hints=hints, **opts)
+    spec = PhoneSpec(regions=regions, hints=hints, **opts)
+    _warn_inert(label, raw, spec)
+    return spec
 
 
 # --------------------------------------------------------------------------
@@ -272,7 +340,7 @@ class Reading:
     number_type: str = ""
     parsed_in: str | None = None  # the region it was parsed in (None: "+" number)
     source: str = "regions"     # number | hint | regions
-    returned: bool = True       # False: filtered out by keep / hint_conflict
+    returned: bool = True       # False: filtered out by keep_possible / when_hints_disagree
     why: str = ""               # why not returned
     e164: str = ""              # always E.164 ("" if local-only: there is none): the
                                 # report's `normalized` column, whatever output_format says
@@ -366,17 +434,18 @@ def readings_for(
         from_hints = _hinted(raw, spec, hinted)
         live = [r for r in from_hints if r.returned]
         names = ", ".join(h.region for h in hinted)
-        if spec.hint_fallback == "never":
+        if spec.also_try_regions == "never":
             if live:
                 return Outcome(from_hints, "hint")
-            return Outcome([], "hint", why=f"impossible in hinted {names}; hint_fallback: never")
+            return Outcome([], "hint", why=f"impossible in hinted {names}; also_try_regions: never")
         if not live:
             notes.append(f"hint {names} did not fit")
-        elif spec.hint_fallback == "if_nothing" or (
-                spec.hint_fallback == "if_not_valid" and any(r.status == "valid" for r in live)):
+        elif spec.also_try_regions == "if_hint_fails" or (
+                spec.also_try_regions == "if_hint_not_valid"
+                and any(r.status == "valid" for r in live)):
             return Outcome(from_hints, "hint")
-        elif spec.hint_fallback == "if_not_valid":
-            notes.append(f"hint {names} not valid; hint_fallback: if_not_valid parsed the regions too")
+        elif spec.also_try_regions == "if_hint_not_valid":
+            notes.append(f"hint {names} not valid; also_try_regions: if_hint_not_valid")
 
     from_list, checks = _fitting(raw, spec.regions, spec)
     known = {r.key for r in from_hints}
@@ -410,7 +479,7 @@ def _numbered(raw: str, c: Check, spec: PhoneSpec) -> Reading:
 
 def _hinted(raw: str, spec: PhoneSpec, hinted: list[RegionHint]) -> list[Reading]:
     """Readings in the hinted regions: valid ones, else possible ones;
-    hint_conflict: nearest keeps only the nearest hint word's region(s)."""
+    when_hints_disagree: nearest keeps only the nearest hint word's region(s)."""
     by_region = {h.region: h for h in hinted}
     order = sorted(hinted, key=lambda h: (h.nearness(), -h.score, h.region))
     found: list[Reading] = []
@@ -428,25 +497,25 @@ def _hinted(raw: str, spec: PhoneSpec, hinted: list[RegionHint]) -> list[Reading
             hint_of[r.key] = by_region[h.region]
     if any(r.status == "valid" for r in found):
         _hold(found, lambda r: r.status == "valid", "a hinted region gives a valid reading")
-    if spec.hint_conflict == "nearest":
+    if spec.when_hints_disagree == "nearest":
         live = [r for r in found if r.returned]
         if live:
             best = min((hint_of[r.key].nearness(), -hint_of[r.key].score) for r in live)
             _hold(found, lambda r: (hint_of[r.key].nearness(), -hint_of[r.key].score) == best,
-                  "hint_conflict: nearest (a nearer hint word won)")
+                  "when_hints_disagree: nearest (a nearer hint word won)")
     return found
 
 
 def _filter_list(found: list[Reading], spec: PhoneSpec, hinted_valid: bool = False) -> None:
-    """Apply `keep` to the list readings (in region order). A valid hinted
-    reading (hint_fallback: always) counts as a valid reading here, so
-    valid_else_possible drops the possible list readings next to it."""
+    """Apply `keep_possible` to the list readings (in region order). A valid
+    hinted reading (also_try_regions: always) counts as a valid reading here,
+    so if_no_valid drops the possible list readings next to it."""
     has_valid = hinted_valid or any(r.status == "valid" for r in found)
     home = next((r for r in found if r.parsed_in == spec.regions[0]), None)
-    mode = spec.keep
-    if mode == "valid":
-        _hold(found, lambda r: r.status == "valid", "keep: valid")
-    elif mode == "valid_else_possible" and has_valid:
-        _hold(found, lambda r: r.status == "valid", "keep: valid_else_possible")
-    elif mode == "valid_plus_home":
-        _hold(found, lambda r: r.status == "valid" or r is home, "keep: valid_plus_home")
+    mode = spec.keep_possible
+    if mode == "never":
+        _hold(found, lambda r: r.status == "valid", "keep_possible: never")
+    elif mode == "if_no_valid" and has_valid:
+        _hold(found, lambda r: r.status == "valid", "keep_possible: if_no_valid")
+    elif mode == "home":
+        _hold(found, lambda r: r.status == "valid" or r is home, "keep_possible: home")

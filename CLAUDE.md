@@ -49,21 +49,27 @@ string, and resolves overlapping matches.
    (no tie-breaking between regions). The steps, first that applies:
    - `+` number (or `00` as a last resort);
    - the hinted regions (valid readings, else possible ones;
-     `hint_conflict` all | nearest);
-   - the `regions` list, filtered by `keep` (a valid hinted reading counts
-     as valid for `keep`). After a hint, it runs per
-     `hint_fallback`: if_not_valid (default; no valid hinted reading),
-     if_nothing (no hinted reading), always, never. Its readings are added
-     (source `regions`); each reading keeps its own source.
+     `when_hints_disagree` all | nearest);
+   - the `regions` list: valid readings always come back; `keep_possible`
+     filters the possible ones (a valid hinted reading counts as valid for
+     `if_no_valid`). After a hint, it runs per `also_try_regions`: never,
+     if_hint_fails (no hinted reading), if_hint_not_valid (default; no valid
+     hinted reading), always. Its readings are added (source `regions`);
+     each reading keeps its own source. `keep_possible` never filters
+     hinted or `+` readings.
    Each returned reading becomes a match labeled `{status}_{REGION}_number`,
    with `pattern` = the pattern label, a shared `hit` id, `text` = the
    number in `output_format` (E164 | INTERNATIONAL | NATIONAL | RAW; RAW keeps
    the input slice) and `raw` = the written form (report `a_text` only; never
    in `to_dict()`). The report's `normalized` column is always E.164 (blank when there is
-   none: local-only readings, dropped hits).
+   none: local-only readings, dropped or unknown hits).
    Validation rows: one per reading (kept / not_kept), or one `dropped`
-   row when the hit is impossible everywhere (status `impossible`; `possible`
-   for a `+` number that is possible only as a local number).
+   row when the hit has no reading (status `impossible`; `possible`
+   for a `+` number that is possible only as a local number). With
+   `keep_unknown: true` that hit becomes one `unknown_number` match (raw
+   text, same `pattern`/`hit`/status) and the row says `kept_unknown`; it
+   needs `min_score` and competes in overlaps normally. A hit whose readings
+   were all filtered out (not_kept only) never becomes `unknown_number`.
 5. `resolve_overlaps(...)`: drop below `min_score` (valid phone readings are
    exempt when `validate.valid_ignores_min_score`, the default; internal
    `Candidate.status`); for overlapping spans keep
@@ -81,7 +87,7 @@ string, and resolves overlapping matches.
    and summarizes them per pattern pair (`a_pattern`) (counts by `decided_by`, `no_evidence`,
    examples, hint); `summarize_misses(path)` counts `miss` rows per label
    (no candidates / dropped); `summarize_validation(path)` counts `validation`
-   rows per pattern (statuses, sources, not_kept, multi-reading
+   rows per pattern (statuses, sources, not_kept, dropped, unknown, multi-reading
    hits, possible-number area-code clusters). CLI: `extract.py --summarize [PATH]` prints all three
    (no `--config`; not combinable with the scan flags).
 
@@ -95,31 +101,42 @@ string, and resolves overlapping matches.
   digit/accented keywords, duplicate keywords within a key (also spelled
   differently, e.g. "amount-due" / "amount due") and non-numeric weights.
 - Only the current config format is supported (single user): no checks or
-  messages for earlier formats. Unknown keys and values fail with the list of
+  messages for earlier formats. One temporary exception: the old `validate`
+  names `keep`, `hint_fallback` and `hint_conflict` (and their old values)
+  load as aliases with a rename warning (`phone.ALIASES`; old and new name
+  together is an error). Remove them with the next config change. Unknown keys and values fail with the list of
   allowed ones; so do values of the wrong type (booleans must be YAML
   true/false, `priority` / `context_window_words` whole numbers, `regex` and
   `label` non-empty strings), every `coexist` entry (a pair of two different
   known labels; reading labels allowed when a pattern has `validate`) and
   every `tests` case (keys name, text, context, expect). A pattern label may
-  not take the reading form `{valid,possible}_{REGION}_number`.
+  not take the reading form `{valid,possible}_{REGION}_number`, nor be
+  `unknown_number` (allowed in `coexist` when a pattern has `keep_unknown`).
 
 ## Phone validation (`validate:` block)
 - Keys:
   - `with: phonenumbers` and `regions: [US, ...]` (required; the first is
     the home region);
   - `hints` ({REGION: {word: weight > 0}}, read like `keywords`);
-  - `keep` (valid_plus_home | all | valid_else_possible | valid): which
-    readings of the `regions` list come back;
-  - `hint_conflict` (all | nearest);
-  - `hint_fallback` (if_not_valid | if_nothing | always | never);
+  - `keep_possible` (never | if_no_valid | home | always; default home):
+    which possible readings of the `regions` list come back;
+  - `when_hints_disagree` (all | nearest; default all);
+  - `also_try_regions` (never | if_hint_fails | if_hint_not_valid | always;
+    default if_hint_not_valid);
   - `output_format` (E164 | INTERNATIONAL | NATIONAL | RAW): the match `text`;
-  - `valid_ignores_min_score` (bool, default true).
+  - `valid_ignores_min_score` (bool, default true);
+  - `keep_unknown` (bool, default false).
 
-  An unknown key or value fails, naming the allowed ones.
+  An unknown key or value fails, naming the allowed ones. A setting the
+  user wrote that can do nothing warns (not fails): `also_try_regions` /
+  `when_hints_disagree` without `hints`; `keep_possible` other than never
+  with one region, unless hints + `also_try_regions: always`.
 - Never lose a hit silently: every validated regex hit ends up as matches or
-  a `dropped` row with a reason (which includes the phonenumbers version).
+  a `dropped` / `kept_unknown` row with a reason (which includes the
+  phonenumbers version).
 - `coexist`, miss rows and `summarize_validation` use
-  `Candidate.pattern`, so rules naming the pattern label cover every reading.
+  `Candidate.pattern`, so rules naming the pattern label cover every reading
+  (and `unknown_number`; a surviving one suppresses the miss row).
 - Regions come only from the YAML (`regions`, `hints`, a `+` in the number);
   there is no per-call region argument or CLI flag.
 
@@ -155,7 +172,10 @@ string, and resolves overlapping matches.
   `miss` rows, the score breakdown, every `decided_by` value,
   `summarize_overlaps`, `summarize_misses` and `--summarize`, and the public
   API as the README shows it. Phone: `validate` load errors,
-  each status, every `keep`, `hint_conflict` and `hint_fallback` mode, hints
+  the old-name aliases and the do-nothing warnings, each status, every
+  `keep_possible`, `when_hints_disagree` and `also_try_regions` mode,
+  `keep_unknown` (each no-reading case, min_score, overlaps, coexist, label
+  reservation, misses, summary counts), hints
   (including misfits), `+`/`00`/`011`, span refinement (incl. space-grouped trimming),
   `valid_ignores_min_score`, and back-to-back
   numbers, readings vs other patterns, coexist/misses via `pattern`, every `output_format`,

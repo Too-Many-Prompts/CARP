@@ -79,9 +79,11 @@ REPORT_FIELDS = (
 # decided_by: overlap -> score | length | priority | start_label;
 # coexist -> coexist; below_min_score -> min_score; miss -> "";
 # validation -> the region source (phone.SOURCES: number | hint | regions).
-# normalized: always E.164; blank when there is none (dropped hit, local-only reading).
+# normalized: always E.164; blank when there is none (dropped or unknown hit,
+# local-only reading).
 # miss outcome: no_candidates (regex gap) | candidates_dropped (tuning).
-# validation outcome: kept | not_kept (a reading filtered out) | dropped (impossible).
+# validation outcome: kept | not_kept (a reading filtered out) | dropped (no
+# reading) | kept_unknown (no reading, kept as unknown_number by keep_unknown).
 REQUIRED_SETTINGS = (
     "context_window_words",
     "distance_decay",
@@ -98,6 +100,9 @@ TEST_KEYS = ("name", "text", "context", "expect")
 # A generated phone reading label ({status}_{REGION}_number; phone.label_for).
 # Pattern labels may not take this form, and coexist may name one.
 _READING_LABEL = re.compile(r"(valid|possible)_([A-Z]{2}|\d{3})_number")
+# The label of a phone hit with no reading, kept by validate.keep_unknown.
+# Reserved: no pattern may use it; coexist may name it when keep_unknown is on.
+UNKNOWN_LABEL = "unknown_number"
 
 # extract() accepts: plain text, {"text": ..., "context": ...}, or (context, text).
 ExtractInput = Union[str, dict, tuple]
@@ -421,6 +426,11 @@ def _load_pattern(entry: Any, flags: int, seen: set[str]) -> Pattern:
             f"pattern '{label}': label is the form of a phone reading label "
             "({status}_{REGION}_number); rename it"
         )
+    if label == UNKNOWN_LABEL:
+        raise ValueError(
+            f"pattern '{label}': label is reserved for phone hits kept by "
+            "validate.keep_unknown; rename it"
+        )
     seen.add(label)
     where = f"pattern '{label}'"
     regex = _require_text(_require(entry, "regex", where), f"{where}: regex")
@@ -445,7 +455,8 @@ def _load_pattern(entry: Any, flags: int, seen: set[str]) -> Pattern:
 
 def _load_coexist(raw: dict[str, Any], patterns: list[Pattern]) -> set[frozenset[str]]:
     """Check `coexist`: a list of [label, label] pairs. A label is a pattern
-    label or, when a pattern has `validate`, a reading label (valid_US_number)."""
+    label or, when a pattern has `validate`, a reading label (valid_US_number);
+    unknown_number too when a pattern has validate.keep_unknown."""
     entries = raw.get("coexist")
     if entries is None:
         return set()
@@ -453,7 +464,9 @@ def _load_coexist(raw: dict[str, Any], patterns: list[Pattern]) -> set[frozenset
         raise ValueError(f"coexist: expected a list of label pairs, got {type(entries).__name__}")
     known = [p.label for p in patterns]
     readings = any(p.validate for p in patterns)
-    allowed = ", ".join(known + (["{status}_{REGION}_number"] if readings else []))
+    unknown = any(p.validate and p.validate.keep_unknown for p in patterns)
+    allowed = ", ".join(known + (["{status}_{REGION}_number"] if readings else [])
+                        + ([UNKNOWN_LABEL] if unknown else []))
     out: set[frozenset[str]] = set()
     for entry in entries:
         if not isinstance(entry, list) or len(entry) != 2:
@@ -462,7 +475,8 @@ def _load_coexist(raw: dict[str, Any], patterns: list[Pattern]) -> set[frozenset
             )
         for name in entry:
             if not isinstance(name, str) or not (
-                    name in known or (readings and _READING_LABEL.fullmatch(name))):
+                    name in known or (readings and _READING_LABEL.fullmatch(name))
+                    or (unknown and name == UNKNOWN_LABEL)):
                 raise ValueError(f"coexist: unknown label {name!r} (expected one of {allowed})")
         if entry[0] == entry[1]:
             raise ValueError(f"coexist: entry {entry!r} names '{entry[0]}' twice")
@@ -840,7 +854,12 @@ def validate_candidates(
     (phone.readings_for). The readings share the hit's span and score and
     never conflict with each other. Logs one `validation` row per reading
     (kept / not_kept), or one `dropped` row when the hit has no reading
-    (impossible everywhere, or a local-only "+" number). Runs after scoring
+    (impossible everywhere, a local-only "+" number, or also_try_regions:
+    never with no fitting hint). With validate.keep_unknown that hit becomes
+    one `unknown_number` match (raw text, status impossible or possible) and
+    the row says `kept_unknown`; min_score and overlaps then treat it like
+    any match. A hit whose readings were all filtered out (not_kept) is
+    never turned into unknown_number. Runs after scoring
     and before min_score/overlaps; other
     candidates pass through. `cache` holds hints _find_validated already
     computed for a span."""
@@ -860,8 +879,13 @@ def validate_candidates(
         out = phone.readings_for(c.text, spec, hints)
         tail = out.notes + [f"phonenumbers {version}"]
         if not out.readings:
+            verdict, why = "dropped", [out.why]
+            if spec.keep_unknown:
+                c = replace(c, label=UNKNOWN_LABEL, raw=c.text, hit=hit_id, status=out.status)
+                kept.append(c)
+                verdict, why = "kept_unknown", [out.why, "keep_unknown"]
             decisions.append(_decision(
-                "validation", "dropped", "; ".join([out.why] + tail), a=c,
+                "validation", verdict, "; ".join(why + tail), a=c,
                 decided_by=out.source, status=out.status,
             ))
             continue

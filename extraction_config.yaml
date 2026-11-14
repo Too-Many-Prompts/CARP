@@ -49,13 +49,18 @@ patterns:
       regions: [US]              # parse in these, in order; the first is the home region
       # Each reading becomes a match: valid_US_number, possible_US_number (right
       # length, unknown range, e.g. a new area code), valid_GB_number ...
-      # Impossible hits are dropped and logged in the report.
+      # Impossible hits are dropped and logged in the report (see keep_unknown).
       # hints:                   # words that point to a region (text window + context);
       #   GB: {uk: 3, britain: 3, british: 2, england: 2, london: 2}   # parsed first, then
-      #   IN: {india: 3, indian: 2, mumbai: 2, delhi: 2}                # see hint_fallback
-      # keep: valid_plus_home     # which list readings come back: valid_plus_home | all | valid_else_possible | valid
-      # hint_conflict: all       # valid in several hinted regions: all | nearest
-      # hint_fallback: if_not_valid  # after a hint, also parse `regions`: if_not_valid | if_nothing | always | never
+      #   IN: {india: 3, indian: 2, mumbai: 2, delhi: 2}                # see also_try_regions
+      # keep_possible: home      # possible readings from `regions` to keep (valid ones always are):
+      #                          #   never | if_no_valid (only when none is valid)
+      #                          #   | home (the first region's) | always
+      # when_hints_disagree: all # several hinted regions fit: all (keep each) | nearest (nearest hint word)
+      # also_try_regions: if_hint_not_valid  # after a hint, also parse `regions`:
+      #                          #   never | if_hint_fails (no hinted reading)
+      #                          #   | if_hint_not_valid (no valid hinted reading) | always
+      # keep_unknown: false      # true: keep a hit that fits nowhere as unknown_number (raw text)
       # output_format: E164      # match text: E164 | INTERNATIONAL | NATIONAL | RAW (as written)
       # valid_ignores_min_score: true  # a valid number is never dropped for a low score
 

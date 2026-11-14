@@ -143,7 +143,24 @@ What comes back:
 - **`text` is the number, cleaned up:** `+12125550123`. `start`/`end` still
   point at the number as written.
 - **A number that fits nowhere** (wrong length everywhere) is dropped, and the
-  report says why.
+  report says why. Set `keep_unknown: true` to keep it instead, as
+  `unknown_number` with its raw text.
+
+How it works, in short. Each phone-shaped hit is read in one or more regions.
+Each reading is graded:
+- **valid**: a real number in that region;
+- **possible**: the right length, but the range isn't known (e.g. a new
+  area code);
+- **impossible**: it fits nowhere.
+
+**Where to look, in order:**
+1. A `+` number's country code decides. Nothing else is consulted.
+2. Otherwise, regions named by **hint words** near the number are tried first.
+3. Then the **`regions` list**, if `also_try_regions` allows it.
+
+**What comes back:** valid readings always. `keep_possible` decides
+possible readings from the `regions` list. Impossible hits are dropped and
+logged, unless `keep_unknown: true` keeps them as `unknown_number`.
 
 ### YAML Config
 

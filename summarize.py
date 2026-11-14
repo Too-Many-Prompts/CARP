@@ -43,14 +43,16 @@ MISS_FIELDS = ("label", "misses", "no_candidates", "dropped", "examples", "hint"
 HINT_MISS_REGEX = "the regex found nothing; check the regex against these inputs"
 HINT_MISS_TUNING = "candidates lost; raise their nearby/context weights or check min_score"
 VALIDATION_FIELDS = (
-    "pattern", "hits", "kept", "valid", "possible", "not_kept", "dropped", "multi",
+    "pattern", "hits", "kept", "valid", "possible", "not_kept", "dropped", "unknown", "multi",
     "sources", "regions", "clusters", "examples", "hint",
 )
 _CLUSTER_MIN = 3        # possible numbers sharing leading digits before the hint shows
 HINT_STALE = ("many possible numbers share these digits; phonenumbers metadata "
               "may be stale, upgrade it")
-HINT_MULTI = "numbers fit several regions; add hints, or set keep / hint_conflict"
+HINT_MULTI = "numbers fit several regions; add hints, or set keep_possible / when_hints_disagree"
 HINT_IMPOSSIBLE = "many impossible; tighten the regex or add regions"
+# Outcomes of a hit with no reading: its only validation row.
+_NO_READING = ("dropped", "kept_unknown")
 
 
 @dataclass
@@ -225,12 +227,13 @@ def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]
     """Count a report CSV's `validation` rows per phone pattern (`a_pattern`).
 
     A hit is one phone number in the text; it has one row per reading
-    (`kept` or `not_kept`) or one `dropped` row (impossible). Per pattern:
-    hits, kept readings by status, not_kept, dropped, `multi` (hits
+    (`kept` or `not_kept`) or, with no reading, one `dropped` row (or
+    `kept_unknown` with validate.keep_unknown). Per pattern: hits, kept
+    readings by status, not_kept, dropped, unknown (kept_unknown), `multi` (hits
     with more than one kept reading), counts by source (`decided_by`) and by
     region, `possible` readings grouped by leading digits (a cluster sharing
     an area code suggests the library's metadata is stale), up to three
-    examples of multi or dropped hits, and a hint. Sorted by hits (highest
+    examples of multi, dropped or unknown hits, and a hint. Sorted by hits (highest
     first), then pattern.
 
     A hit's rows are written together, so hits are told apart by row order
@@ -258,7 +261,7 @@ def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]
             st["out"][outcome] += 1
             st["texts"].setdefault(hit, row.get("a_text", ""))
             st["hits"][hit] += outcome == "kept"
-            if outcome == "dropped":
+            if outcome in _NO_READING:
                 st.setdefault("dropped_hits", []).append(hit)
                 st["impossible"] = st.get("impossible", 0) + (row.get("status") == "impossible")
                 continue
@@ -296,6 +299,7 @@ def summarize_validation(path: str = DEFAULT_REPORT_PATH) -> list[dict[str, Any]
             "possible": st["status"]["possible"],
             "not_kept": st["out"]["not_kept"],
             "dropped": st["out"]["dropped"],
+            "unknown": st["out"]["kept_unknown"],
             "multi": len(multi_hits),
             "sources": _joined(st["sources"]),
             "regions": _joined(st["regions"]),
@@ -314,7 +318,7 @@ class _HitCounter:
     written text (a_text), and no two of its readings share (region,
     normalized). So a new hit starts when any of those differ from the
     previous row, a non-validation row came between (gap()), the previous
-    row was a `dropped` one (a hit's only row), or a reading repeats.
+    row was a `dropped` or `kept_unknown` one (a hit's only row), or a reading repeats.
     """
 
     def __init__(self) -> None:
@@ -334,7 +338,7 @@ class _HitCounter:
             self.readings = set()
         self.last = same
         self.readings.add(reading)
-        self.closed = row.get("outcome") == "dropped"
+        self.closed = row.get("outcome") in _NO_READING
         return (same[0], self.serial)
 
 
