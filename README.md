@@ -14,10 +14,6 @@ CARP finds things in text with regular expressions, then decides which finds
 to trust by reading the words around them. Everything it knows lives in one
 YAML file, and every decision it makes can be written to a report.
 
-**In one sentence:** CARP finds every possible match, scores each by the words
-around it (and in the context you pass), and when two matches claim the same
-text, the higher score wins.
-
 **The full rules and the decision flow are in
 [REFERENCE.md](REFERENCE.md).** This page is the overview.
 
@@ -65,7 +61,8 @@ patterns:
     keywords: {account: 3, acct: 3, call: -2}
 ```
 
-The shipped `extraction_config.yaml` has these two patterns and several more.
+The shipped `extraction_config.yaml` has fuller versions of these two patterns
+(the phone one validated) and several more.
 **Every YAML option, with its values and what it does, is listed in
 [Config options](REFERENCE.md#config-options).** Run it on a text:
 
@@ -141,33 +138,18 @@ What comes back:
   `possible_GB_number` has the right length for GB but is in a range the
   library doesn't know (a new area code, say). Nothing is lost for being new.
 - **`text` is the number, cleaned up:** `+12125550123`. `start`/`end` still
-  point at the number as written.
+  point at the number as written (in the normalized text).
 - **A number that fits nowhere** (wrong length everywhere) is dropped, and the
   report says why. Set `keep_unknown: true` to keep it instead, as
   `unknown_number` with its raw text.
 
-How it works, in short. Each phone-shaped hit is read in one or more regions.
-Each reading is graded:
-- **valid**: a real number in that region;
-- **possible**: the right length, but the range isn't known (e.g. a new
-  area code);
-- **impossible**: it fits nowhere.
+**Where to look, in order:** a `+` number's country code decides; otherwise
+regions named by **hint words** near the number are tried first; then the
+**`regions` list**, if `also_try_regions` allows it. `keep_possible` decides
+which possible readings from that list come back.
 
-**Where to look, in order:**
-1. A `+` number's country code decides. Nothing else is consulted.
-2. Otherwise, regions named by **hint words** near the number are tried first.
-3. Then the **`regions` list**, if `also_try_regions` allows it.
-
-**What comes back:** valid readings always. `keep_possible` decides
-possible readings from the `regions` list. Impossible hits are dropped and
-logged, unless `keep_unknown: true` keeps them as `unknown_number`.
-
-### YAML Config
-
-Each option's values are listed in
-[Config options](REFERENCE.md#validate-inside-a-pattern). The exact rule,
-with every branch, is the
-[phone decision flow](REFERENCE.md#phone-decision-flow).
+Every option is in [`validate`](REFERENCE.md#validate-inside-a-pattern); the
+exact rule is the [phone decision flow](REFERENCE.md#phone-decision-flow).
 
 ## Setup
 
@@ -180,11 +162,7 @@ python -m venv .venv
 
 ## Quick start
 
-CLI: see step 3 above. It scans one text per run and prints JSON. Phone
-matches have the same fields; their `text` is the normalized number, and
-`start`/`end` still point at the number as written.
-
-Library:
+CLI: see step 3 above. Library:
 
 ```python
 from extract import load_config, extract
@@ -194,27 +172,10 @@ cfg = load_config("extraction_config.yaml")
 matches, decisions = extract("some text", cfg)
 ```
 
-Looping over many inputs, writing the report as you go:
-
-```python
-from extract import load_config, extract, open_report, reset_report
-
-cfg = load_config("extraction_config.yaml")
-reset_report()
-items = [("id-1", "call", "Call 212-555-0123"), ("id-2", "", "Invoice INV-004521")]
-
-with open_report() as write:           # opens the file once, holds nothing in memory
-    for id, context, text in items:
-        matches, decisions = extract((context, text), cfg, source=id)
-        write(decisions)
-        # use `matches` here
-```
+For many inputs, stream the report with `open_report()`: see
+[Library](REFERENCE.md#library).
 
 ## Seeing why
-
-**When a result surprises you, read its row in the report.** That is the normal
-way to tune CARP: run, look at the row that explains the surprise, change a
-weight, run again.
 
 Add `--report` to the CLI, or write `decisions` from the library. That
 produces `extract_report.csv` with one row per decision and each score split

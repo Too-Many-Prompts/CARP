@@ -1053,7 +1053,7 @@ def test_public_api_as_documented(
     m = matches_of(("call", "Call 212-555-0123"), cfg)[0]
     assert m.score == m.text_score + m.context_score
 
-    # The README loop: reset, then stream with open_report.
+    # The REFERENCE Library loop: reset, then stream with open_report.
     reset_report()
     items = [("id-1", "call", "Call 212-555-0123"), ("id-2", "tel", "Invoice INV-004521"),
              ("id-3", "", "Acct 2125550123 is overdue.")]
