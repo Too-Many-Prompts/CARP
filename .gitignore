@@ -5,3 +5,5 @@ errorlog.csv
 extract_report.csv
 .claude/
 flowchart.jpg
+.artifact-build/
+.superpowers/
