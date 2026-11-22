@@ -25,7 +25,9 @@ readings from the `regions` list (never | if_no_valid | home | always).
 At most one reading per country: regions read a prefix differently
 ("011 49 30 123456" is +4930123456 via the US prefix, +49114930123456 as
 German digits), so same-country readings compete (_one_per_country): valid
-beats possible, then the longer number wins; the loser is logged.
+beats possible; at equal status same_country_tiebreak decides (home: the
+home region's reading, else the longer; longest; shortest); the loser is
+logged.
 Impossible hits have no reading: extract.py drops and logs them, unless
 keep_unknown: true keeps them as `unknown_number`.
 
@@ -46,8 +48,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 VALIDATE_KEYS = ("with", "regions", "hints", "keep_possible", "when_hints_disagree",
-                 "also_try_regions", "output_format", "valid_ignores_min_score",
-                 "keep_unknown")
+                 "also_try_regions", "same_country_tiebreak", "output_format",
+                 "valid_ignores_min_score", "keep_unknown")
 CHOICES = {
     # Possible readings from the `regions` list: which come back.
     "keep_possible": ("never", "if_no_valid", "home", "always"),
@@ -56,10 +58,14 @@ CHOICES = {
     # After a hint, also parse the `regions` list: from never to always, by
     # how good the hinted result had to be to stop the search.
     "also_try_regions": ("never", "if_hint_fails", "if_hint_not_valid", "always"),
+    # Two readings of one country with the same status (valid/valid or
+    # possible/possible): which one stays.
+    "same_country_tiebreak": ("home", "longest", "shortest"),
     "output_format": ("E164", "INTERNATIONAL", "NATIONAL", "RAW"),
 }
 DEFAULTS = {"keep_possible": "home", "when_hints_disagree": "all",
-            "also_try_regions": "if_hint_not_valid", "output_format": "E164"}
+            "also_try_regions": "if_hint_not_valid", "same_country_tiebreak": "home",
+            "output_format": "E164"}
 BOOLS = {"valid_ignores_min_score": True, "keep_unknown": False}
 
 # Temporary aliases: remove with the next config change. Old key ->
@@ -106,6 +112,7 @@ class PhoneSpec:
     keep_possible: str = "home"
     when_hints_disagree: str = "all"
     also_try_regions: str = "if_hint_not_valid"
+    same_country_tiebreak: str = "home"
     output_format: str = "E164"
     # A valid reading is never dropped for scoring below settings.min_score
     # (it still competes in overlaps).
@@ -162,6 +169,10 @@ def _warn_inert(label: str, raw: dict[str, Any], spec: PhoneSpec) -> None:
             and not (spec.hints and spec.also_try_regions == "always")):
         warnings.warn(f"{where}.keep_possible: with one region, if_no_valid, home and "
                       "always behave the same", stacklevel=3)
+    # One region and no hints: a hit has one reading, so nothing competes.
+    if "same_country_tiebreak" in raw and len(spec.regions) == 1 and not spec.hints:
+        warnings.warn(f"{where}.same_country_tiebreak has no effect with one region "
+                      "and no hints", stacklevel=3)
 
 
 def load_validate(label: str, raw: Any, weight_map: WeightMap) -> PhoneSpec:
@@ -419,12 +430,18 @@ def _hold(readings: list[Reading], keep: Callable[[Reading], bool], why: str) ->
             r.returned, r.why = False, why
 
 
-def _rank(r: Reading, spec: PhoneSpec) -> tuple[bool, bool, int, bool, int, str]:
+def _rank(r: Reading, spec: PhoneSpec) -> tuple[bool, bool, bool, int, bool, int, str]:
     """Sort key among same-country readings of one hit; the smallest wins:
-    valid before possible, a full number before a local-only one, then the
-    longer E.164, then a hint reading, then the earlier region of `regions`."""
+    valid before possible, a full number before a local-only one, then
+    same_country_tiebreak: home (the reading parsed in the home region, as
+    the writer most likely dials like home: RU "8 10 49 ..." is a call
+    abroad; else the longer), longest or shortest E.164; then a hint
+    reading, then the earlier region of `regions`."""
+    mode = spec.same_country_tiebreak
     order = spec.regions.index(r.parsed_in) if r.parsed_in in spec.regions else len(spec.regions)
-    return (r.status != "valid", not r.e164, -len(r.e164), r.source != "hint", order, r.e164)
+    away = mode == "home" and r.parsed_in != spec.regions[0]
+    size = len(r.e164) if mode == "shortest" else -len(r.e164)
+    return (r.status != "valid", not r.e164, away, size, r.source != "hint", order, r.e164)
 
 
 def _one_per_country(readings: list[Reading], spec: PhoneSpec) -> dict[int, Reading]:

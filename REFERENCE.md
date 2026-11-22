@@ -175,6 +175,7 @@ of 0 is an error, and a word in `keywords` may not also be in `nearby` or
     keep_possible: home         # possible `regions` readings to keep: never | if_no_valid | home | always
     when_hints_disagree: all    # several hinted regions fit: all | nearest
     also_try_regions: if_hint_not_valid  # after a hint, also parse `regions`: never | if_hint_fails | if_hint_not_valid | always
+    same_country_tiebreak: home # two readings of one country, same status: home | longest | shortest
     keep_unknown: false         # true: keep a hit that fits nowhere as unknown_number
     output_format: E164         # the match text: E164 | INTERNATIONAL | NATIONAL | RAW
 ```
@@ -186,6 +187,7 @@ of 0 is an error, and a word in `keywords` may not also be in `nearby` or
 | `keep_possible` | default `home` | `never`, `if_no_valid`, `home`, `always` | Which *possible* readings from `regions` are kept; valid ones always are. `never`: none. `if_no_valid`: every possible one when there is no valid reading (a valid hinted reading counts, with `also_try_regions: always`). `home`: the home country's, even when another one is valid. `always`: every one. Hinted and `+` readings are not filtered by it. |
 | `when_hints_disagree` | default `all` | `all`, `nearest` | When several hinted regions give a reading (valid ones if any, otherwise possible ones): `all` keeps every one; `nearest` keeps only the region whose hint word is nearest. A word in the text window is nearer than any context word, then the higher hint score wins, and an exact tie keeps both. |
 | `also_try_regions` | default `if_hint_not_valid` | `never`, `if_hint_fails`, `if_hint_not_valid`, `always` | After a hint, whether `regions` is parsed too. `never`: never, so a number that fits no hinted region has no reading. `if_hint_fails`: only when the hinted regions gave no reading at all. `if_hint_not_valid`: when no hinted reading is valid. `always`: every time. |
+| `same_country_tiebreak` | default `home` | `home`, `longest`, `shortest` | When one hit gives two readings of the same country with the same status (both valid or both possible), which one is kept. A valid reading always beats a possible one. `home`: the one read in the home country (the first of `regions`), since the writer most likely dials like home; if neither was, the longer. `longest`: the longer number (usually the national reading). `shortest`: the shorter number; with possible readings this is often a misread prefix. See [Phone-Specific Labels](#phone-specific-labels). |
 | `output_format` | default `E164` | `E164`, `INTERNATIONAL`, `NATIONAL`, `RAW` | How a match's `text` is written: `+12125550123`, `+1 212-555-0123`, `(212) 555-0123`, or `RAW`, the number exactly as written in the input. |
 | `valid_ignores_min_score` | default `true` | `true`, `false` | `true`: a reading the library confirms is valid is never dropped for scoring below `settings.min_score`, so a stray negative word can't erase a real number. It still competes in overlaps, so `Acct 2125550123` can still go to `account_number`. Possible readings always need `min_score`. `false`: valid readings need `min_score` too. |
 | `keep_unknown` | default `false` | `true`, `false` | `true`: a hit that fits no region (or that `also_try_regions: never` stopped) is kept as `unknown_number` with its raw text instead of being dropped. It must reach `min_score` and competes in overlaps like any match. |
@@ -412,13 +414,18 @@ is `+4930123456` through the US prefix `011`, but `+49114930123456` when DE
 reads the same digits as a German national number. Both are DE numbers, so
 only one is kept, here the valid `+4930123456`. The rule:
 1. valid beats possible;
-2. otherwise the longer number wins (usually the national reading);
+2. between two readings of the same status, `same_country_tiebreak` decides.
+   `home` (the default): the one read in the home region (the first entry of
+   `regions`) wins, since the writer most likely dials like home; if neither
+   was, the longer number wins. `longest`: the longer number.
+   `shortest`: the shorter number;
 3. ties go to a hint reading, then to the earlier region of `regions`.
 
 Example: with `regions: [RU, DE]`, `8 10 49 98516242` gives two valid DE
-numbers, `+4998516242` (RU's prefix `8 10`) and `+498104998516242`. The longer
-one is kept. The other reading gets a `not_kept` row with the reason
-`another reading of this hit in DE was kept: +498104998516242`.
+numbers, `+4998516242` (RU's international prefix `8 10`) and
+`+498104998516242` (the digits read as a German number). RU is home, so
+`+4998516242` is kept. The other reading gets a `not_kept` row with the reason
+`another reading of this hit in DE was kept: +4998516242`.
 Different countries are never merged: `201-555-0123` with `[US, GB]` and
 `keep_possible: always` still gives both `valid_US_number` and
 `valid_GB_number`, and the same number written twice at different places
@@ -444,6 +451,42 @@ stays two matches.
   With `regions: [US, GB]`, `0406 812 4158` is impossible in the US and only
   possible in GB: `home` (and `never`) give no match, while `if_no_valid` or
   `always` give `possible_GB_number` (`+444068124158`).
+
+### When `same_country_tiebreak` applies
+
+All of these must be true:
+- **One hit, two readings, one country.** The same written number (the same
+  span of text) is read in two regions, and both readings land in the same
+  country but give different numbers. Readings that give the same E.164
+  number are already one reading, and readings of different countries are
+  never compared.
+- **The same status.** Both are valid or both are possible. A valid reading
+  always beats a possible one, whatever the setting.
+- **Both are full numbers.** A full number always beats a local-only reading.
+
+In practice this happens when the number starts with digits that one region
+dials as an **international prefix** (`011` in the US, `00` in most of
+Europe, `8 10` in Russia, `0011` in Australia), while another region reads
+those same digits as part of a domestic number. The two readings usually
+differ in length: the prefix reading drops those digits, while the domestic
+reading keeps them.
+
+| `regions` | Written | Prefix reading | Domestic reading | `home` keeps |
+| --- | --- | --- | --- | --- |
+| `[RU, DE]` | `8 10 49 98516242` | `+4998516242` (RU dials out with `8 10`) | `+498104998516242` (DE area code `08104`) | `+4998516242` (RU is home) |
+| `[US, NL]` | `01131794698` | `+31794698` (US dials out with `011`) | `+311131794698` (NL national digits) | `+31794698` (US is home) |
+| `[AU, NL]` | `006104735` | `+6104735` (NL dials out with `00`) | `+6106104735` (AU national digits) | `+6106104735` (AU is home) |
+
+Which to choose:
+- `home` (default): your writers dial like the home region. Then a prefix
+  the home region uses really is a call abroad, and digits the home region
+  reads as its own number are a local number.
+- `longest`: keep the domestic reading, whatever the home region.
+- `shortest`: keep the prefix reading. With possible readings, the short one
+  is often a misread prefix, so use it only where most numbers are valid.
+
+The other reading is never lost silently: it gets a `not_kept` row naming
+the reading that was kept.
 
 ### Worked example: one number, three setups
 
@@ -681,8 +724,8 @@ keyword validation, `decided_by`, `miss` rows, the
 report CSV and its score breakdown, the summaries, the CLI, and the public API
 as shown in the README and this reference. Phone tests cover the `validate`
 load errors, the renamed-setting aliases and the warnings for settings that
-do nothing, each status, every `keep_possible`, `when_hints_disagree`
-and `also_try_regions` mode, `keep_unknown`, hints (including a hint that does not fit), `+`, `00` and
+do nothing, each status, every `keep_possible`, `when_hints_disagree`,
+`also_try_regions` and `same_country_tiebreak` mode, `keep_unknown`, hints (including a hint that does not fit), `+`, `00` and
 `011`, span refinement and back-to-back numbers, readings competing with
 other patterns, `coexist` and misses through `pattern`, every `output_format`, the report
 rows and the validation summary.

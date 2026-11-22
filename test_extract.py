@@ -1348,6 +1348,8 @@ def got(matches: list[Any]) -> list[tuple[str, str]]:
     ({"with": "phonenumbers", "regions": ["US"], "keep_possible": "some"}, "validate.keep_possible: unknown value 'some'"),
     ({"with": "phonenumbers", "regions": ["US"], "when_hints_disagree": "first"}, "validate.when_hints_disagree: unknown value"),
     ({"with": "phonenumbers", "regions": ["US"], "output_format": "e164"}, "validate.output_format: unknown value"),
+    ({"with": "phonenumbers", "regions": ["US"], "same_country_tiebreak": "first"},
+     "validate.same_country_tiebreak: unknown value 'first' \\(expected one of home, longest, shortest\\)"),
     ({"with": "phonenumbers", "regions": ["US"], "valid_ignores_min_score": "yes"},
      "validate.valid_ignores_min_score: expected true or false"),
     ({"with": "phonenumbers", "regions": ["US"], "hints": {"GB": {"uk2": 1}}},
@@ -1625,6 +1627,7 @@ def test_bad_value_under_an_old_name_lists_the_new_values(tmp_path: Path) -> Non
     ({"when_hints_disagree": "nearest"}, "when_hints_disagree has no effect without hints"),
     ({"keep_possible": "always"}, "keep_possible: with one region"),
     ({"keep_possible": "if_no_valid", "hints": UK_INDIA}, "keep_possible: with one region"),
+    ({"same_country_tiebreak": "longest"}, "same_country_tiebreak has no effect with one region"),
 ])
 def test_settings_that_do_nothing_warn(tmp_path: Path, validate: dict, message: str) -> None:
     with pytest.warns(UserWarning, match=message):
@@ -1635,6 +1638,8 @@ def test_settings_that_do_nothing_warn(tmp_path: Path, validate: dict, message: 
     {},                                                     # defaults never warn
     {"keep_possible": "never"},                             # differs with one region
     {"keep_possible": "home", "regions": ["US", "GB"]},
+    {"same_country_tiebreak": "shortest", "regions": ["US", "GB"]},
+    {"same_country_tiebreak": "longest", "hints": UK_INDIA},  # hint vs list readings compete
     {"also_try_regions": "never", "when_hints_disagree": "nearest", "hints": UK_INDIA},
     # A valid hinted reading makes if_no_valid drop the possible list reading.
     {"keep_possible": "if_no_valid", "hints": UK_INDIA, "also_try_regions": "always"},
@@ -2283,7 +2288,8 @@ def test_summarize_validation_counts_unknown_hits(tmp_path: Path) -> None:
 # ---- one reading per country per hit (fix-phone-duplicates)
 # A hit read in several regions can give two numbers of one country: "011 49 30
 # 123456" is +4930123456 via the US prefix 011, and +49114930123456 read as German
-# national digits. Rule: valid beats possible; then the longer E.164 wins. The loser
+# national digits. Rule: valid beats possible; between valid ones the home region's
+# reading wins; then the longer E.164 wins. The loser
 # is logged as not_kept. A1-A8 are the cases of the duplicate-reading report.
 def _same_country_dups(matches: list[Any]) -> list[tuple[int, int, str]]:
     seen: Counter = Counter()
@@ -2304,9 +2310,9 @@ ONE_PER_COUNTRY = [
     ("A4", {"regions": ["AU", "IN"], "output_format": "RAW"}, "0061 412 345 678",
      "valid_AU_number", "+61412345678", "+61061412345678"),
     ("A5", {"regions": ["US", "NL"], "keep_possible": "always", "output_format": "RAW"}, "01131794698",
-     "possible_NL_number", "+311131794698", "+31794698"),
+     "possible_NL_number", "+31794698", "+311131794698"),   # home (US) reading
     ("A6", {"regions": ["RU", "DE"], "keep_possible": "always"}, "tel 8 10 49 98516242",
-     "valid_DE_number", "+498104998516242", "+4998516242"),
+     "valid_DE_number", "+4998516242", "+498104998516242"),
     ("A7", {"regions": ["DE", "CA"]}, "0114930456",
      "valid_DE_number", "+4930456", "+49114930456"),
     ("A8", {"regions": ["AU", "NL"], "keep_possible": "if_no_valid"}, "006104735",
@@ -2335,6 +2341,22 @@ class TestOnePerCountry:
             assert matches[0].text == matches[0].raw
         else:
             assert matches[0].text == kept
+
+    @pytest.mark.parametrize("mode, a5, a6", [
+        ("home", "+31794698", "+4998516242"),
+        ("longest", "+311131794698", "+498104998516242"),
+        ("shortest", "+31794698", "+4998516242"),
+    ])
+    def test_same_country_tiebreak_end_to_end(self, tmp_path: Path, mode: str, a5: str, a6: str) -> None:
+        (tmp_path / "a5").mkdir()
+        (tmp_path / "a6").mkdir()
+        m5, d5 = run_phone(tmp_path / "a5", "01131794698", regions=["US", "NL"],
+                           keep_possible="always", same_country_tiebreak=mode)
+        m6, _ = run_phone(tmp_path / "a6", "tel 8 10 49 98516242", regions=["RU", "DE"],
+                          keep_possible="always", same_country_tiebreak=mode)
+        assert got(m5) == [("possible_NL_number", a5)]
+        assert got(m6) == [("valid_DE_number", a6)]
+        assert sorted(r["outcome"] for r in vrows(d5)) == ["kept", "not_kept"]
 
     def test_genoa_default_settings_unchanged(self, tmp_path: Path) -> None:
         matches, _ = run_phone(tmp_path, "call 010 3965 8066 today", regions=["IT", "JP"])
@@ -2385,7 +2407,8 @@ class TestOnePerCountry:
         cfgs: dict[str, Config] = {}
         for i in range(500):
             v: dict[str, Any] = {"regions": rng.sample(regions, rng.randint(1, 3)),
-                                 "keep_possible": rng.choice(["never", "if_no_valid", "home", "always"])}
+                                 "keep_possible": rng.choice(["never", "if_no_valid", "home", "always"]),
+                                 "same_country_tiebreak": rng.choice(["home", "longest", "shortest"])}
             ctx = None
             if rng.random() < 0.4:
                 h = rng.choice(sorted(hint_words))
@@ -2419,9 +2442,38 @@ class TestOnePerCountryRanking:
         assert self.winner(p, v) == [v]
         assert p.why == "another reading of this hit in DE was kept: +4930123456"
 
-    def test_longer_wins_at_equal_status(self) -> None:
+    def test_home_reading_wins_between_valid(self) -> None:
         a, b = _r("valid", "DE", "+4998516242", "US"), _r("valid", "DE", "+498104998516242", "DE")
+        assert self.winner(a, b) == [a]
+        assert b.why == "another reading of this hit in DE was kept: +4998516242"
+
+    def test_home_reading_wins_between_possible(self) -> None:
+        a, b = _r("possible", "DE", "+4998516242", "US"), _r("possible", "DE", "+498104998516242", "DE")
+        assert self.winner(a, b) == [a]
+
+    def test_home_falls_back_to_longer(self) -> None:
+        a, b = _r("valid", "DE", "+4998516242", "GB"), _r("valid", "DE", "+498104998516242", "DE")
         assert self.winner(a, b) == [b]
+
+    def test_valid_beats_possible_home_reading(self) -> None:
+        home, v = _r("possible", "DE", "+49114930123456", "US"), _r("valid", "DE", "+4930123456", "GB")
+        assert self.winner(home, v) == [v]
+
+    @pytest.mark.parametrize("mode, kept", [("home", "+4998516242"), ("longest", "+498104998516242"),
+                                            ("shortest", "+4998516242")])
+    @pytest.mark.parametrize("status", ["valid", "possible"])
+    def test_same_country_tiebreak_modes(self, mode: str, kept: str, status: str) -> None:
+        spec = phone.PhoneSpec(regions=["US", "DE", "GB"], same_country_tiebreak=mode)
+        a, b = _r(status, "DE", "+4998516242", "US"), _r(status, "DE", "+498104998516242", "DE")
+        phone._one_per_country([b, a], spec)
+        assert [r.e164 for r in (a, b) if r.returned] == [kept]
+        # Away from home both modes compare length only.
+        spec.regions = ["GB", "US", "DE"]
+        a.returned = b.returned = True
+        phone._one_per_country([b, a], spec)
+        shorter_wins = mode == "shortest"
+        assert [r.e164 for r in (a, b) if r.returned] == (["+4998516242"] if shorter_wins
+                                                          else ["+498104998516242"])
 
     def test_full_beats_local_only(self) -> None:
         local, full = _r("possible", "US", "", "US"), _r("possible", "US", "+1201555012", "GB")
@@ -2442,7 +2494,10 @@ class TestOnePerCountryRanking:
         assert held.why == "keep_possible: never"
 
     def test_replaced_home_reading_passes_home_on(self) -> None:
-        spec = phone.PhoneSpec(regions=["AU", "NL", "GB"], keep_possible="home")
+        # Under home the home reading only loses to a valid one, which
+        # keep_possible never filters; longest/shortest can replace it.
+        spec = phone.PhoneSpec(regions=["AU", "NL", "GB"], keep_possible="home",
+                               same_country_tiebreak="longest")
         home = _r("possible", "AU", "+6104735", "AU")
         heir = _r("possible", "AU", "+6106104735", "NL")
         other = _r("possible", "GB", "+44104735", "GB")

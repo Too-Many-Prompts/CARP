@@ -68,7 +68,8 @@ CARP adds that missing step:
 Phone patterns add a check between steps 3 and 4. A number can come back
 with readings for several countries, but at most one per country: readings
 are merged by E.164, and if two readings of one country differ, the valid one
-wins, then the longer one ([details](REFERENCE.md#phone-specific-labels)).
+wins; between two of the same status, the home region's reading wins by
+default (`same_country_tiebreak`; [details](REFERENCE.md#phone-specific-labels)).
 
 ## Setup
 

@@ -58,8 +58,9 @@ string, and resolves overlapping matches.
      each reading keeps its own source. `keep_possible` never filters
      hinted or `+` readings.
    - At most one reading per country (label region) per hit
-     (`phone._one_per_country`): valid > possible, full > local-only, longer
-     E.164, hint > list, earlier region. It runs on the hint readings before
+     (`phone._one_per_country`): valid > possible, full > local-only, then
+     `same_country_tiebreak` (home: parsed in the home region, else longer;
+     longest; shortest E.164), hint > list, earlier region. It runs on the hint readings before
      their holds, on hint + list readings before `keep_possible` (a reading
      that beat the home reading counts as home), and once more as a backstop.
      Losers are `not_kept` ("another reading of this hit in X was kept: ...").
@@ -126,6 +127,8 @@ string, and resolves overlapping matches.
   - `hints` ({REGION: {word: weight > 0}}, read like `keywords`);
   - `keep_possible` (never | if_no_valid | home | always; default home):
     which possible readings of the `regions` list come back;
+  - `same_country_tiebreak` (home | longest | shortest; default home): which
+    of two same-status readings of one country in one hit stays;
   - `when_hints_disagree` (all | nearest; default all);
   - `also_try_regions` (never | if_hint_fails | if_hint_not_valid | always;
     default if_hint_not_valid);
@@ -136,7 +139,8 @@ string, and resolves overlapping matches.
   An unknown key or value fails, naming the allowed ones. A setting the
   user wrote that can do nothing warns (not fails): `also_try_regions` /
   `when_hints_disagree` without `hints`; `keep_possible` other than never
-  with one region, unless hints + `also_try_regions: always`.
+  with one region, unless hints + `also_try_regions: always`;
+  `same_country_tiebreak` with one region and no hints.
 - Never lose a hit silently: every validated regex hit ends up as matches or
   a `dropped` / `kept_unknown` row with a reason (which includes the
   phonenumbers version).
@@ -179,7 +183,8 @@ string, and resolves overlapping matches.
   `summarize_overlaps`, `summarize_misses` and `--summarize`, and the public
   API as the README shows it. Phone: `validate` load errors,
   the old-name aliases and the do-nothing warnings, each status, every
-  `keep_possible`, `when_hints_disagree` and `also_try_regions` mode,
+  `keep_possible`, `when_hints_disagree`, `also_try_regions` and
+  `same_country_tiebreak` mode,
   `keep_unknown` (each no-reading case, min_score, overlaps, coexist, label
   reservation, misses, summary counts), hints
   (including misfits), `+`/`00`/`011`, span refinement (incl. space-grouped trimming),
