@@ -248,7 +248,7 @@ Questions the report answers:
 | Why did `A` beat `B`? | the `overlap` row: `a_*` is the winner, `b_*` the loser; `reason` shows the numbers |
 | Why is my match missing? | `b_` side of an `overlap` row; a `below_min_score` row; a `validation` row with `dropped`; or a `miss` row |
 | Why `possible_US_number` and not `valid_US_number`? | the `validation` row: `status`, `region`, and `reason` |
-| Why was a phone reading not kept? | a `validation` row with `not_kept`; `reason` names the `keep_possible` or `when_hints_disagree` setting |
+| Why was a phone reading not kept? | a `validation` row with `not_kept`; `reason` names the `keep_possible` or `when_hints_disagree` setting, or the reading of the same country that was kept instead |
 | What do I tune first? | `extract.py --summarize` (see [Summaries](#summaries)) |
 
 ### Misses
@@ -406,6 +406,24 @@ Readings that give the same number count as one. US and CA share +1, so
 `416-555-0123` gives one reading, labeled by its real region:
 `valid_CA_number`.
 
+**A hit returns at most one reading per country.** Regions read an
+international prefix differently. With `regions: [DE, US]`, `011 49 30 123456`
+is `+4930123456` through the US prefix `011`, but `+49114930123456` when DE
+reads the same digits as a German national number. Both are DE numbers, so
+only one is kept, here the valid `+4930123456`. The rule:
+1. valid beats possible;
+2. otherwise the longer number wins (usually the national reading);
+3. ties go to a hint reading, then to the earlier region of `regions`.
+
+Example: with `regions: [RU, DE]`, `8 10 49 98516242` gives two valid DE
+numbers, `+4998516242` (RU's prefix `8 10`) and `+498104998516242`. The longer
+one is kept. The other reading gets a `not_kept` row with the reason
+`another reading of this hit in DE was kept: +498104998516242`.
+Different countries are never merged: `201-555-0123` with `[US, GB]` and
+`keep_possible: always` still gives both `valid_US_number` and
+`valid_GB_number`, and the same number written twice at different places
+stays two matches.
+
 ### Notes:
 
 - **"Home" is the first entry of `regions`**, never a hinted region.
@@ -416,6 +434,10 @@ Readings that give the same number count as one. US and CA share +1, so
   readings from `regions` are dropped.
 - **A number already read through a hint is not read again** from
   `regions` (readings are deduplicated by E.164).
+- **The one-per-country rule runs before `keep_possible` and
+  `when_hints_disagree`**, so those settings only see the readings that are
+  left. If it drops the home reading, the reading that replaced it counts as
+  home for `keep_possible: home`.
 - **`keep_possible: home` with an impossible home region:** if the number is
   impossible in the home region, valid nowhere, and possible only in other
   listed regions, nothing comes back, and the hit has only `not_kept` rows.
@@ -549,7 +571,8 @@ notes:
 
 - **Never a guess about the country.** Every reading that survives is
   kept, labeled with its status and region (`valid_US_number`,
-  `possible_GB_number`).
+  `possible_GB_number`). Within one country, though, only one reading is
+  kept: see [Phone-Specific Labels](#phone-specific-labels).
 - **Hints narrow the search first.** A hint word is a reason to look at a
   region, not a verdict. `also_try_regions` says when the `regions` list gets
   a turn too.

@@ -2278,3 +2278,176 @@ def test_summarize_validation_counts_unknown_hits(tmp_path: Path) -> None:
     assert (row["hits"], row["kept"], row["valid"], row["dropped"], row["unknown"]) == (3, 1, 1, 0, 2)
     assert summarize.HINT_IMPOSSIBLE in row["hint"]
     assert '"12345-6789"' in row["examples"]
+
+
+# ---- one reading per country per hit (fix-phone-duplicates)
+# A hit read in several regions can give two numbers of one country: "011 49 30
+# 123456" is +4930123456 via the US prefix 011, and +49114930123456 read as German
+# national digits. Rule: valid beats possible; then the longer E.164 wins. The loser
+# is logged as not_kept. A1-A8 are the cases of the duplicate-reading report.
+def _same_country_dups(matches: list[Any]) -> list[tuple[int, int, str]]:
+    seen: Counter = Counter()
+    for m in matches:
+        found = re.fullmatch(r"(?:valid|possible)_(\w+?)_number", m.label)
+        if found:
+            seen[(m.start, m.end, found.group(1))] += 1
+    return [k for k, n in seen.items() if n > 1]
+
+
+ONE_PER_COUNTRY = [
+    ("A1", {"regions": ["DE", "US"]}, "011 49 30 123456",
+     "valid_DE_number", "+4930123456", "+49114930123456"),
+    ("A2", {"regions": ["AU", "IN"]}, "0061 412 345 678",
+     "valid_AU_number", "+61412345678", "+61061412345678"),
+    ("A3", {"regions": ["US"], "hints": {"DE": {"germany": 3}}}, ("germany", "call 011 49 30 123456 today"),
+     "valid_DE_number", "+4930123456", "+49114930123456"),
+    ("A4", {"regions": ["AU", "IN"], "output_format": "RAW"}, "0061 412 345 678",
+     "valid_AU_number", "+61412345678", "+61061412345678"),
+    ("A5", {"regions": ["US", "NL"], "keep_possible": "always", "output_format": "RAW"}, "01131794698",
+     "possible_NL_number", "+311131794698", "+31794698"),
+    ("A6", {"regions": ["RU", "DE"], "keep_possible": "always"}, "tel 8 10 49 98516242",
+     "valid_DE_number", "+498104998516242", "+4998516242"),
+    ("A7", {"regions": ["DE", "CA"]}, "0114930456",
+     "valid_DE_number", "+4930456", "+49114930456"),
+    ("A8", {"regions": ["AU", "NL"], "keep_possible": "if_no_valid"}, "006104735",
+     "possible_AU_number", "+6106104735", "+6104735"),
+    ("KR 011 mobile", {"regions": ["KR", "US"]}, "call 011 8242 1040 today",
+     "valid_KR_number", "+821182421040", "+82421040"),
+    ("Genoa 010, keep all", {"regions": ["IT", "JP"], "keep_possible": "always"}, "call 010 3965 8066 today",
+     "valid_IT_number", "+3901039658066", "+39658066"),
+]
+
+
+class TestOnePerCountry:
+    @pytest.mark.parametrize("validate, inp, label, kept, lost",
+                             [c[1:] for c in ONE_PER_COUNTRY], ids=[c[0] for c in ONE_PER_COUNTRY])
+    def test_one_reading_per_country(self, tmp_path: Path, validate: dict[str, Any], inp: Any,
+                                     label: str, kept: str, lost: str) -> None:
+        matches, decisions = run_phone(tmp_path, inp, **validate)
+        assert not _same_country_dups(matches)
+        assert [m.label for m in matches] == [label]
+        rows = {r["normalized"]: r for r in vrows(decisions)}
+        assert rows[kept]["outcome"] == "kept"
+        assert rows[lost]["outcome"] == "not_kept"
+        region = label.split("_")[1]
+        assert f"another reading of this hit in {region} was kept: {kept}" in rows[lost]["reason"]
+        if validate.get("output_format") == "RAW":
+            assert matches[0].text == matches[0].raw
+        else:
+            assert matches[0].text == kept
+
+    def test_genoa_default_settings_unchanged(self, tmp_path: Path) -> None:
+        matches, _ = run_phone(tmp_path, "call 010 3965 8066 today", regions=["IT", "JP"])
+        assert got(matches) == [("valid_IT_number", "+3901039658066")]
+
+    def test_home_default_keeps_one_reading(self, tmp_path: Path) -> None:
+        matches, _ = run_phone(tmp_path, "006104735", regions=["AU", "NL"])
+        assert got(matches) == [("possible_AU_number", "+6106104735")]
+
+    @pytest.mark.parametrize("text, e164", [("call 0117 496 0123", "+441174960123"),
+                                            ("call 0113 496 0123", "+441134960123"),
+                                            ("call 0114 496 0123", "+441144960123")])
+    def test_uk_011x_area_codes_with_us_listed(self, tmp_path: Path, text: str, e164: str) -> None:
+        # The US reads 011 as its prefix: another country (or a local-only US
+        # reading), so the GB reading is never compared with it.
+        matches, _ = run_phone(tmp_path, text, regions=["US", "GB"], keep_possible="always")
+        assert ("valid_GB_number", e164) in got(matches)
+        assert not _same_country_dups(matches)
+
+    @pytest.mark.parametrize("validate, text, expected", [
+        ({"regions": ["US", "CA"]}, "416-555-0123", [("valid_CA_number", "+14165550123")]),
+        ({"regions": ["US", "GB"], "keep_possible": "always"}, "201-555-0123",
+         [("valid_GB_number", "+442015550123"), ("valid_US_number", "+12015550123")]),
+        ({"regions": ["US"]}, "+44 20 7946 0958", [("valid_GB_number", "+442079460958")]),
+        ({"regions": ["US"]}, "call 212-555-0123 or 212-555-0123",
+         [("valid_US_number", "+12125550123")] * 2),
+        ({"regions": ["US"]}, "212-555-0123 212-555-0199",
+         [("valid_US_number", "+12125550123"), ("valid_US_number", "+12125550199")]),
+    ])
+    def test_unchanged_behavior(self, tmp_path: Path, validate: dict[str, Any], text: str,
+                                expected: list[tuple[str, str]]) -> None:
+        matches, _ = run_phone(tmp_path, text, **validate)
+        assert got(matches) == expected
+
+    @pytest.mark.filterwarnings("ignore::UserWarning")
+    def test_property_no_same_country_pair(self, tmp_path: Path) -> None:
+        import random
+
+        import phonenumbers as pn
+        rng = random.Random(11)
+        regions = ["US", "CA", "GB", "DE", "FR", "NL", "AU", "IN", "RU", "JP"]
+        hint_words = {"US": "usa", "GB": "uk", "DE": "germany", "AU": "australia", "JP": "japan"}
+        forms = []
+        for r in regions:
+            n = pn.example_number(r)
+            cc, nsn = n.country_code, pn.national_significant_number(n)
+            forms += [f"+{cc} {nsn}", f"00 {cc} {nsn}", f"011 {cc} {nsn}", nsn, f"0{nsn}"]
+        cfgs: dict[str, Config] = {}
+        for i in range(500):
+            v: dict[str, Any] = {"regions": rng.sample(regions, rng.randint(1, 3)),
+                                 "keep_possible": rng.choice(["never", "if_no_valid", "home", "always"])}
+            ctx = None
+            if rng.random() < 0.4:
+                h = rng.choice(sorted(hint_words))
+                v["hints"] = {h: {hint_words[h]: 3}}
+                v["also_try_regions"] = rng.choice(["never", "if_hint_fails", "if_hint_not_valid", "always"])
+                ctx = hint_words[h]
+            key = repr(sorted(v.items()))
+            if key not in cfgs:
+                d = tmp_path / f"c{len(cfgs)}"
+                d.mkdir()
+                cfgs[key] = make_cfg(d, [phone_pattern(**v)])
+            text = f"call {rng.choice(forms)} today"
+            matches, _ = extract((ctx, text), cfgs[key])
+            assert not _same_country_dups(matches), (v, ctx, text, got(matches))
+
+
+def _r(status: str, region: str, e164: str, parsed_in: str, source: str = "regions") -> phone.Reading:
+    return phone.Reading(status, region, e164, e164 or f"{parsed_in}:x", parsed_in=parsed_in,
+                         source=source, e164=e164)
+
+
+class TestOnePerCountryRanking:
+    SPEC = phone.PhoneSpec(regions=["US", "DE", "GB"])
+
+    def winner(self, *readings: phone.Reading) -> list[phone.Reading]:
+        phone._one_per_country(list(readings), self.SPEC)
+        return [r for r in readings if r.returned]
+
+    def test_valid_beats_longer_possible(self) -> None:
+        v, p = _r("valid", "DE", "+4930123456", "US"), _r("possible", "DE", "+49114930123456", "DE")
+        assert self.winner(p, v) == [v]
+        assert p.why == "another reading of this hit in DE was kept: +4930123456"
+
+    def test_longer_wins_at_equal_status(self) -> None:
+        a, b = _r("valid", "DE", "+4998516242", "US"), _r("valid", "DE", "+498104998516242", "DE")
+        assert self.winner(a, b) == [b]
+
+    def test_full_beats_local_only(self) -> None:
+        local, full = _r("possible", "US", "", "US"), _r("possible", "US", "+1201555012", "GB")
+        assert self.winner(local, full) == [full]
+
+    def test_hint_then_region_order_break_length_ties(self) -> None:
+        a, b = _r("valid", "DE", "+4930123456", "GB"), _r("valid", "DE", "+4930123457", "FR", "hint")
+        assert self.winner(a, b) == [b]
+        a, b = _r("valid", "DE", "+4930123456", "GB"), _r("valid", "DE", "+4930123457", "US")
+        assert self.winner(a, b) == [b]
+
+    def test_other_countries_and_held_readings_untouched(self) -> None:
+        us, gb = _r("valid", "US", "+12015550123", "US"), _r("valid", "GB", "+442015550123", "GB")
+        assert self.winner(us, gb) == [us, gb]
+        held = _r("valid", "US", "+120155501234", "DE")
+        held.returned, held.why = False, "keep_possible: never"
+        assert self.winner(us, held) == [us]
+        assert held.why == "keep_possible: never"
+
+    def test_replaced_home_reading_passes_home_on(self) -> None:
+        spec = phone.PhoneSpec(regions=["AU", "NL", "GB"], keep_possible="home")
+        home = _r("possible", "AU", "+6104735", "AU")
+        heir = _r("possible", "AU", "+6106104735", "NL")
+        other = _r("possible", "GB", "+44104735", "GB")
+        found = [home, heir, other]
+        replaced = phone._one_per_country(found, spec)
+        assert replaced[id(home)] is heir
+        phone._filter_list(found, spec, replaced=replaced)
+        assert [r for r in found if r.returned] == [heir]

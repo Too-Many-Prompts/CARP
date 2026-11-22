@@ -22,6 +22,10 @@ Where to look, in order (readings_for):
 
 What comes back: valid readings always. keep_possible decides possible
 readings from the `regions` list (never | if_no_valid | home | always).
+At most one reading per country: regions read a prefix differently
+("011 49 30 123456" is +4930123456 via the US prefix, +49114930123456 as
+German digits), so same-country readings compete (_one_per_country): valid
+beats possible, then the longer number wins; the loser is logged.
 Impossible hits have no reading: extract.py drops and logs them, unless
 keep_unknown: true keeps them as `unknown_number`.
 
@@ -415,6 +419,36 @@ def _hold(readings: list[Reading], keep: Callable[[Reading], bool], why: str) ->
             r.returned, r.why = False, why
 
 
+def _rank(r: Reading, spec: PhoneSpec) -> tuple[bool, bool, int, bool, int, str]:
+    """Sort key among same-country readings of one hit; the smallest wins:
+    valid before possible, a full number before a local-only one, then the
+    longer E.164, then a hint reading, then the earlier region of `regions`."""
+    order = spec.regions.index(r.parsed_in) if r.parsed_in in spec.regions else len(spec.regions)
+    return (r.status != "valid", not r.e164, -len(r.e164), r.source != "hint", order, r.e164)
+
+
+def _one_per_country(readings: list[Reading], spec: PhoneSpec) -> dict[int, Reading]:
+    """Keep at most one returned reading per country (label region) of one hit.
+
+    Regions read a prefix differently: "011 49 30 123456" is +4930123456 via
+    the US prefix 011, and +49114930123456 as German national digits, so one
+    hit can give two numbers of one country. The best by _rank stays; the
+    others are held, naming the kept number. Returns {id(loser): winner}.
+    Readings already held are ignored, so calling it again changes nothing."""
+    best: dict[str | None, Reading] = {}
+    for r in readings:
+        if r.returned and (r.region not in best or _rank(r, spec) < _rank(best[r.region], spec)):
+            best[r.region] = r
+    replaced: dict[int, Reading] = {}
+    for r in readings:
+        winner = best.get(r.region)
+        if r.returned and winner is not r and winner is not None:
+            r.returned = False
+            r.why = f"another reading of this hit in {r.region} was kept: {winner.e164 or winner.normalized}"
+            replaced[id(r)] = winner
+    return replaced
+
+
 def readings_for(
     raw: str, spec: PhoneSpec, hints: list[RegionHint]
 ) -> Outcome:
@@ -450,9 +484,11 @@ def readings_for(
     from_list, checks = _fitting(raw, spec.regions, spec)
     known = {r.key for r in from_hints}
     from_list = [r for r in from_list if r.key not in known]
+    replaced = _one_per_country(from_hints + from_list, spec)
     _filter_list(from_list, spec, hinted_valid=any(
-        r.returned and r.status == "valid" for r in from_hints))
+        r.returned and r.status == "valid" for r in from_hints), replaced=replaced)
     readings = from_hints + from_list
+    _one_per_country(readings, spec)    # backstop: the filters only remove readings
     if readings:
         return Outcome(readings, "regions", notes)
 
@@ -495,6 +531,7 @@ def _hinted(raw: str, spec: PhoneSpec, hinted: list[RegionHint]) -> list[Reading
             seen.add(r.key)
             found.append(r)
             hint_of[r.key] = by_region[h.region]
+    _one_per_country(found, spec)
     if any(r.status == "valid" for r in found):
         _hold(found, lambda r: r.status == "valid", "a hinted region gives a valid reading")
     if spec.when_hints_disagree == "nearest":
@@ -506,12 +543,17 @@ def _hinted(raw: str, spec: PhoneSpec, hinted: list[RegionHint]) -> list[Reading
     return found
 
 
-def _filter_list(found: list[Reading], spec: PhoneSpec, hinted_valid: bool = False) -> None:
+def _filter_list(found: list[Reading], spec: PhoneSpec, hinted_valid: bool = False,
+                 replaced: dict[int, Reading] | None = None) -> None:
     """Apply `keep_possible` to the list readings (in region order). A valid
     hinted reading (also_try_regions: always) counts as a valid reading here,
-    so if_no_valid drops the possible list readings next to it."""
-    has_valid = hinted_valid or any(r.status == "valid" for r in found)
+    so if_no_valid drops the possible list readings next to it. Only readings
+    still returned count. If _one_per_country held the home reading, the
+    same-country reading that beat it (`replaced`) is the home reading."""
+    has_valid = hinted_valid or any(r.returned and r.status == "valid" for r in found)
     home = next((r for r in found if r.parsed_in == spec.regions[0]), None)
+    if home is not None and not home.returned:
+        home = (replaced or {}).get(id(home))
     mode = spec.keep_possible
     if mode == "never":
         _hold(found, lambda r: r.status == "valid", "keep_possible: never")

@@ -57,6 +57,12 @@ string, and resolves overlapping matches.
      hinted reading), always. Its readings are added (source `regions`);
      each reading keeps its own source. `keep_possible` never filters
      hinted or `+` readings.
+   - At most one reading per country (label region) per hit
+     (`phone._one_per_country`): valid > possible, full > local-only, longer
+     E.164, hint > list, earlier region. It runs on the hint readings before
+     their holds, on hint + list readings before `keep_possible` (a reading
+     that beat the home reading counts as home), and once more as a backstop.
+     Losers are `not_kept` ("another reading of this hit in X was kept: ...").
    Each returned reading becomes a match labeled `{status}_{REGION}_number`,
    with `pattern` = the pattern label, a shared `hit` id, `text` = the
    number in `output_format` (E164 | INTERNATIONAL | NATIONAL | RAW; RAW keeps
@@ -177,10 +183,15 @@ string, and resolves overlapping matches.
   `keep_unknown` (each no-reading case, min_score, overlaps, coexist, label
   reservation, misses, summary counts), hints
   (including misfits), `+`/`00`/`011`, span refinement (incl. space-grouped trimming),
-  `valid_ignores_min_score`, and back-to-back
+  `valid_ignores_min_score`, one reading per country (`TestOnePerCountry`,
+  `TestOnePerCountryRanking`: cases A1-A8 of the duplicate-reading report, the IT 010 / KR 011 cases,
+  guards, a seeded property loop), and back-to-back
   numbers, readings vs other patterns, coexist/misses via `pattern`, every `output_format`,
   report rows, `summarize_validation`.
 - Run `pytest -q` after every change and do not report success until it passes.
+- Duplicate-reading tools may exist locally in `bench/` (git-ignored, not in
+  the repo; see `bench/README.md` there). If present, run them before merging
+  any change to `phone.py` or the validation path in `extract.py`.
 
 ## Constraints
 - Python 3.10+, standard library + PyYAML + pytest + phonenumbers

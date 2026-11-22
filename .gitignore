@@ -7,3 +7,4 @@ extract_report.csv
 flowchart.jpg
 .artifact-build/
 .superpowers/
+bench/

@@ -65,7 +65,10 @@ CARP adds that missing step:
 5. **Resolve overlaps.** If the two labels are listed in `coexist`, keep both.
    Otherwise apply `overlap_tiebreak` in order: score, length, priority.
 
-Phone patterns add a check between steps 3 and 4.
+Phone patterns add a check between steps 3 and 4. A number can come back
+with readings for several countries, but at most one per country: readings
+are merged by E.164, and if two readings of one country differ, the valid one
+wins, then the longer one ([details](REFERENCE.md#phone-specific-labels)).
 
 ## Setup
 
